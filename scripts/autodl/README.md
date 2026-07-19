@@ -22,7 +22,7 @@ bash /root/autodl-tmp/autodl-bootstrap/01_git.sh
 bash /root/autodl-tmp/search-r1/checkout/scripts/autodl/02_cpu_prepare.sh
 ```
 
-此阶段通过 Conda 的 `llmdevelop` 环境解析镜像 Python，并在持久盘创建带 `--system-site-packages` 的 train venv，以复用镜像自带 PyTorch 2.8.0+cu128，不修改 `llmdevelop`，也不重新安装 PyTorch。随后创建隔离的 retriever venv，安装依赖和 Java，下载固定 revision 的 Qwen3.5-2B 与 BM25 索引，生成 NQ 512/64/128 数据，并执行 tokenizer、数据、BM25 和成本奖励测试。最后生成自校验的 `manifests/cpu_handoff.json`；它是 GPU 阶段唯一认可的交接。完成后在 AutoDL 控制台确认 CPU 实例已停止，并确认 GPU 实例挂载的是同一个数据盘。
+此阶段通过 Conda 的 `llmdevelop` 环境解析镜像 Python，并在持久盘创建带 `--system-site-packages` 的 train venv，以复用镜像自带 PyTorch 2.8.0+cu128，不修改 `llmdevelop`，也不重新安装 PyTorch。随后创建隔离的 retriever venv，安装依赖和 Java，下载固定 revision 的 Qwen3.5-2B、BM25 索引与配套 wiki-18 corpus。BM25 索引只存文档 ID，因此脚本会以流式方式解出约 14.4 GB JSONL，并生成约 160 MB 的行偏移表，运行时不会把 Wikipedia 全量载入内存。之后生成 NQ 512/64/128 数据，执行 tokenizer、数据、真实 BM25 和成本奖励测试，并组合、封存一卡与两卡的全部训练/评测配置，最后发布自校验的 `manifests/cpu_handoff.json`。计入环境和缓存后，持久盘至少预留 35 GB。完成后在 AutoDL 控制台确认 CPU 实例已停止，并确认 GPU 实例挂载的是同一个数据盘。
 
 ## 阶段三：GPU 离线训练
 

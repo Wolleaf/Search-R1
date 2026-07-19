@@ -8,16 +8,26 @@ source "$SCRIPT_DIR/lib/runtime.sh"
 readonly MODEL_REVISION='15852e8c16360a2fea060d615a32b45270f8a8fc'
 readonly DATA_REVISION='bcafb8dd07d453be3cbeeeb3f78be1841bddf92c'
 readonly BM25_REVISION='2c7554f25f425038c4bcb155735a0f831851fd78'
+readonly CORPUS_REVISION='69c1c00ffe7c5554c68d8548355cb22e46aabc51'
+readonly CORPUS_SHA256='7abd929223399cd63c52b499f289bf4f9039be1e9f8c43e1cb3938305b2317db'
+readonly CORPUS_BYTES=5123307260
+readonly CORPUS_MEMBER_BYTES=14393573105
 TRAIN_ENV="$PROJECT_ROOT/envs/train"
 RETRIEVER_ENV="$PROJECT_ROOT/envs/retriever"
 CACHE_ROOT="$PROJECT_ROOT/cache"
 DATA_ROOT="$PROJECT_ROOT/data"
 SMALL_DATA_DIR="$DATA_ROOT/nq_small"
 BM25_ROOT="$DATA_ROOT/wiki-18-bm25-index"
+CORPUS_SOURCE_ROOT="$DATA_ROOT/wiki-18-corpus-source"
+CORPUS_ROOT="$DATA_ROOT/wiki-18-corpus"
+CORPUS_GZIP="$CORPUS_SOURCE_ROOT/wiki-18.jsonl.gz"
+CORPUS_JSONL="$CORPUS_ROOT/wiki-18.jsonl"
+CORPUS_OFFSETS="$CORPUS_ROOT/wiki-18.offsets.u64"
 MODEL_DIR="$PROJECT_ROOT/models/Qwen3.5-2B"
 HANDOFF="$MANIFEST_DIR/cpu_handoff.json"
 
 export CUDA_VISIBLE_DEVICES=''
+export JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
 export HF_HOME="$CACHE_ROOT/huggingface"
 export HF_HUB_CACHE="$HF_HOME/hub"
 export HUGGINGFACE_HUB_CACHE="$HF_HUB_CACHE"
@@ -61,7 +71,7 @@ resolve_llmdevelop_python() {
 
 cpu_action() {
     local _attempt="$1"
-    local commit base_python train_python retriever_python python_version torch_version handoff_digest
+    local commit base_python train_python retriever_python python_version torch_version handoff_digest gpu_count
     commit="$(expected_commit)"
     verify_checkout "$commit"
     [[ -f "$CHECKOUT_DIR/requirements-autodl.lock" ]] || {
@@ -107,11 +117,11 @@ cpu_action() {
         'pydantic>=2.10,<3'
     "$retriever_python" -c 'import sys; assert sys.version_info[:2] == (3, 12)'
 
-    "$train_python" - "$MODEL_DIR" "$BM25_ROOT" <<PY
+    "$train_python" - "$MODEL_DIR" "$BM25_ROOT" "$CORPUS_SOURCE_ROOT" <<PY
 from huggingface_hub import snapshot_download
 import sys
 
-model_dir, bm25_dir = sys.argv[1:]
+model_dir, bm25_dir, corpus_source_dir = sys.argv[1:]
 # Keep snapshot downloads within the memory limit of AutoDL's CPU-only mode.
 snapshot_download(
     repo_id="Qwen/Qwen3.5-2B",
@@ -126,7 +136,23 @@ snapshot_download(
     local_dir=bm25_dir,
     max_workers=1,
 )
+snapshot_download(
+    repo_id="PeterJinGo/wiki-18-corpus",
+    repo_type="dataset",
+    revision="$CORPUS_REVISION",
+    local_dir=corpus_source_dir,
+    allow_patterns=["wiki-18.jsonl.gz"],
+    max_workers=1,
+)
 PY
+
+    "$train_python" "$CHECKOUT_DIR/scripts/autodl/build_corpus_offsets.py" prepare \
+        --source "$CORPUS_GZIP" \
+        --output-dir "$CORPUS_ROOT" \
+        --revision "$CORPUS_REVISION" \
+        --source-sha256 "$CORPUS_SHA256" \
+        --source-bytes "$CORPUS_BYTES" \
+        --member-bytes "$CORPUS_MEMBER_BYTES"
 
     "$train_python" "$CHECKOUT_DIR/scripts/data_process/nq_small.py" \
         --local-dir "$SMALL_DATA_DIR" \
@@ -158,11 +184,17 @@ if not manifest["overlap_checks"]["passed"]:
     raise SystemExit("NQ split overlap validation failed")
 PY
 
-    PYTHONPATH="$CHECKOUT_DIR" "$retriever_python" - "$BM25_ROOT/bm25" <<'PY'
+    PYTHONPATH="$CHECKOUT_DIR" "$retriever_python" - \
+        "$BM25_ROOT/bm25" "$CORPUS_JSONL" "$CORPUS_OFFSETS" <<'PY'
 from search_r1.search.bm25_server import BM25Retriever
 import sys
 
-retriever = BM25Retriever(sys.argv[1], topk=1)
+retriever = BM25Retriever(
+    sys.argv[1],
+    topk=1,
+    corpus_path=sys.argv[2],
+    offsets_path=sys.argv[3],
+)
 hits = retriever.search("Who wrote Hamlet?", topk=1, return_scores=True)
 if not hits or not hits[0]["document"]["contents"]:
     raise SystemExit("BM25 smoke query returned no document")
@@ -181,29 +213,36 @@ for relative_root in ("search_r1", "verl", "scripts"):
         compile(path.read_bytes(), str(path), "exec")
 PY
 
-    for spec in 'train smoke 1' 'train baseline 60' 'train cost_aware 60' "eval baseline $MODEL_DIR" "eval cost_aware $MODEL_DIR"; do
-        read -r mode variant argument <<<"$spec"
-        AUTODL_CONFIG_ONLY=1 \
-            AUTODL_ROOT="$PROJECT_ROOT" \
-            GPU_COUNT=1 \
-            OUTPUT_DIR="$PROJECT_ROOT/cache/config-compose/$variant-$mode" \
-            bash "$CHECKOUT_DIR/scripts/autodl/train_small_grpo.sh" \
-            "$mode" "$variant" "$argument" \
-            >"$MANIFEST_DIR/config-$variant-$mode.yaml"
+    for gpu_count in 1 2; do
+        for spec in 'train smoke 1' 'train baseline 60' 'train cost_aware 60' "eval baseline $MODEL_DIR" "eval cost_aware $MODEL_DIR"; do
+            read -r mode variant argument <<<"$spec"
+            AUTODL_CONFIG_ONLY=1 \
+                AUTODL_ROOT="$PROJECT_ROOT" \
+                GPU_COUNT="$gpu_count" \
+                OUTPUT_DIR="$PROJECT_ROOT/cache/config-compose/${gpu_count}gpu-$variant-$mode" \
+                bash "$CHECKOUT_DIR/scripts/autodl/train_small_grpo.sh" \
+                "$mode" "$variant" "$argument" \
+                >"$MANIFEST_DIR/config-${gpu_count}gpu-$variant-$mode.yaml"
+        done
     done
 
-    "$train_python" - "$MANIFEST_DIR/config-baseline-train.yaml" <<'PY'
+    "$train_python" - \
+        "$MANIFEST_DIR/config-1gpu-baseline-train.yaml" \
+        "$MANIFEST_DIR/config-2gpu-baseline-train.yaml" <<'PY'
 from pathlib import Path
 import sys
 
 from omegaconf import OmegaConf
 
-config = OmegaConf.load(Path(sys.argv[1]))
-group_size = config.actor_rollout_ref.rollout.n_agent
-mini_batch_size = config.actor_rollout_ref.actor.ppo_mini_batch_size
-expected_mini_batch_size = config.data.train_batch_size * group_size
-if group_size != 8 or mini_batch_size != expected_mini_batch_size:
-    raise SystemExit("GRPO group and actor mini-batch configuration are inconsistent")
+for path, expected_gpu_count in zip(map(Path, sys.argv[1:]), (1, 2)):
+    config = OmegaConf.load(path)
+    group_size = config.actor_rollout_ref.rollout.n_agent
+    mini_batch_size = config.actor_rollout_ref.actor.ppo_mini_batch_size
+    expected_mini_batch_size = config.data.train_batch_size * group_size
+    if group_size != 8 or mini_batch_size != expected_mini_batch_size:
+        raise SystemExit("GRPO group and actor mini-batch configuration are inconsistent")
+    if config.trainer.n_gpus_per_node != expected_gpu_count:
+        raise SystemExit(f"GPU count mismatch in {path}")
 PY
 
     "$train_python" -m pip freeze --all >"$MANIFEST_DIR/train-freeze.txt"
@@ -216,16 +255,23 @@ PY
         --commit "$commit" \
         --model "$MODEL_DIR" \
         --bm25 "$BM25_ROOT/bm25" \
+        --corpus "$CORPUS_ROOT" \
         --data "$SMALL_DATA_DIR" \
         --requirements "$CHECKOUT_DIR/requirements-autodl.lock" \
+        --extra-file "$CORPUS_GZIP" \
         --extra-file "$MANIFEST_DIR/train-freeze.txt" \
         --extra-file "$MANIFEST_DIR/retriever-freeze.txt" \
         --extra-file "$MANIFEST_DIR/java-version.txt" \
-        --extra-file "$MANIFEST_DIR/config-smoke-train.yaml" \
-        --extra-file "$MANIFEST_DIR/config-baseline-train.yaml" \
-        --extra-file "$MANIFEST_DIR/config-cost_aware-train.yaml" \
-        --extra-file "$MANIFEST_DIR/config-baseline-eval.yaml" \
-        --extra-file "$MANIFEST_DIR/config-cost_aware-eval.yaml" \
+        --extra-file "$MANIFEST_DIR/config-1gpu-smoke-train.yaml" \
+        --extra-file "$MANIFEST_DIR/config-1gpu-baseline-train.yaml" \
+        --extra-file "$MANIFEST_DIR/config-1gpu-cost_aware-train.yaml" \
+        --extra-file "$MANIFEST_DIR/config-1gpu-baseline-eval.yaml" \
+        --extra-file "$MANIFEST_DIR/config-1gpu-cost_aware-eval.yaml" \
+        --extra-file "$MANIFEST_DIR/config-2gpu-smoke-train.yaml" \
+        --extra-file "$MANIFEST_DIR/config-2gpu-baseline-train.yaml" \
+        --extra-file "$MANIFEST_DIR/config-2gpu-cost_aware-train.yaml" \
+        --extra-file "$MANIFEST_DIR/config-2gpu-baseline-eval.yaml" \
+        --extra-file "$MANIFEST_DIR/config-2gpu-cost_aware-eval.yaml" \
         --python-version "$python_version" \
         --torch-version "$torch_version" \
         --output "$HANDOFF"

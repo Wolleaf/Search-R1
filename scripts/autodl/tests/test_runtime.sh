@@ -64,9 +64,12 @@ wait_for_terminal "$attempt"
 [[ "$(git -C "$TEST_ROOT/git-project/checkout" rev-parse HEAD)" == "$source_commit" ]]
 [[ -s "$TEST_ROOT/git-project/manifests/checkout-tree.sha256" ]]
 
-mkdir -p "$TEST_ROOT/handoff/model" "$TEST_ROOT/handoff/bm25" "$TEST_ROOT/handoff/data" "$TEST_ROOT/handoff/manifests"
+mkdir -p "$TEST_ROOT/handoff/model" "$TEST_ROOT/handoff/bm25" \
+    "$TEST_ROOT/handoff/corpus" "$TEST_ROOT/handoff/data" \
+    "$TEST_ROOT/handoff/manifests"
 printf 'model\n' >"$TEST_ROOT/handoff/model/config.json"
 printf 'index\n' >"$TEST_ROOT/handoff/bm25/segments_1"
+printf 'corpus\n' >"$TEST_ROOT/handoff/corpus/wiki-18.jsonl"
 printf 'data\n' >"$TEST_ROOT/handoff/data/train.parquet"
 printf 'lock\n' >"$TEST_ROOT/handoff/requirements.lock"
 "$PYTHON_BIN" "$AUTODL_DIR/handoff.py" create \
@@ -74,6 +77,7 @@ printf 'lock\n' >"$TEST_ROOT/handoff/requirements.lock"
     --commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
     --model "$TEST_ROOT/handoff/model" \
     --bm25 "$TEST_ROOT/handoff/bm25" \
+    --corpus "$TEST_ROOT/handoff/corpus" \
     --data "$TEST_ROOT/handoff/data" \
     --requirements "$TEST_ROOT/handoff/requirements.lock" \
     --python-version 3.12.0 \

@@ -13,10 +13,11 @@ import sys
 import tempfile
 from typing import Iterable
 
-SCHEMA = 1
+SCHEMA = 2
 MODEL_REVISION = "15852e8c16360a2fea060d615a32b45270f8a8fc"
 DATA_REVISION = "bcafb8dd07d453be3cbeeeb3f78be1841bddf92c"
 BM25_REVISION = "2c7554f25f425038c4bcb155735a0f831851fd78"
+CORPUS_REVISION = "69c1c00ffe7c5554c68d8548355cb22e46aabc51"
 
 
 def sha256_file(path: Path) -> str:
@@ -80,7 +81,8 @@ def contained_relative(root: Path, path: Path) -> str:
 def create(args: argparse.Namespace) -> None:
     root = args.root.resolve()
     artifacts = []
-    paths = iter_artifacts([args.model, args.bm25, args.data], [args.requirements, *args.extra_file])
+    paths = iter_artifacts([args.model, args.bm25, args.corpus, args.data],
+                           [args.requirements, *args.extra_file])
     for path in paths:
         artifacts.append({
             "bytes": path.stat().st_size,
@@ -92,6 +94,7 @@ def create(args: argparse.Namespace) -> None:
         "artifacts": artifacts,
         "bm25_revision": BM25_REVISION,
         "checkout_commit": args.commit.lower(),
+        "corpus_revision": CORPUS_REVISION,
         "data_revision": DATA_REVISION,
         "model_revision": MODEL_REVISION,
         "persistent_root": str(root),
@@ -127,8 +130,9 @@ def verify(args: argparse.Namespace) -> None:
     if canonical_bytes(payload) != raw:
         raise ValueError("handoff manifest is not canonical JSON")
     expected_keys = {
-        "artifacts", "bm25_revision", "checkout_commit", "data_revision", "model_revision",
-        "persistent_root", "python_version", "schema", "torch_version",
+        "artifacts", "bm25_revision", "checkout_commit", "corpus_revision",
+        "data_revision", "model_revision", "persistent_root", "python_version",
+        "schema", "torch_version",
     }
     if set(payload) != expected_keys:
         raise ValueError("handoff manifest has missing or unknown fields")
@@ -139,6 +143,7 @@ def verify(args: argparse.Namespace) -> None:
         "model_revision": MODEL_REVISION,
         "data_revision": DATA_REVISION,
         "bm25_revision": BM25_REVISION,
+        "corpus_revision": CORPUS_REVISION,
         "python_version": args.python_version,
         "torch_version": args.torch_version,
     }
@@ -172,6 +177,7 @@ def parser() -> argparse.ArgumentParser:
     create_parser.add_argument("--commit", required=True)
     create_parser.add_argument("--model", type=Path, required=True)
     create_parser.add_argument("--bm25", type=Path, required=True)
+    create_parser.add_argument("--corpus", type=Path, required=True)
     create_parser.add_argument("--data", type=Path, required=True)
     create_parser.add_argument("--requirements", type=Path, required=True)
     create_parser.add_argument("--extra-file", type=Path, action="append", default=[])

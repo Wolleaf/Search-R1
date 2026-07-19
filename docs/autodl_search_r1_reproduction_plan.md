@@ -82,10 +82,11 @@ cost-aware: r = r_em - 0.10 * (n_search / B)
 
 1. 创建训练环境和独立 BM25 retriever 环境；训练环境安装锁定依赖，retriever 环境安装 Pyserini、FastAPI 和 Java 运行依赖。
 2. 下载并固定 Qwen3.5-2B 到 `cache/huggingface`，不在 GPU 阶段重新下载。
-3. 下载 `PeterJinGo/wiki-18-bm25-index`。该索引内含原始文档，不下载 E5 flat/HNSW 索引。
-4. 运行 NQ 预处理，以 seed 42 输出互不重叠的 `train_512.parquet`、`val_64.parquet` 和 `test_128.parquet`，并保存样本 ID 清单。
-5. 仅做 CPU 可完成的最小验收：依赖可导入、模型 tokenizer 能处理一条 prompt、三份数据行数正确、BM25 能返回一条结果、奖励函数的手工样例通过。
-6. 保存依赖 freeze、文件大小和数据 manifest，成功后写 `manifests/cpu.ok`。
+3. 下载固定 revision 的 `PeterJinGo/wiki-18-bm25-index` 和 `PeterJinGo/wiki-18-corpus`；不下载 E5 flat/HNSW 索引。
+4. BM25 索引只存文档 ID。脚本从 corpus 的单文件 TAR 中流式写出约 14.4 GB JSONL 和 `uint64` 行偏移表，逐行验证 `id == 0-based row`，运行时按命中 ID 随机读取，不全量载入内存。
+5. 运行 NQ 预处理，以 seed 42 输出互不重叠的 `train_512.parquet`、`val_64.parquet` 和 `test_128.parquet`，并保存样本 ID 清单。
+6. 仅做 CPU 可完成的最小验收：依赖可导入、模型 tokenizer 能处理一条 prompt、三份数据行数正确、真实 BM25 加外部 corpus 能返回一条结果、奖励函数的手工样例通过。
+7. 将 corpus revision、源 SHA-256、模型、索引、解包语料、偏移表、依赖 freeze 和数据 manifest 一并封存，成功后写 `manifests/cpu.ok`。
 
 这里不调用 `nvidia-smi`、不探测显卡数量、不根据机器规格自动改参数。完成后关闭无 GPU 实例，并在 AutoDL 控制台确认 GPU 实例继续挂载同一数据盘。
 

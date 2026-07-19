@@ -8,10 +8,15 @@ source "$SCRIPT_DIR/lib/runtime.sh"
 TRAIN_ENV="$PROJECT_ROOT/envs/train"
 RETRIEVER_ENV="$PROJECT_ROOT/envs/retriever"
 BM25_INDEX="$PROJECT_ROOT/data/wiki-18-bm25-index/bm25"
+CORPUS_ROOT="$PROJECT_ROOT/data/wiki-18-corpus"
+CORPUS_JSONL="$CORPUS_ROOT/wiki-18.jsonl"
+CORPUS_OFFSETS="$CORPUS_ROOT/wiki-18.offsets.u64"
 HANDOFF="$MANIFEST_DIR/cpu_handoff.json"
 RESULTS_DIR="$RUNS_ROOT/comparison"
 GPU_COUNT="${GPU_COUNT:-}"
 TRAIN_STEPS="${TRAIN_STEPS:-60}"
+TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-4}"
+MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-256}"
 PRICE_PER_HOUR="${AUTODL_PRICE_PER_HOUR:-}"
 
 validate_gpu_inputs() {
@@ -21,6 +26,14 @@ validate_gpu_inputs() {
     }
     [[ "$TRAIN_STEPS" =~ ^[1-9][0-9]*$ ]] || {
         printf 'TRAIN_STEPS must be a positive integer.\n' >&2
+        return 64
+    }
+    [[ "$TRAIN_BATCH_SIZE" == 4 || "$TRAIN_BATCH_SIZE" == 2 ]] || {
+        printf 'TRAIN_BATCH_SIZE must be 4 or the documented OOM fallback 2.\n' >&2
+        return 64
+    }
+    [[ "$MAX_RESPONSE_LENGTH" == 256 || "$MAX_RESPONSE_LENGTH" == 192 ]] || {
+        printf 'MAX_RESPONSE_LENGTH must be 256 or the documented OOM fallback 192.\n' >&2
         return 64
     }
     if [[ ! "$PRICE_PER_HOUR" =~ ^[0-9]+([.][0-9]+)?$ ]] ||
@@ -56,6 +69,9 @@ finish_run_record() {
 "finished_at=$(utc_now)"$'\n'\
 "elapsed_seconds=$elapsed"$'\n'\
 "gpu_count=$GPU_COUNT"$'\n'\
+"train_steps=$TRAIN_STEPS"$'\n'\
+"train_batch_size=$TRAIN_BATCH_SIZE"$'\n'\
+"max_response_length=$MAX_RESPONSE_LENGTH"$'\n'\
 "price_per_hour=$PRICE_PER_HOUR"$'\n'\
 "budget_rmb=$budget_rmb"$'\n'\
 "timeout_seconds=$timeout_seconds"$'\n'\
@@ -94,13 +110,28 @@ run_job() {
         "$mode" "$variant" "$budget_rmb" "$timeout_seconds" "$run_dir"
 
     set +e
-    OUTPUT_DIR="$run_dir/checkpoints" \
+    : >"$run_dir/train.log"
+    AUTODL_CONFIG_ONLY=1 \
+        OUTPUT_DIR="$run_dir/checkpoints" \
         GPU_COUNT="$GPU_COUNT" \
+        TRAIN_BATCH_SIZE="$TRAIN_BATCH_SIZE" \
+        MAX_RESPONSE_LENGTH="$MAX_RESPONSE_LENGTH" \
+        AUTODL_ROOT="$PROJECT_ROOT" \
+        bash "$CHECKOUT_DIR/scripts/autodl/train_small_grpo.sh" \
+        "$mode" "$variant" "$argument" \
+        >"$run_dir/resolved-config.yaml" 2>>"$run_dir/train.log"
+    rc=$?
+    if ((rc == 0)); then
+        OUTPUT_DIR="$run_dir/checkpoints" \
+        GPU_COUNT="$GPU_COUNT" \
+        TRAIN_BATCH_SIZE="$TRAIN_BATCH_SIZE" \
+        MAX_RESPONSE_LENGTH="$MAX_RESPONSE_LENGTH" \
         AUTODL_ROOT="$PROJECT_ROOT" \
         timeout --signal=TERM --kill-after=120s "${timeout_seconds}s" \
         bash "$CHECKOUT_DIR/scripts/autodl/train_small_grpo.sh" \
-        "$mode" "$variant" "$argument" >"$run_dir/train.log" 2>&1
-    rc=$?
+        "$mode" "$variant" "$argument" >>"$run_dir/train.log" 2>&1
+        rc=$?
+    fi
     set -e
     finish_run_record "$run_dir" "$rc" "$started_epoch" "$started_at" \
         "$budget_rmb" "$timeout_seconds"
@@ -144,6 +175,7 @@ gpu_action() {
     export HUGGINGFACE_HUB_CACHE="$HF_HUB_CACHE"
     export TOKENIZERS_PARALLELISM=false
     export PYTHONDONTWRITEBYTECODE=1
+    export JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
     export NO_PROXY="127.0.0.1,localhost${NO_PROXY:+,$NO_PROXY}"
     export no_proxy="$NO_PROXY"
 
@@ -190,7 +222,10 @@ PY
     mkdir -p "$RESULTS_DIR"
     retriever_log="$LOG_DIR/bm25-$(date -u +'%Y%m%dT%H%M%SZ').log"
     setsid "$RETRIEVER_ENV/bin/python" "$CHECKOUT_DIR/search_r1/search/bm25_server.py" \
-        --index-path "$BM25_INDEX" --topk 3 --host 127.0.0.1 --port 8000 \
+        --index-path "$BM25_INDEX" \
+        --corpus-path "$CORPUS_JSONL" \
+        --offsets-path "$CORPUS_OFFSETS" \
+        --topk 3 --host 127.0.0.1 --port 8000 \
         >"$retriever_log" 2>&1 < /dev/null &
     retriever_pid=$!
     cleanup_retriever() {
