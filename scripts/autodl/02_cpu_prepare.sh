@@ -243,6 +243,15 @@ for path, expected_gpu_count in zip(map(Path, sys.argv[1:]), (1, 2)):
         raise SystemExit("GRPO group and actor mini-batch configuration are inconsistent")
     if config.trainer.n_gpus_per_node != expected_gpu_count:
         raise SystemExit(f"GPU count mismatch in {path}")
+    expected_wrap_classes = ["Qwen3_5DecoderLayer"]
+    actor_wrap_classes = list(
+        config.actor_rollout_ref.actor.fsdp_config.wrap_policy.transformer_layer_cls_to_wrap
+    )
+    ref_wrap_classes = list(
+        config.actor_rollout_ref.ref.fsdp_config.wrap_policy.transformer_layer_cls_to_wrap
+    )
+    if actor_wrap_classes != expected_wrap_classes or ref_wrap_classes != expected_wrap_classes:
+        raise SystemExit(f"Qwen3.5 FSDP wrap policy mismatch in {path}")
 PY
 
     "$train_python" -m pip freeze --all >"$MANIFEST_DIR/train-freeze.txt"
