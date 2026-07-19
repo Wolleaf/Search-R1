@@ -33,37 +33,61 @@ case "$MODE:$VARIANT" in
     train:smoke)
         COST_LAMBDA=0.0
         TOTAL_STEPS="${3:-1}"
-        SAVE_FREQ=1
-        TEST_FREQ=1
+        [[ "$TOTAL_STEPS" == 1 && $# -le 3 ]] || {
+            printf 'Smoke training is fixed at one step.\n' >&2
+            exit 64
+        }
+        SAVE_FREQ="$TOTAL_STEPS"
+        TEST_FREQ="$TOTAL_STEPS"
         MODEL_PATH="$MODEL_DIR"
         VAL_FILE="$DATA_DIR/val_64.parquet"
         VAL_ONLY=false
         VAL_BEFORE_TRAIN=false
         USE_KL_LOSS=true
         ;;
-    train:baseline)
+    train:reproduce)
         COST_LAMBDA=0.0
         TOTAL_STEPS="${3:-60}"
-        SAVE_FREQ=20
-        TEST_FREQ=20
+        [[ $# -le 3 ]] || {
+            printf 'Reproduction training always starts from the prepared base model.\n' >&2
+            exit 64
+        }
+        SAVE_FREQ="$TOTAL_STEPS"
+        TEST_FREQ="$TOTAL_STEPS"
         MODEL_PATH="$MODEL_DIR"
         VAL_FILE="$DATA_DIR/val_64.parquet"
         VAL_ONLY=false
         VAL_BEFORE_TRAIN=false
         USE_KL_LOSS=true
         ;;
-    train:cost_aware)
-        COST_LAMBDA=0.10
-        TOTAL_STEPS="${3:-60}"
-        SAVE_FREQ=20
-        TEST_FREQ=20
-        MODEL_PATH="$MODEL_DIR"
+    train:control|train:cost_aware)
+        if [[ $# == 3 && ! "$3" =~ ^[1-9][0-9]*$ ]]; then
+            TOTAL_STEPS=20
+            MODEL_PATH="$3"
+        elif [[ $# == 4 ]]; then
+            TOTAL_STEPS="$3"
+            MODEL_PATH="$4"
+        else
+            printf 'Pass the reproduced checkpoint shared by both second-stage branches.\n' >&2
+            exit 64
+        fi
+        if [[ "$VARIANT" == cost_aware ]]; then
+            COST_LAMBDA=0.10
+        else
+            COST_LAMBDA=0.0
+        fi
+        SAVE_FREQ="$TOTAL_STEPS"
+        TEST_FREQ="$TOTAL_STEPS"
         VAL_FILE="$DATA_DIR/val_64.parquet"
         VAL_ONLY=false
         VAL_BEFORE_TRAIN=false
         USE_KL_LOSS=true
         ;;
-    eval:baseline|eval:cost_aware)
+    eval:base|eval:reproduced|eval:control|eval:cost_aware)
+        [[ $# == 3 ]] || {
+            printf 'Pass exactly one model/checkpoint path for evaluation.\n' >&2
+            exit 64
+        }
         COST_LAMBDA=0.10
         TOTAL_STEPS=1
         SAVE_FREQ=-1
@@ -75,8 +99,10 @@ case "$MODE:$VARIANT" in
         USE_KL_LOSS=false
         ;;
     *)
-        printf 'Usage: %s train {smoke|baseline|cost_aware} [steps]\n' "$0" >&2
-        printf '   or: %s eval {baseline|cost_aware} CHECKPOINT\n' "$0" >&2
+        printf 'Usage: %s train smoke [1]\n' "$0" >&2
+        printf '   or: %s train reproduce [STEPS]\n' "$0" >&2
+        printf '   or: %s train {control|cost_aware} [STEPS] REPRODUCED_CHECKPOINT\n' "$0" >&2
+        printf '   or: %s eval {base|reproduced|control|cost_aware} MODEL_PATH\n' "$0" >&2
         exit 64
         ;;
 esac

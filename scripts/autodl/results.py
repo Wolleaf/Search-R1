@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Select validation checkpoints and summarize the two fixed test runs."""
+"""Select validation checkpoints and summarize fixed-endpoint test runs."""
 
 from __future__ import annotations
 
@@ -12,9 +12,19 @@ import re
 import sys
 
 
-def metric_rows(log_path: Path) -> list[tuple[int, dict[str, float]]]:
+EVAL_METRICS = {
+    "utility": "val/utility",
+    "em": "val/em",
+    "search_count": "val/search_count",
+    "no_search_ratio": "val/no_search_ratio",
+}
+UTILITY_LAMBDA = 0.10
+UTILITY_TOLERANCE = 2e-6
+
+
+def _metric_rows(log_path: Path, reject_duplicates: bool) -> list[tuple[int, dict[str, float]]]:
     rows = []
-    for line in log_path.read_text(errors="replace").splitlines():
+    for line_number, line in enumerate(log_path.read_text(errors="replace").splitlines(), 1):
         match = re.search(r"(?:^|\s)step:(\d+)(?:\s|$)", line)
         if not match:
             continue
@@ -25,15 +35,26 @@ def metric_rows(log_path: Path) -> list[tuple[int, dict[str, float]]]:
             key, raw_value = token.rsplit(":", 1)
             key = key.strip()
             try:
-                metrics[key] = float(raw_value.strip())
+                value = float(raw_value.strip())
             except ValueError:
                 continue
+            if reject_duplicates and key in metrics:
+                raise ValueError(f"duplicate metric {key!r} in {log_path}:{line_number}")
+            metrics[key] = value
         rows.append((int(match.group(1)), metrics))
     return rows
 
 
+def metric_rows(log_path: Path) -> list[tuple[int, dict[str, float]]]:
+    return _metric_rows(log_path, reject_duplicates=False)
+
+
 def mean_prefix(metrics: dict[str, float], prefix: str) -> float | None:
-    values = [value for key, value in metrics.items() if key.startswith(prefix)]
+    prefix = prefix.rstrip("/")
+    values = [
+        value for key, value in metrics.items()
+        if key == prefix or key.startswith(f"{prefix}/")
+    ]
     return sum(values) / len(values) if values else None
 
 
@@ -67,49 +88,208 @@ def select(args: argparse.Namespace) -> None:
 
 def read_run_metadata(path: Path) -> dict[str, str]:
     values = {}
-    for line in path.read_text().splitlines():
-        if "=" in line:
-            key, value = line.split("=", 1)
-            values[key] = value
+    for line_number, line in enumerate(path.read_text().splitlines(), 1):
+        if not line:
+            continue
+        if "=" not in line:
+            raise ValueError(f"invalid metadata line in {path}:{line_number}")
+        key, value = line.split("=", 1)
+        if not key or key in values:
+            raise ValueError(f"duplicate or empty metadata key in {path}:{line_number}")
+        values[key] = value
     return values
 
 
 def final_metrics(log_path: Path) -> dict[str, float]:
-    for _, metrics in reversed(metric_rows(log_path)):
-        em = mean_prefix(metrics, "val/em/")
-        if em is not None:
-            search_count = mean_prefix(metrics, "val/search_count/")
-            no_search_ratio = mean_prefix(metrics, "val/no_search_ratio/")
-            utility = mean_prefix(metrics, "val/utility/")
-            return {
-                "em": em,
-                "search_count": 0.0 if search_count is None else search_count,
-                "no_search_ratio": 0.0 if no_search_ratio is None else no_search_ratio,
-                "utility": em if utility is None else utility,
-            }
-    raise ValueError(f"no test metrics found in {log_path}")
+    evaluation_rows = []
+    for step, metrics in _metric_rows(log_path, reject_duplicates=True):
+        if any(mean_prefix(metrics, prefix) is not None for prefix in EVAL_METRICS.values()):
+            evaluation_rows.append((step, metrics))
+    if len(evaluation_rows) != 1:
+        raise ValueError(
+            f"expected exactly one evaluation record in {log_path}, found {len(evaluation_rows)}"
+        )
+
+    _, metrics = evaluation_rows[0]
+    result = {}
+    missing = []
+    for name, prefix in EVAL_METRICS.items():
+        value = mean_prefix(metrics, prefix)
+        if value is None:
+            missing.append(prefix)
+        elif not math.isfinite(value):
+            raise ValueError(f"non-finite {prefix} metric in {log_path}")
+        else:
+            result[name] = value
+    if missing:
+        raise ValueError(f"evaluation record in {log_path} is missing: {', '.join(missing)}")
+    expected_utility = result["em"] - UTILITY_LAMBDA * result["search_count"] / 2
+    if not math.isclose(
+        result["utility"], expected_utility, rel_tol=0.0, abs_tol=UTILITY_TOLERANCE
+    ):
+        raise ValueError(
+            f"utility in {log_path} is inconsistent with lambda={UTILITY_LAMBDA:.2f}: "
+            f"found {result['utility']}, expected {expected_utility}"
+        )
+    return result
+
+
+def training_fields(path: Path, expected_role: str) -> dict[str, str | int | float]:
+    metadata = read_run_metadata(path)
+    required = {
+        "checkpoint",
+        "checkpoint_digest",
+        "checkout_commit",
+        "cost_lambda",
+        "cpu_handoff_digest",
+        "elapsed_seconds",
+        "gpu_count",
+        "parent_checkpoint",
+        "parent_checkpoint_digest",
+        "price_per_hour",
+        "resolved_config_sha256",
+        "role",
+        "seed",
+    }
+    missing = sorted(required - metadata.keys())
+    if missing:
+        raise ValueError(f"metadata {path} is missing: {', '.join(missing)}")
+    if metadata["role"] != expected_role:
+        raise ValueError(
+            f"metadata {path} has role {metadata['role']!r}, expected {expected_role!r}"
+        )
+    provenance_keys = (
+        "checkpoint",
+        "checkpoint_digest",
+        "checkout_commit",
+        "cpu_handoff_digest",
+        "parent_checkpoint",
+        "parent_checkpoint_digest",
+        "resolved_config_sha256",
+    )
+    if any(not metadata[key] for key in provenance_keys):
+        raise ValueError(f"metadata {path} has an empty provenance field")
+
+    elapsed = int(metadata["elapsed_seconds"])
+    gpu_count = int(metadata["gpu_count"])
+    price = float(metadata["price_per_hour"])
+    seed = int(metadata["seed"])
+    cost_lambda = float(metadata["cost_lambda"])
+    expected_lambda = 0.10 if expected_role == "cost_aware" else 0.0
+    if not math.isclose(cost_lambda, expected_lambda, rel_tol=0.0, abs_tol=1e-12):
+        raise ValueError(
+            f"metadata {path} has cost_lambda {cost_lambda}, expected {expected_lambda}"
+        )
+    if (
+        elapsed < 0
+        or gpu_count <= 0
+        or not math.isfinite(price)
+        or price < 0
+        or not math.isfinite(cost_lambda)
+    ):
+        raise ValueError(f"metadata {path} has invalid training resource values")
+    return {
+        "checkpoint": metadata["checkpoint"],
+        "checkpoint_digest": metadata["checkpoint_digest"],
+        "checkout_commit": metadata["checkout_commit"],
+        "cost_lambda": cost_lambda,
+        "cpu_handoff_digest": metadata["cpu_handoff_digest"],
+        "parent_checkpoint": metadata["parent_checkpoint"],
+        "parent_checkpoint_digest": metadata["parent_checkpoint_digest"],
+        "resolved_config_sha256": metadata["resolved_config_sha256"],
+        "seed": seed,
+        "elapsed_seconds": elapsed,
+        "gpu_hours": elapsed * gpu_count / 3600,
+        "actual_rmb": elapsed * price / 3600,
+    }
 
 
 def summarize(args: argparse.Namespace) -> None:
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    output_rows = []
-    for variant, eval_log, run_metadata in (
-        ("baseline", args.baseline_log, args.baseline_run_metadata),
-        ("cost_aware", args.cost_log, args.cost_run_metadata),
-    ):
-        metrics = final_metrics(eval_log)
-        metadata = read_run_metadata(run_metadata)
-        elapsed = int(metadata["elapsed_seconds"])
-        gpu_count = int(metadata["gpu_count"])
-        price = metadata.get("price_per_hour", "")
-        metrics.update({
-            "model": variant,
-            "gpu_hours": elapsed * gpu_count / 3600,
-            "actual_rmb": "" if not price else elapsed * float(price) / 3600,
-        })
-        output_rows.append(metrics)
+    run_fields = {
+        "reproduced": training_fields(args.reproduced_run_metadata, "reproduced"),
+        "control": training_fields(args.control_run_metadata, "control"),
+        "cost_aware": training_fields(args.cost_aware_run_metadata, "cost_aware"),
+    }
+    base_checkpoint = str(args.base_checkpoint)
+    base_checkpoint_digest = str(args.base_checkpoint_digest)
+    if not base_checkpoint or not base_checkpoint_digest:
+        raise ValueError("base checkpoint path and digest must not be empty")
+    reproduced_checkpoint = run_fields["reproduced"]["checkpoint"]
+    if run_fields["reproduced"]["parent_checkpoint"] != base_checkpoint:
+        raise ValueError("reproduced parent checkpoint does not match the base checkpoint")
+    if run_fields["reproduced"]["parent_checkpoint_digest"] != base_checkpoint_digest:
+        raise ValueError("reproduced parent digest does not match the base checkpoint digest")
+    for model in ("control", "cost_aware"):
+        if run_fields[model]["parent_checkpoint"] != reproduced_checkpoint:
+            raise ValueError(
+                f"{model} parent checkpoint does not match the reproduced checkpoint"
+            )
+        if (
+            run_fields[model]["parent_checkpoint_digest"]
+            != run_fields["reproduced"]["checkpoint_digest"]
+        ):
+            raise ValueError(
+                f"{model} parent digest does not match the reproduced checkpoint digest"
+            )
+    for provenance in ("checkout_commit", "cpu_handoff_digest"):
+        values = {fields[provenance] for fields in run_fields.values()}
+        if len(values) != 1:
+            raise ValueError(f"R/B/C metadata disagree on {provenance}")
+    if run_fields["control"]["seed"] != run_fields["cost_aware"]["seed"]:
+        raise ValueError("control and cost-aware metadata disagree on seed")
 
-    fields = ["model", "em", "search_count", "no_search_ratio", "utility", "gpu_hours", "actual_rmb"]
+    labels = {
+        "base": "A / Base",
+        "reproduced": "R / Reproduced",
+        "control": "B / Control",
+        "cost_aware": "C / Cost-aware",
+    }
+    eval_logs = {
+        "base": args.base_log,
+        "reproduced": args.reproduced_log,
+        "control": args.control_log,
+        "cost_aware": args.cost_aware_log,
+    }
+    output_rows = []
+    for stage, model in zip("ARBC", ("base", "reproduced", "control", "cost_aware")):
+        metrics = final_metrics(eval_logs[model])
+        resource_fields = run_fields.get(model, {
+            "checkpoint": base_checkpoint,
+            "checkpoint_digest": base_checkpoint_digest,
+            "checkout_commit": "",
+            "cost_lambda": "",
+            "cpu_handoff_digest": "",
+            "parent_checkpoint": "",
+            "parent_checkpoint_digest": "",
+            "resolved_config_sha256": "",
+            "seed": "",
+            "elapsed_seconds": 0,
+            "gpu_hours": 0.0,
+            "actual_rmb": 0.0,
+        })
+        output_rows.append({"stage": stage, "model": model, **metrics, **resource_fields})
+
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    fields = [
+        "stage",
+        "model",
+        "checkpoint",
+        "checkpoint_digest",
+        "parent_checkpoint",
+        "parent_checkpoint_digest",
+        "checkout_commit",
+        "cpu_handoff_digest",
+        "resolved_config_sha256",
+        "seed",
+        "cost_lambda",
+        "em",
+        "search_count",
+        "no_search_ratio",
+        "utility",
+        "elapsed_seconds",
+        "gpu_hours",
+        "actual_rmb",
+    ]
     with (args.output_dir / "results.csv").open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
@@ -117,14 +297,15 @@ def summarize(args: argparse.Namespace) -> None:
     lines = [
         "# Test-128 Results",
         "",
-        "| Model | NQ EM | Avg searches | No-search ratio | Utility | GPU hours | RMB |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| Model | NQ EM | Avg searches | No-search ratio | Utility (lambda=0.10) | Train seconds | GPU hours | RMB | Checkpoint | Parent |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |",
     ]
     for row in output_rows:
-        rmb = "n/a" if row["actual_rmb"] == "" else f"{row['actual_rmb']:.2f}"
         lines.append(
-            f"| {row['model']} | {row['em']:.3f} | {row['search_count']:.3f} | "
-            f"{row['no_search_ratio']:.3f} | {row['utility']:.3f} | {row['gpu_hours']:.2f} | {rmb} |"
+            f"| {labels[row['model']]} | {row['em']:.3f} | {row['search_count']:.3f} | "
+            f"{row['no_search_ratio']:.3f} | {row['utility']:.3f} | "
+            f"{row['elapsed_seconds']} | {row['gpu_hours']:.2f} | {row['actual_rmb']:.2f} | "
+            f"{row['checkpoint']} | {row['parent_checkpoint'] or '-'} |"
         )
     (args.output_dir / "results.md").write_text("\n".join(lines) + "\n")
 
@@ -139,10 +320,15 @@ def build_parser() -> argparse.ArgumentParser:
     choose.add_argument("--output", type=Path, required=True)
     choose.set_defaults(handler=select)
     summary = commands.add_parser("summarize")
-    summary.add_argument("--baseline-log", type=Path, required=True)
-    summary.add_argument("--cost-log", type=Path, required=True)
-    summary.add_argument("--baseline-run-metadata", type=Path, required=True)
-    summary.add_argument("--cost-run-metadata", type=Path, required=True)
+    summary.add_argument("--base-checkpoint", type=Path, required=True)
+    summary.add_argument("--base-checkpoint-digest", required=True)
+    summary.add_argument("--base-log", type=Path, required=True)
+    summary.add_argument("--reproduced-log", type=Path, required=True)
+    summary.add_argument("--control-log", type=Path, required=True)
+    summary.add_argument("--cost-aware-log", type=Path, required=True)
+    summary.add_argument("--reproduced-run-metadata", type=Path, required=True)
+    summary.add_argument("--control-run-metadata", type=Path, required=True)
+    summary.add_argument("--cost-aware-run-metadata", type=Path, required=True)
     summary.add_argument("--output-dir", type=Path, required=True)
     summary.set_defaults(handler=summarize)
     return parser

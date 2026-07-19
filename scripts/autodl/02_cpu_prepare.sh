@@ -72,6 +72,8 @@ resolve_llmdevelop_python() {
 cpu_action() {
     local _attempt="$1"
     local commit base_python train_python retriever_python python_version torch_version handoff_digest gpu_count
+    local spec mode variant steps model_path config_output_dir parent_placeholder
+    local -a command_args
     commit="$(expected_commit)"
     verify_checkout "$commit"
     [[ -f "$CHECKOUT_DIR/requirements-autodl.lock" ]] || {
@@ -213,45 +215,117 @@ for relative_root in ("search_r1", "verl", "scripts"):
         compile(path.read_bytes(), str(path), "exec")
 PY
 
+    config_output_dir="$PROJECT_ROOT/cache/config-compose/resolved-output"
+    parent_placeholder="$PROJECT_ROOT/cache/config-compose/reproduced-checkpoint-placeholder"
+    mkdir -p "$parent_placeholder"
     for gpu_count in 1 2; do
-        for spec in 'train smoke 1' 'train baseline 60' 'train cost_aware 60' "eval baseline $MODEL_DIR" "eval cost_aware $MODEL_DIR"; do
-            read -r mode variant argument <<<"$spec"
+        for spec in \
+            'train|smoke|1|' \
+            'train|reproduce|60|' \
+            "train|control|20|$parent_placeholder" \
+            "train|cost_aware|20|$parent_placeholder" \
+            "eval|base||$MODEL_DIR" \
+            "eval|reproduced||$parent_placeholder" \
+            "eval|control||$parent_placeholder" \
+            "eval|cost_aware||$parent_placeholder"; do
+            IFS='|' read -r mode variant steps model_path <<<"$spec"
+            command_args=("$mode" "$variant")
+            case "$mode:$variant" in
+                train:smoke|train:reproduce)
+                    command_args+=("$steps")
+                    ;;
+                train:control|train:cost_aware)
+                    command_args+=("$steps" "$model_path")
+                    ;;
+                eval:*)
+                    command_args+=("$model_path")
+                    ;;
+            esac
             AUTODL_CONFIG_ONLY=1 \
                 AUTODL_ROOT="$PROJECT_ROOT" \
                 GPU_COUNT="$gpu_count" \
-                OUTPUT_DIR="$PROJECT_ROOT/cache/config-compose/${gpu_count}gpu-$variant-$mode" \
+                OUTPUT_DIR="$config_output_dir" \
                 bash "$CHECKOUT_DIR/scripts/autodl/train_small_grpo.sh" \
-                "$mode" "$variant" "$argument" \
+                "${command_args[@]}" \
                 >"$MANIFEST_DIR/config-${gpu_count}gpu-$variant-$mode.yaml"
         done
     done
 
     "$train_python" - \
-        "$MANIFEST_DIR/config-1gpu-baseline-train.yaml" \
-        "$MANIFEST_DIR/config-2gpu-baseline-train.yaml" <<'PY'
+        "$MANIFEST_DIR" \
+        "$MODEL_DIR" \
+        "$parent_placeholder" <<'PY'
+from copy import deepcopy
 from pathlib import Path
 import sys
 
 from omegaconf import OmegaConf
 
-for path, expected_gpu_count in zip(map(Path, sys.argv[1:]), (1, 2)):
-    config = OmegaConf.load(path)
-    group_size = config.actor_rollout_ref.rollout.n_agent
-    mini_batch_size = config.actor_rollout_ref.actor.ppo_mini_batch_size
-    expected_mini_batch_size = config.data.train_batch_size * group_size
-    if group_size != 8 or mini_batch_size != expected_mini_batch_size:
-        raise SystemExit("GRPO group and actor mini-batch configuration are inconsistent")
-    if config.trainer.n_gpus_per_node != expected_gpu_count:
-        raise SystemExit(f"GPU count mismatch in {path}")
-    expected_wrap_classes = ["Qwen3_5DecoderLayer"]
-    actor_wrap_classes = list(
-        config.actor_rollout_ref.actor.fsdp_config.wrap_policy.transformer_layer_cls_to_wrap
-    )
-    ref_wrap_classes = list(
-        config.actor_rollout_ref.ref.fsdp_config.wrap_policy.transformer_layer_cls_to_wrap
-    )
-    if actor_wrap_classes != expected_wrap_classes or ref_wrap_classes != expected_wrap_classes:
-        raise SystemExit(f"Qwen3.5 FSDP wrap policy mismatch in {path}")
+manifest_dir, model_dir, parent_placeholder = map(Path, sys.argv[1:])
+train_variants = ("smoke", "reproduce", "control", "cost_aware")
+eval_variants = ("base", "reproduced", "control", "cost_aware")
+
+for gpu_count in (1, 2):
+    configs = {}
+    for mode, variants in (("train", train_variants), ("eval", eval_variants)):
+        for variant in variants:
+            path = manifest_dir / f"config-{gpu_count}gpu-{variant}-{mode}.yaml"
+            config = OmegaConf.load(path)
+            configs[(mode, variant)] = config
+            group_size = config.actor_rollout_ref.rollout.n_agent
+            mini_batch_size = config.actor_rollout_ref.actor.ppo_mini_batch_size
+            expected_mini_batch_size = config.data.train_batch_size * group_size
+            if group_size != 8 or mini_batch_size != expected_mini_batch_size:
+                raise SystemExit(f"GRPO group or actor mini-batch mismatch in {path}")
+            if config.trainer.n_gpus_per_node != gpu_count:
+                raise SystemExit(f"GPU count mismatch in {path}")
+            expected_wrap_classes = ["Qwen3_5DecoderLayer"]
+            actor_wrap_classes = list(
+                config.actor_rollout_ref.actor.fsdp_config.wrap_policy.transformer_layer_cls_to_wrap
+            )
+            ref_wrap_classes = list(
+                config.actor_rollout_ref.ref.fsdp_config.wrap_policy.transformer_layer_cls_to_wrap
+            )
+            if actor_wrap_classes != expected_wrap_classes or ref_wrap_classes != expected_wrap_classes:
+                raise SystemExit(f"Qwen3.5 FSDP wrap policy mismatch in {path}")
+
+    smoke = configs[("train", "smoke")]
+    reproduced = configs[("train", "reproduce")]
+    control = configs[("train", "control")]
+    cost_aware = configs[("train", "cost_aware")]
+    expected_steps = ((smoke, 1), (reproduced, 60), (control, 20), (cost_aware, 20))
+    for config, steps in expected_steps:
+        if config.trainer.total_training_steps != steps:
+            raise SystemExit(f"training step mismatch for {config.trainer.experiment_name}")
+        if config.trainer.save_freq != steps or config.trainer.test_freq != steps:
+            raise SystemExit(f"checkpoint/validation is not fixed to the final step for {config.trainer.experiment_name}")
+
+    if Path(reproduced.actor_rollout_ref.model.path) != model_dir:
+        raise SystemExit("reproduction must start from the prepared base model")
+    for config in (control, cost_aware):
+        if Path(config.actor_rollout_ref.model.path) != parent_placeholder:
+            raise SystemExit("second-stage branch does not use the reproduced-checkpoint placeholder")
+    train_lambdas = {
+        variant: configs[("train", variant)].algorithm.cost_lambda for variant in train_variants
+    }
+    if train_lambdas != {"smoke": 0.0, "reproduce": 0.0, "control": 0.0, "cost_aware": 0.10}:
+        raise SystemExit(f"unexpected training cost lambdas: {train_lambdas}")
+
+    normalized_control = deepcopy(OmegaConf.to_container(control, resolve=True))
+    normalized_cost = deepcopy(OmegaConf.to_container(cost_aware, resolve=True))
+    for normalized in (normalized_control, normalized_cost):
+        normalized["algorithm"]["cost_lambda"] = None
+        normalized["trainer"]["experiment_name"] = None
+    if normalized_control != normalized_cost:
+        raise SystemExit("control and cost-aware branch configs differ beyond lambda and variant")
+
+    for variant in eval_variants:
+        config = configs[("eval", variant)]
+        expected_path = model_dir if variant == "base" else parent_placeholder
+        if Path(config.actor_rollout_ref.model.path) != expected_path:
+            raise SystemExit(f"evaluation model placeholder mismatch for {variant}")
+        if config.algorithm.cost_lambda != 0.10 or not config.trainer.val_only:
+            raise SystemExit(f"evaluation contract mismatch for {variant}")
 PY
 
     "$train_python" -m pip freeze --all >"$MANIFEST_DIR/train-freeze.txt"
@@ -272,14 +346,20 @@ PY
         --extra-file "$MANIFEST_DIR/retriever-freeze.txt" \
         --extra-file "$MANIFEST_DIR/java-version.txt" \
         --extra-file "$MANIFEST_DIR/config-1gpu-smoke-train.yaml" \
-        --extra-file "$MANIFEST_DIR/config-1gpu-baseline-train.yaml" \
+        --extra-file "$MANIFEST_DIR/config-1gpu-reproduce-train.yaml" \
+        --extra-file "$MANIFEST_DIR/config-1gpu-control-train.yaml" \
         --extra-file "$MANIFEST_DIR/config-1gpu-cost_aware-train.yaml" \
-        --extra-file "$MANIFEST_DIR/config-1gpu-baseline-eval.yaml" \
+        --extra-file "$MANIFEST_DIR/config-1gpu-base-eval.yaml" \
+        --extra-file "$MANIFEST_DIR/config-1gpu-reproduced-eval.yaml" \
+        --extra-file "$MANIFEST_DIR/config-1gpu-control-eval.yaml" \
         --extra-file "$MANIFEST_DIR/config-1gpu-cost_aware-eval.yaml" \
         --extra-file "$MANIFEST_DIR/config-2gpu-smoke-train.yaml" \
-        --extra-file "$MANIFEST_DIR/config-2gpu-baseline-train.yaml" \
+        --extra-file "$MANIFEST_DIR/config-2gpu-reproduce-train.yaml" \
+        --extra-file "$MANIFEST_DIR/config-2gpu-control-train.yaml" \
         --extra-file "$MANIFEST_DIR/config-2gpu-cost_aware-train.yaml" \
-        --extra-file "$MANIFEST_DIR/config-2gpu-baseline-eval.yaml" \
+        --extra-file "$MANIFEST_DIR/config-2gpu-base-eval.yaml" \
+        --extra-file "$MANIFEST_DIR/config-2gpu-reproduced-eval.yaml" \
+        --extra-file "$MANIFEST_DIR/config-2gpu-control-eval.yaml" \
         --extra-file "$MANIFEST_DIR/config-2gpu-cost_aware-eval.yaml" \
         --python-version "$python_version" \
         --torch-version "$torch_version" \

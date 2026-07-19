@@ -7,6 +7,7 @@ source "$SCRIPT_DIR/lib/runtime.sh"
 
 TRAIN_ENV="$PROJECT_ROOT/envs/train"
 RETRIEVER_ENV="$PROJECT_ROOT/envs/retriever"
+MODEL_DIR="$PROJECT_ROOT/models/Qwen3.5-2B"
 BM25_INDEX="$PROJECT_ROOT/data/wiki-18-bm25-index/bm25"
 CORPUS_ROOT="$PROJECT_ROOT/data/wiki-18-corpus"
 CORPUS_JSONL="$CORPUS_ROOT/wiki-18.jsonl"
@@ -14,18 +15,16 @@ CORPUS_OFFSETS="$CORPUS_ROOT/wiki-18.offsets.u64"
 HANDOFF="$MANIFEST_DIR/cpu_handoff.json"
 RESULTS_DIR="$RUNS_ROOT/comparison"
 GPU_COUNT="${GPU_COUNT:-}"
-TRAIN_STEPS="${TRAIN_STEPS:-60}"
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-4}"
 MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-256}"
 PRICE_PER_HOUR="${AUTODL_PRICE_PER_HOUR:-}"
+ALLOCATOR_CONFIG="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+readonly REPRODUCE_STEPS=60
+readonly BRANCH_STEPS=20
 
 validate_gpu_inputs() {
     [[ "$GPU_COUNT" == 1 || "$GPU_COUNT" == 2 ]] || {
         printf 'Set GPU_COUNT explicitly to 1 or 2. No GPU auto-detection is performed.\n' >&2
-        return 64
-    }
-    [[ "$TRAIN_STEPS" =~ ^[1-9][0-9]*$ ]] || {
-        printf 'TRAIN_STEPS must be a positive integer.\n' >&2
         return 64
     }
     [[ "$TRAIN_BATCH_SIZE" == 4 || "$TRAIN_BATCH_SIZE" == 2 ]] || {
@@ -34,6 +33,10 @@ validate_gpu_inputs() {
     }
     [[ "$MAX_RESPONSE_LENGTH" == 256 || "$MAX_RESPONSE_LENGTH" == 192 ]] || {
         printf 'MAX_RESPONSE_LENGTH must be 256 or the documented OOM fallback 192.\n' >&2
+        return 64
+    }
+    [[ "$ALLOCATOR_CONFIG" == expandable_segments:True ]] || {
+        printf 'PYTORCH_CUDA_ALLOC_CONF must be expandable_segments:True.\n' >&2
         return 64
     }
     if [[ ! "$PRICE_PER_HOUR" =~ ^[0-9]+([.][0-9]+)?$ ]] ||
@@ -47,12 +50,46 @@ validate_gpu_inputs() {
     }
 }
 
+file_sha256() {
+    local path="$1"
+    [[ -f "$path" && ! -L "$path" ]] || {
+        printf 'Cannot hash missing or symlinked file: %s\n' "$path" >&2
+        return 1
+    }
+    sha256sum -- "$path" | cut -d' ' -f1
+}
+
+tree_sha256() {
+    local root="$1"
+    [[ -d "$root" && ! -L "$root" ]] || {
+        printf 'Cannot hash missing or symlinked directory: %s\n' "$root" >&2
+        return 1
+    }
+    (
+        cd "$root"
+        [[ -z "$(find . -path './.cache' -prune -o -type l -print -quit)" ]] || {
+            printf 'Artifact tree contains a symlink: %s\n' "$root" >&2
+            return 1
+        }
+        find . -path './.cache' -prune -o -type f -print0 \
+            | LC_ALL=C sort -z \
+            | xargs -0 -r sha256sum \
+            | sha256sum \
+            | cut -d' ' -f1
+    )
+}
+
 finish_run_record() {
     local run_dir="$1" rc="$2" started_epoch="$3" started_at="$4"
     local budget_rmb="$5" timeout_seconds="$6"
+    local job_mode="$7" variant="$8" requested_steps="$9" input_model="${10}"
     local finished_epoch elapsed state marker timed_out=false
+    local resolved_config_sha256=unavailable
     finished_epoch="$(date +%s)"
     elapsed=$((finished_epoch - started_epoch))
+    if [[ -f "$run_dir/resolved-config.yaml" && ! -L "$run_dir/resolved-config.yaml" ]]; then
+        resolved_config_sha256="$(file_sha256 "$run_dir/resolved-config.yaml")"
+    fi
     if ((rc == 0)); then
         state=success
         marker=.success
@@ -68,10 +105,15 @@ finish_run_record() {
         "started_at=$started_at"$'\n'\
 "finished_at=$(utc_now)"$'\n'\
 "elapsed_seconds=$elapsed"$'\n'\
+"job_mode=$job_mode"$'\n'\
+"variant=$variant"$'\n'\
 "gpu_count=$GPU_COUNT"$'\n'\
-"train_steps=$TRAIN_STEPS"$'\n'\
+"train_steps=$requested_steps"$'\n'\
 "train_batch_size=$TRAIN_BATCH_SIZE"$'\n'\
 "max_response_length=$MAX_RESPONSE_LENGTH"$'\n'\
+"input_model=$input_model"$'\n'\
+"resolved_config_sha256=$resolved_config_sha256"$'\n'\
+"pytorch_cuda_alloc_conf=$ALLOCATOR_CONFIG"$'\n'\
 "price_per_hour=$PRICE_PER_HOUR"$'\n'\
 "budget_rmb=$budget_rmb"$'\n'\
 "timeout_seconds=$timeout_seconds"$'\n'\
@@ -84,21 +126,63 @@ finish_run_record() {
 }
 
 run_job() {
-    local mode="$1" variant="$2" argument="$3"
+    local mode="$1" variant="$2" argument="${3:-}" model_path="${4:-}"
     local parent run_dir started_epoch started_at rc budget_rmb timeout_seconds
+    local requested_steps=0 input_model
+    local -a job_args
     case "$mode:$variant" in
-        train:smoke) budget_rmb=30 ;;
-        train:baseline|train:cost_aware) budget_rmb=100 ;;
-        eval:baseline|eval:cost_aware) budget_rmb=15 ;;
+        train:smoke)
+            [[ "$argument" == 1 ]] || { printf 'Base smoke gate is fixed at one step.\n' >&2; return 64; }
+            budget_rmb=15
+            ;;
+        train:reproduce)
+            [[ "$argument" == "$REPRODUCE_STEPS" ]] || {
+                printf 'Reproduction endpoint is fixed at step %s.\n' "$REPRODUCE_STEPS" >&2
+                return 64
+            }
+            budget_rmb=100
+            ;;
+        train:control)
+            if [[ "$argument" == 1 ]]; then
+                budget_rmb=15
+            elif [[ "$argument" == "$BRANCH_STEPS" ]]; then
+                budget_rmb=40
+            else
+                printf 'Control is allowed only for the one-step gate or step %s endpoint.\n' "$BRANCH_STEPS" >&2
+                return 64
+            fi
+            ;;
+        train:cost_aware)
+            [[ "$argument" == "$BRANCH_STEPS" ]] || {
+                printf 'Cost-aware endpoint is fixed at step %s.\n' "$BRANCH_STEPS" >&2
+                return 64
+            }
+            budget_rmb=40
+            ;;
+        eval:base|eval:reproduced|eval:control|eval:cost_aware) budget_rmb=10 ;;
         *) printf 'No budget is defined for %s:%s.\n' "$mode" "$variant" >&2; return 64 ;;
     esac
+    if [[ "$mode" == train ]]; then
+        requested_steps="$argument"
+        if [[ "$variant" == control || "$variant" == cost_aware ]]; then
+            input_model="$model_path"
+        else
+            input_model="$MODEL_DIR"
+        fi
+    else
+        input_model="$argument"
+    fi
     timeout_seconds="$(awk -v budget="$budget_rmb" -v price="$PRICE_PER_HOUR" \
         'BEGIN { printf "%d", budget / price * 3600 }')"
     ((timeout_seconds > 0)) || {
         printf 'Computed timeout is not positive for %s:%s.\n' "$mode" "$variant" >&2
         return 64
     }
-    parent="$RUNS_ROOT/$variant"
+    if [[ "$mode" == eval ]]; then
+        parent="$RUNS_ROOT/eval/$variant"
+    else
+        parent="$RUNS_ROOT/$variant"
+    fi
     mkdir -p "$parent/attempts"
     run_dir="$parent/attempts/$(date -u +'%Y%m%dT%H%M%SZ')-$$-$RANDOM"
     mkdir "$run_dir"
@@ -111,6 +195,10 @@ run_job() {
 
     set +e
     : >"$run_dir/train.log"
+    job_args=("$mode" "$variant" "$argument")
+    if [[ -n "$model_path" ]]; then
+        job_args+=("$model_path")
+    fi
     AUTODL_CONFIG_ONLY=1 \
         OUTPUT_DIR="$run_dir/checkpoints" \
         GPU_COUNT="$GPU_COUNT" \
@@ -118,7 +206,7 @@ run_job() {
         MAX_RESPONSE_LENGTH="$MAX_RESPONSE_LENGTH" \
         AUTODL_ROOT="$PROJECT_ROOT" \
         bash "$CHECKOUT_DIR/scripts/autodl/train_small_grpo.sh" \
-        "$mode" "$variant" "$argument" \
+        "${job_args[@]}" \
         >"$run_dir/resolved-config.yaml" 2>>"$run_dir/train.log"
     rc=$?
     if ((rc == 0)); then
@@ -128,13 +216,13 @@ run_job() {
         MAX_RESPONSE_LENGTH="$MAX_RESPONSE_LENGTH" \
         AUTODL_ROOT="$PROJECT_ROOT" \
         timeout --signal=TERM --kill-after=120s "${timeout_seconds}s" \
-        bash "$CHECKOUT_DIR/scripts/autodl/train_small_grpo.sh" \
-        "$mode" "$variant" "$argument" >>"$run_dir/train.log" 2>&1
+            bash "$CHECKOUT_DIR/scripts/autodl/train_small_grpo.sh" \
+            "${job_args[@]}" >>"$run_dir/train.log" 2>&1
         rc=$?
     fi
     set -e
     finish_run_record "$run_dir" "$rc" "$started_epoch" "$started_at" \
-        "$budget_rmb" "$timeout_seconds"
+        "$budget_rmb" "$timeout_seconds" "$mode" "$variant" "$requested_steps" "$input_model"
     LAST_RUN_DIR="$run_dir"
     if ((rc != 0)); then
         printf '%s %s failed with exit code %s; inspect %s/train.log\n' "$mode" "$variant" "$rc" "$run_dir" >&2
@@ -142,20 +230,167 @@ run_job() {
     fi
 }
 
-selected_checkpoint() {
-    local selection_file="$1"
-    "$TRAIN_ENV/bin/python" - "$selection_file" <<'PY'
-import json
-import sys
-print(json.load(open(sys.argv[1]))["checkpoint"])
-PY
+fixed_checkpoint() {
+    local run_dir="$1" step="$2" checkpoint canonical_run canonical_checkpoint canonical_runs_root
+    [[ "$(tr -d '\r\n' <"$run_dir/terminal")" == success ]] || {
+        printf 'Run is not successful: %s\n' "$run_dir" >&2
+        return 1
+    }
+    [[ "$(tr -d '\r\n' <"$run_dir/exit-code")" == 0 && -f "$run_dir/.success" ]] || {
+        printf 'Run has no valid success evidence: %s\n' "$run_dir" >&2
+        return 1
+    }
+    [[ ! -e "$run_dir/.running" ]] || {
+        printf 'Run is still active: %s\n' "$run_dir" >&2
+        return 1
+    }
+    checkpoint="$run_dir/checkpoints/actor/global_step_$step"
+    [[ -d "$checkpoint" && ! -L "$checkpoint" && -f "$checkpoint/config.json" ]] || {
+        printf 'Fixed endpoint checkpoint is incomplete: %s\n' "$checkpoint" >&2
+        return 1
+    }
+    compgen -G "$checkpoint/model*.safetensors" >/dev/null || {
+        printf 'Fixed endpoint checkpoint has no model weights: %s\n' "$checkpoint" >&2
+        return 1
+    }
+    canonical_run="$(readlink -f -- "$run_dir")"
+    canonical_checkpoint="$(readlink -f -- "$checkpoint")"
+    canonical_runs_root="$(readlink -f -- "$RUNS_ROOT")"
+    [[ "$canonical_run" == "$canonical_runs_root/"* &&
+        "$canonical_checkpoint" == "$canonical_run/checkpoints/actor/global_step_$step" ]] || {
+        printf 'Fixed endpoint checkpoint escapes its run directory: %s\n' "$checkpoint" >&2
+        return 1
+    }
+    printf '%s\n' "$canonical_checkpoint"
+}
+
+record_lineage() {
+    local run_dir="$1" role="$2" checkpoint="$3" checkpoint_digest="$4"
+    local parent_checkpoint="$5" parent_checkpoint_digest="$6"
+    local checkout_commit="$7" cpu_handoff_digest="$8" cost_lambda="$9"
+    local metadata resolved_config_sha256 value
+    resolved_config_sha256="$(file_sha256 "$run_dir/resolved-config.yaml")"
+    for value in "$role" "$checkpoint" "$parent_checkpoint"; do
+        [[ -n "$value" && "$value" != *$'\n'* && "$value" != *$'\t'* ]] || {
+            printf 'Invalid lineage value for %s.\n' "$run_dir" >&2
+            return 1
+        }
+    done
+    [[ "$checkpoint_digest" =~ ^[0-9a-f]{64}$ &&
+        "$parent_checkpoint_digest" =~ ^[0-9a-f]{64}$ &&
+        "$cpu_handoff_digest" =~ ^[0-9a-f]{64}$ &&
+        "$resolved_config_sha256" =~ ^[0-9a-f]{64}$ &&
+        "$checkout_commit" =~ ^[0-9a-f]{40}$ ]] || {
+        printf 'Invalid digest in lineage for %s.\n' "$run_dir" >&2
+        return 1
+    }
+    grep -Fxq "resolved_config_sha256=$resolved_config_sha256" "$run_dir/run.env" || {
+        printf 'Resolved config digest changed for %s.\n' "$run_dir" >&2
+        return 1
+    }
+    metadata="$(cat "$run_dir/run.env")"
+    atomic_write "$run_dir/run.env" \
+        "$metadata"$'\n'\
+"role=$role"$'\n'\
+"checkpoint=$checkpoint"$'\n'\
+"checkpoint_digest=$checkpoint_digest"$'\n'\
+"parent_checkpoint=$parent_checkpoint"$'\n'\
+"parent_checkpoint_digest=$parent_checkpoint_digest"$'\n'\
+"checkout_commit=$checkout_commit"$'\n'\
+"cpu_handoff_digest=$cpu_handoff_digest"$'\n'\
+"seed=42"$'\n'\
+"cost_lambda=$cost_lambda"$'\n'
+    atomic_write "$run_dir/lineage.tsv" \
+        $'role\tcheckpoint\tcheckpoint_digest\tparent_checkpoint\tparent_checkpoint_digest\tcheckout_commit\tcpu_handoff_digest\tresolved_config_sha256\n'\
+"$role"$'\t'"$checkpoint"$'\t'"$checkpoint_digest"$'\t'"$parent_checkpoint"$'\t'"$parent_checkpoint_digest"$'\t'"$checkout_commit"$'\t'"$cpu_handoff_digest"$'\t'"$resolved_config_sha256"$'\n'
+    sync_path "$run_dir"
+}
+
+delete_gate_checkpoint() {
+    local run_dir="$1" checkpoint="$2" variant="$3"
+    local canonical_run canonical_runs_root expected_checkpoint bytes metadata
+    canonical_run="$(readlink -f -- "$run_dir")"
+    canonical_runs_root="$(readlink -f -- "$RUNS_ROOT")"
+    expected_checkpoint="$canonical_run/checkpoints/actor/global_step_1"
+    [[ "$canonical_run" == "$canonical_runs_root/"* ]] || {
+        printf 'Refusing gate cleanup outside the runs root: %s\n' "$run_dir" >&2
+        return 1
+    }
+    [[ "$checkpoint" == "$expected_checkpoint" && -d "$checkpoint" && ! -L "$checkpoint" ]] || {
+        printf 'Refusing unsafe gate checkpoint cleanup: %s\n' "$checkpoint" >&2
+        return 1
+    }
+    [[ "$(tr -d '\r\n' <"$run_dir/terminal")" == success &&
+        "$(tr -d '\r\n' <"$run_dir/exit-code")" == 0 &&
+        -f "$run_dir/.success" && ! -e "$run_dir/.running" ]] || {
+        printf 'Refusing cleanup without successful gate evidence: %s\n' "$run_dir" >&2
+        return 1
+    }
+    grep -Fxq 'job_mode=train' "$run_dir/run.env" \
+        && grep -Fxq "variant=$variant" "$run_dir/run.env" \
+        && grep -Fxq 'train_steps=1' "$run_dir/run.env" || {
+        printf 'Refusing cleanup of a non-gate run: %s\n' "$run_dir" >&2
+        return 1
+    }
+    bytes="$(du -sb "$checkpoint" | cut -f1)"
+    atomic_write "$run_dir/checkpoint-cleanup.env" \
+        "requested_at=$(utc_now)"$'\n'\
+"target=$checkpoint"$'\n'\
+"bytes=$bytes"$'\n'\
+"reason=successful-gate-is-not-a-scientific-checkpoint"$'\n'
+    sync_path "$run_dir"
+    rm -rf -- "$checkpoint"
+    [[ ! -e "$checkpoint" && ! -L "$checkpoint" ]] || return 1
+    metadata="$(cat "$run_dir/checkpoint-cleanup.env")"
+    atomic_write "$run_dir/checkpoint-cleanup.env" \
+        "$metadata"$'\n'"completed_at=$(utc_now)"$'\n'
+    sync_path "$run_dir"
+}
+
+write_lineage_manifest() {
+    local base_checkpoint="$1" base_digest="$2"
+    local reproduced_checkpoint="$3" reproduced_digest="$4" reproduced_config="$5"
+    local control_checkpoint="$6" control_digest="$7" control_config="$8"
+    local cost_checkpoint="$9" cost_digest="${10}" cost_config="${11}"
+    local checkout_commit="${12}" cpu_handoff_digest="${13}" value
+    for value in "$base_checkpoint" "$reproduced_checkpoint" "$control_checkpoint" "$cost_checkpoint"; do
+        [[ -n "$value" && "$value" != *$'\n'* && "$value" != *$'\t'* ]] || {
+            printf 'Invalid checkpoint path in comparison lineage.\n' >&2
+            return 1
+        }
+    done
+    for value in "$base_digest" "$reproduced_digest" "$reproduced_config" \
+        "$control_digest" "$control_config" "$cost_digest" "$cost_config" \
+        "$cpu_handoff_digest"; do
+        [[ "$value" =~ ^[0-9a-f]{64}$ ]] || {
+            printf 'Invalid digest in comparison lineage.\n' >&2
+            return 1
+        }
+    done
+    [[ "$checkout_commit" =~ ^[0-9a-f]{40}$ ]] || {
+        printf 'Invalid checkout commit in comparison lineage.\n' >&2
+        return 1
+    }
+    atomic_write "$RESULTS_DIR/lineage.tsv" \
+        $'stage\trole\tcheckpoint\tcheckpoint_digest\tparent_checkpoint\tparent_checkpoint_digest\tcheckout_commit\tcpu_handoff_digest\tresolved_config_sha256\n'\
+"A"$'\t'"base"$'\t'"$base_checkpoint"$'\t'"$base_digest"$'\t-\t-\t'"$checkout_commit"$'\t'"$cpu_handoff_digest"$'\t-\n'\
+"R"$'\t'"reproduced"$'\t'"$reproduced_checkpoint"$'\t'"$reproduced_digest"$'\t'"$base_checkpoint"$'\t'"$base_digest"$'\t'"$checkout_commit"$'\t'"$cpu_handoff_digest"$'\t'"$reproduced_config"$'\n'\
+"B"$'\t'"control"$'\t'"$control_checkpoint"$'\t'"$control_digest"$'\t'"$reproduced_checkpoint"$'\t'"$reproduced_digest"$'\t'"$checkout_commit"$'\t'"$cpu_handoff_digest"$'\t'"$control_config"$'\n'\
+"C"$'\t'"cost_aware"$'\t'"$cost_checkpoint"$'\t'"$cost_digest"$'\t'"$reproduced_checkpoint"$'\t'"$reproduced_digest"$'\t'"$checkout_commit"$'\t'"$cpu_handoff_digest"$'\t'"$cost_config"$'\n'
+    sync_path "$RESULTS_DIR"
 }
 
 gpu_action() {
     local _attempt="$1"
     local commit python_version torch_version recorded_digest actual_digest
-    local retriever_pid='' retriever_log ready=false
-    local baseline_run cost_run baseline_eval cost_eval baseline_checkpoint cost_checkpoint
+    local retriever_pid='' retriever_log ready=false base_model base_model_digest
+    local base_gate_run branch_gate_run reproduce_run control_run cost_run
+    local base_eval reproduced_eval control_eval cost_eval
+    local base_gate_checkpoint branch_gate_checkpoint
+    local reproduce_checkpoint control_checkpoint cost_checkpoint
+    local reproduce_digest control_digest cost_digest
+    local reproduce_config_digest control_config_digest cost_config_digest
+    local comparison_checksums
     validate_gpu_inputs
     commit="$(expected_commit)"
     verify_checkout "$commit"
@@ -163,6 +398,8 @@ gpu_action() {
         printf 'CPU phase is not sealed; refusing paid GPU work.\n' >&2
         return 1
     }
+    rm -f -- "$MANIFEST_DIR/gpu.ok"
+    sync_path "$MANIFEST_DIR"
 
     # Everything after this point is deliberately offline except localhost retrieval.
     export HF_HUB_OFFLINE=1
@@ -175,6 +412,7 @@ gpu_action() {
     export HUGGINGFACE_HUB_CACHE="$HF_HUB_CACHE"
     export TOKENIZERS_PARALLELISM=false
     export PYTHONDONTWRITEBYTECODE=1
+    export PYTORCH_CUDA_ALLOC_CONF="$ALLOCATOR_CONFIG"
     export JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
     export NO_PROXY="127.0.0.1,localhost${NO_PROXY:+,$NO_PROXY}"
     export no_proxy="$NO_PROXY"
@@ -219,6 +457,9 @@ PY
     }
     verify_checkout "$commit"
 
+    base_model="$(readlink -f -- "$MODEL_DIR")"
+    base_model_digest="$(tree_sha256 "$base_model")"
+
     mkdir -p "$RESULTS_DIR"
     retriever_log="$LOG_DIR/bm25-$(date -u +'%Y%m%dT%H%M%SZ').log"
     setsid "$RETRIEVER_ENV/bin/python" "$CHECKOUT_DIR/search_r1/search/bm25_server.py" \
@@ -254,37 +495,79 @@ PY
     }
 
     run_job train smoke 1
-    run_job train baseline "$TRAIN_STEPS"
-    baseline_run="$LAST_RUN_DIR"
-    "$TRAIN_ENV/bin/python" "$CHECKOUT_DIR/scripts/autodl/results.py" select \
-        --variant baseline \
-        --log "$baseline_run/train.log" \
-        --checkpoint-root "$baseline_run/checkpoints" \
-        --output "$baseline_run/selected_checkpoint.json"
-    baseline_checkpoint="$(selected_checkpoint "$baseline_run/selected_checkpoint.json")"
+    base_gate_run="$LAST_RUN_DIR"
+    base_gate_checkpoint="$(fixed_checkpoint "$base_gate_run" 1)"
+    run_job train control 1 "$base_gate_checkpoint"
+    branch_gate_run="$LAST_RUN_DIR"
+    branch_gate_checkpoint="$(fixed_checkpoint "$branch_gate_run" 1)"
+    delete_gate_checkpoint "$branch_gate_run" "$branch_gate_checkpoint" control
+    delete_gate_checkpoint "$base_gate_run" "$base_gate_checkpoint" smoke
 
-    run_job train cost_aware "$TRAIN_STEPS"
+    run_job train reproduce "$REPRODUCE_STEPS"
+    reproduce_run="$LAST_RUN_DIR"
+    reproduce_checkpoint="$(fixed_checkpoint "$reproduce_run" "$REPRODUCE_STEPS")"
+    reproduce_digest="$(tree_sha256 "$reproduce_checkpoint")"
+    reproduce_config_digest="$(file_sha256 "$reproduce_run/resolved-config.yaml")"
+    record_lineage "$reproduce_run" reproduced "$reproduce_checkpoint" "$reproduce_digest" \
+        "$base_model" "$base_model_digest" "$commit" "$recorded_digest" 0
+
+    run_job train control "$BRANCH_STEPS" "$reproduce_checkpoint"
+    control_run="$LAST_RUN_DIR"
+    control_checkpoint="$(fixed_checkpoint "$control_run" "$BRANCH_STEPS")"
+    control_digest="$(tree_sha256 "$control_checkpoint")"
+    control_config_digest="$(file_sha256 "$control_run/resolved-config.yaml")"
+    record_lineage "$control_run" control "$control_checkpoint" "$control_digest" \
+        "$reproduce_checkpoint" "$reproduce_digest" "$commit" "$recorded_digest" 0
+
+    run_job train cost_aware "$BRANCH_STEPS" "$reproduce_checkpoint"
     cost_run="$LAST_RUN_DIR"
-    "$TRAIN_ENV/bin/python" "$CHECKOUT_DIR/scripts/autodl/results.py" select \
-        --variant cost_aware \
-        --log "$cost_run/train.log" \
-        --checkpoint-root "$cost_run/checkpoints" \
-        --output "$cost_run/selected_checkpoint.json"
-    cost_checkpoint="$(selected_checkpoint "$cost_run/selected_checkpoint.json")"
+    cost_checkpoint="$(fixed_checkpoint "$cost_run" "$BRANCH_STEPS")"
+    cost_digest="$(tree_sha256 "$cost_checkpoint")"
+    cost_config_digest="$(file_sha256 "$cost_run/resolved-config.yaml")"
+    record_lineage "$cost_run" cost_aware "$cost_checkpoint" "$cost_digest" \
+        "$reproduce_checkpoint" "$reproduce_digest" "$commit" "$recorded_digest" 0.10
 
-    run_job eval baseline "$baseline_checkpoint"
-    baseline_eval="$LAST_RUN_DIR"
+    run_job eval base "$base_model"
+    base_eval="$LAST_RUN_DIR"
+    run_job eval reproduced "$reproduce_checkpoint"
+    reproduced_eval="$LAST_RUN_DIR"
+    run_job eval control "$control_checkpoint"
+    control_eval="$LAST_RUN_DIR"
     run_job eval cost_aware "$cost_checkpoint"
     cost_eval="$LAST_RUN_DIR"
 
+    write_lineage_manifest \
+        "$base_model" "$base_model_digest" \
+        "$reproduce_checkpoint" "$reproduce_digest" "$reproduce_config_digest" \
+        "$control_checkpoint" "$control_digest" "$control_config_digest" \
+        "$cost_checkpoint" "$cost_digest" "$cost_config_digest" \
+        "$commit" "$recorded_digest"
     "$TRAIN_ENV/bin/python" "$CHECKOUT_DIR/scripts/autodl/results.py" summarize \
-        --baseline-log "$baseline_eval/train.log" \
-        --cost-log "$cost_eval/train.log" \
-        --baseline-run-metadata "$baseline_run/run.env" \
-        --cost-run-metadata "$cost_run/run.env" \
+        --base-log "$base_eval/train.log" \
+        --reproduced-log "$reproduced_eval/train.log" \
+        --control-log "$control_eval/train.log" \
+        --cost-aware-log "$cost_eval/train.log" \
+        --base-checkpoint "$base_model" \
+        --base-checkpoint-digest "$base_model_digest" \
+        --reproduced-run-metadata "$reproduce_run/run.env" \
+        --control-run-metadata "$control_run/run.env" \
+        --cost-aware-run-metadata "$cost_run/run.env" \
         --output-dir "$RESULTS_DIR"
     verify_checkout "$commit"
-    atomic_write "$MANIFEST_DIR/gpu.ok" "$(sha256sum "$RESULTS_DIR/results.csv" | cut -d' ' -f1)"$'\n'
+    [[ -s "$RESULTS_DIR/results.csv" && -s "$RESULTS_DIR/results.md" &&
+        -s "$RESULTS_DIR/lineage.tsv" &&
+        "$(wc -l <"$RESULTS_DIR/results.csv")" == 5 &&
+        "$(wc -l <"$RESULTS_DIR/lineage.tsv")" == 5 ]] || {
+        printf 'Comparison results or four-stage lineage are incomplete.\n' >&2
+        return 1
+    }
+    comparison_checksums="$(
+        cd "$RESULTS_DIR"
+        sha256sum results.csv results.md lineage.tsv
+    )"
+    atomic_write "$RESULTS_DIR/comparison.sha256" "$comparison_checksums"$'\n'
+    sync_path "$RESULTS_DIR"
+    atomic_write "$MANIFEST_DIR/gpu.ok" "$(file_sha256 "$RESULTS_DIR/comparison.sha256")"$'\n'
     sync_path "$MANIFEST_DIR"
     cleanup_retriever
     trap - EXIT
