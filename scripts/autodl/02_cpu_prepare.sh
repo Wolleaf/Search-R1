@@ -112,16 +112,19 @@ from huggingface_hub import snapshot_download
 import sys
 
 model_dir, bm25_dir = sys.argv[1:]
+# Keep snapshot downloads within the memory limit of AutoDL's CPU-only mode.
 snapshot_download(
     repo_id="Qwen/Qwen3.5-2B",
     revision="$MODEL_REVISION",
     local_dir=model_dir,
+    max_workers=1,
 )
 snapshot_download(
     repo_id="PeterJinGo/wiki-18-bm25-index",
     repo_type="dataset",
     revision="$BM25_REVISION",
     local_dir=bm25_dir,
+    max_workers=1,
 )
 PY
 
