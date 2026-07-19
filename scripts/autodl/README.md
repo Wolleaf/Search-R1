@@ -47,9 +47,9 @@ B/C 只从 R 的模型权重启动；Adam、warmup、数据 shuffle 状态和 KL
 
 ## 固定配置与回退
 
-默认配置为两张 GPU、train batch 4、GRPO group size 8、response 256，每步 32 条轨迹，并固定 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`。不再先试单卡。
+默认配置为两张 GPU、train batch 4、GRPO group size 8、最多 4 次搜索、retriever top-k 3、start 1024、observation 384、response 256，每步 32 条轨迹，并固定 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`。`max_prompt_length` 按真实循环固定为 `1024 + 4 * (response + 384)`，默认是 3584；搜索轮数不能通过环境变量覆盖。不再先试单卡。
 
-只有两卡 gate OOM 时才人工重跑整个 GPU 阶段：先设置 `TRAIN_BATCH_SIZE=2`，仍失败再加 `MAX_RESPONSE_LENGTH=192`。R/B/C 必须共享同一卡数和同一组回退参数。失败不会自动重试、不会覆盖旧 attempt，也不会采用早于固定终点的 checkpoint。
+只有两卡 gate OOM 时才人工重跑整个 GPU 阶段：先设置 `TRAIN_BATCH_SIZE=2`，仍失败再加 `MAX_RESPONSE_LENGTH=192`，此时 `max_prompt_length` 自动派生为 3328。R/B/C 必须共享同一卡数和同一组回退参数。失败不会自动重试、不会覆盖旧 attempt，也不会采用早于固定终点的 checkpoint。
 
 ## 预算与存储
 

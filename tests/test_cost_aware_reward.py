@@ -43,7 +43,7 @@ def _deterministic_em(monkeypatch):
 def test_zero_lambda_preserves_em_reward_without_search_tensor():
     data = _data()
     reward = main_ppo.RewardManager(
-        tokenizer=_Tokenizer(), num_examine=0, cost_lambda=0.0, max_searches=2)(data)
+        tokenizer=_Tokenizer(), num_examine=0, cost_lambda=0.0, max_searches=4)(data)
 
     assert reward.sum(-1).tolist() == [1.0, 0.0]
     assert data.batch['sequence_em_scores'].tolist() == [1.0, 0.0]
@@ -51,28 +51,28 @@ def test_zero_lambda_preserves_em_reward_without_search_tensor():
 
 
 def test_cost_reward_is_normalized_by_max_searches():
-    data = _data(search_counts=[2, 1])
+    data = _data(search_counts=[4, 1])
     reward = main_ppo.RewardManager(
-        tokenizer=_Tokenizer(), num_examine=0, cost_lambda=0.1, max_searches=2)(data)
+        tokenizer=_Tokenizer(), num_examine=0, cost_lambda=0.1, max_searches=4)(data)
 
-    assert reward.sum(-1).tolist() == pytest.approx([0.9, -0.05])
+    assert reward.sum(-1).tolist() == pytest.approx([0.9, -0.025])
     assert data.batch['sequence_em_scores'].tolist() == [1.0, 0.0]
-    assert data.batch['sequence_search_costs'].tolist() == pytest.approx([0.1, 0.05])
+    assert data.batch['sequence_search_costs'].tolist() == pytest.approx([0.1, 0.025])
 
 
 def test_search_cost_stays_aligned_after_batch_reorder():
-    data = _data(search_counts=[2, 0])
+    data = _data(search_counts=[4, 0])
     data.reorder(torch.tensor([1, 0]))
 
     reward = main_ppo.RewardManager(
-        tokenizer=_Tokenizer(), num_examine=0, cost_lambda=0.1, max_searches=2)(data)
+        tokenizer=_Tokenizer(), num_examine=0, cost_lambda=0.1, max_searches=4)(data)
 
     assert reward.sum(-1).tolist() == pytest.approx([0.0, 0.9])
 
 
 def test_nonzero_lambda_requires_aligned_search_count():
     manager = main_ppo.RewardManager(
-        tokenizer=_Tokenizer(), num_examine=0, cost_lambda=0.1, max_searches=2)
+        tokenizer=_Tokenizer(), num_examine=0, cost_lambda=0.1, max_searches=4)
 
     with pytest.raises(KeyError, match='executed_search_count'):
         manager(_data())

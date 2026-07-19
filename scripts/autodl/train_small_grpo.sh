@@ -14,6 +14,10 @@ MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-256}"
 OUTPUT_DIR="${OUTPUT_DIR:?Set OUTPUT_DIR to the run checkpoint directory}"
 GRPO_GROUP_SIZE=8
 PPO_MINI_BATCH_SIZE=$((TRAIN_BATCH_SIZE * GRPO_GROUP_SIZE))
+readonly MAX_TURNS=4
+readonly MAX_START_LENGTH=1024
+readonly MAX_OBS_LENGTH=384
+readonly RETRIEVER_TOPK=3
 
 [[ "$GPU_COUNT" == 1 || "$GPU_COUNT" == 2 ]] || { printf 'GPU_COUNT must be 1 or 2.\n' >&2; exit 64; }
 [[ "$TRAIN_BATCH_SIZE" == 4 || "$TRAIN_BATCH_SIZE" == 2 ]] || {
@@ -24,6 +28,7 @@ PPO_MINI_BATCH_SIZE=$((TRAIN_BATCH_SIZE * GRPO_GROUP_SIZE))
     printf 'MAX_RESPONSE_LENGTH must be 256 (default) or the documented OOM fallback 192.\n' >&2
     exit 64
 }
+readonly MAX_PROMPT_LENGTH=$((MAX_START_LENGTH + MAX_TURNS * (MAX_RESPONSE_LENGTH + MAX_OBS_LENGTH)))
 [[ -x "$TRAIN_PYTHON" && -d "$MODEL_DIR" && -d "$DATA_DIR" ]] || {
     printf 'CPU preparation is incomplete under %s.\n' "$PROJECT_ROOT" >&2
     exit 1
@@ -132,10 +137,10 @@ HYDRA_ARGS=(
     data.val_data_num=null
     "data.train_batch_size=$TRAIN_BATCH_SIZE"
     data.val_batch_size=64
-    data.max_prompt_length=2048
+    "data.max_prompt_length=$MAX_PROMPT_LENGTH"
     "data.max_response_length=$MAX_RESPONSE_LENGTH"
-    data.max_start_length=1024
-    data.max_obs_length=384
+    "data.max_start_length=$MAX_START_LENGTH"
+    "data.max_obs_length=$MAX_OBS_LENGTH"
     data.shuffle_train_dataloader=true
     algorithm.adv_estimator=grpo
     "algorithm.cost_lambda=$COST_LAMBDA"
@@ -185,9 +190,9 @@ HYDRA_ARGS=(
     "hydra.run.dir=$OUTPUT_DIR/hydra"
     hydra.output_subdir=null
     hydra.job.chdir=false
-    max_turns=2
+    "max_turns=$MAX_TURNS"
     retriever.url=http://127.0.0.1:8000/retrieve
-    retriever.topk=3
+    "retriever.topk=$RETRIEVER_TOPK"
 )
 
 cd "$CHECKOUT_DIR"

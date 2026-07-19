@@ -279,6 +279,23 @@ for gpu_count in (1, 2):
                 raise SystemExit(f"GRPO group or actor mini-batch mismatch in {path}")
             if config.trainer.n_gpus_per_node != gpu_count:
                 raise SystemExit(f"GPU count mismatch in {path}")
+            if config.max_turns != 4:
+                raise SystemExit(f"max_turns must be 4 in {path}")
+            if config.retriever.topk != 3:
+                raise SystemExit(f"retriever top-k must be 3 in {path}")
+            if config.data.max_start_length != 1024:
+                raise SystemExit(f"max_start_length must be 1024 in {path}")
+            if config.data.max_response_length != 256:
+                raise SystemExit(f"max_response_length must be 256 in {path}")
+            if config.data.max_obs_length != 384:
+                raise SystemExit(f"max_obs_length must be 384 in {path}")
+            expected_max_prompt_length = (
+                config.data.max_start_length
+                + config.max_turns
+                * (config.data.max_response_length + config.data.max_obs_length)
+            )
+            if config.data.max_prompt_length != expected_max_prompt_length:
+                raise SystemExit(f"max_prompt_length does not match the search-loop formula in {path}")
             expected_wrap_classes = ["Qwen3_5DecoderLayer"]
             actor_wrap_classes = list(
                 config.actor_rollout_ref.actor.fsdp_config.wrap_policy.transformer_layer_cls_to_wrap

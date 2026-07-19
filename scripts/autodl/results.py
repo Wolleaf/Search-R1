@@ -19,6 +19,7 @@ EVAL_METRICS = {
     "no_search_ratio": "val/no_search_ratio",
 }
 UTILITY_LAMBDA = 0.10
+MAX_SEARCHES = 4
 UTILITY_TOLERANCE = 2e-6
 
 
@@ -123,7 +124,9 @@ def final_metrics(log_path: Path) -> dict[str, float]:
             result[name] = value
     if missing:
         raise ValueError(f"evaluation record in {log_path} is missing: {', '.join(missing)}")
-    expected_utility = result["em"] - UTILITY_LAMBDA * result["search_count"] / 2
+    expected_utility = (
+        result["em"] - UTILITY_LAMBDA * result["search_count"] / MAX_SEARCHES
+    )
     if not math.isclose(
         result["utility"], expected_utility, rel_tol=0.0, abs_tol=UTILITY_TOLERANCE
     ):

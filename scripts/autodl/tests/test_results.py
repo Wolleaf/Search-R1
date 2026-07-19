@@ -64,9 +64,9 @@ class ResultsTest(unittest.TestCase):
                 (checkpoint_root / "actor" / f"global_step_{step}").mkdir(parents=True)
             log = root / "train.log"
             log.write_text(
-                "step:20 - val/em/nq:0.500 - val/search_count/nq:1.500 - val/utility/nq:0.425\n"
-                "step:40 - val/em/nq:0.600 - val/search_count/nq:1.500 - val/utility/nq:0.525\n"
-                "step:60 - val/em/nq:0.600 - val/search_count/nq:0.500 - val/utility/nq:0.525\n"
+                "step:20 - val/em/nq:0.500 - val/search_count/nq:1.500 - val/utility/nq:0.4625\n"
+                "step:40 - val/em/nq:0.600 - val/search_count/nq:1.500 - val/utility/nq:0.5625\n"
+                "step:60 - val/em/nq:0.575 - val/search_count/nq:0.500 - val/utility/nq:0.5625\n"
             )
             output = root / "selected.json"
             RESULTS.select(Namespace(
@@ -80,18 +80,19 @@ class ResultsTest(unittest.TestCase):
             self.assertEqual(json.loads(output.read_text())["step"], 40)
 
     def test_zero_utility_is_not_replaced_by_em(self) -> None:
+        self.assertEqual(RESULTS.MAX_SEARCHES, 4)
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             log = root / "eval.log"
             log.write_text(
-                "step:0 - val/em/nq:0.100 - val/search_count/nq:2.000 - "
+                "step:0 - val/em/nq:0.100 - val/search_count/nq:4.000 - "
                 "val/no_search_ratio/nq:0.000 - val/utility/nq:0.000\n"
             )
             self.assertEqual(RESULTS.final_metrics(log)["utility"], 0.0)
 
             rounded = root / "rounded.log"
-            self.write_eval(rounded, 0.333333, 0.666667, 0, 0.300000)
-            self.assertEqual(RESULTS.final_metrics(rounded)["utility"], 0.3)
+            self.write_eval(rounded, 0.333333, 0.666667, 0, 0.316666)
+            self.assertEqual(RESULTS.final_metrics(rounded)["utility"], 0.316666)
 
     def test_summarizes_four_fixed_endpoints_and_lineage(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -102,7 +103,8 @@ class ResultsTest(unittest.TestCase):
                 em = 0.1 + index / 10
                 searches = float(index)
                 self.write_eval(
-                    logs[model], em, searches, index / 10, em - 0.10 * searches / 2,
+                    logs[model], em, searches, index / 10,
+                    em - 0.10 * searches / RESULTS.MAX_SEARCHES,
                 )
 
             metadata = {}
@@ -160,7 +162,7 @@ class ResultsTest(unittest.TestCase):
             root = Path(temporary)
             missing = root / "missing.log"
             missing.write_text(
-                "step:0 - val/em/nq:0.1 - val/search_count/nq:1 - val/utility/nq:0.0\n"
+                "step:0 - val/em/nq:0.1 - val/search_count/nq:1 - val/utility/nq:0.075\n"
             )
             with self.assertRaisesRegex(ValueError, "missing: val/no_search_ratio"):
                 RESULTS.final_metrics(missing)
@@ -168,17 +170,17 @@ class ResultsTest(unittest.TestCase):
             duplicate = root / "duplicate.log"
             duplicate.write_text(
                 "step:0 - val/em/nq:0.1 - val/em/nq:0.2 - val/search_count/nq:1 - "
-                "val/no_search_ratio/nq:0 - val/utility/nq:0\n"
+                "val/no_search_ratio/nq:0 - val/utility/nq:0.075\n"
             )
             with self.assertRaisesRegex(ValueError, "duplicate metric"):
                 RESULTS.final_metrics(duplicate)
 
             multiple = root / "multiple.log"
-            self.write_eval(multiple, 0.1, 1, 0, 0)
+            self.write_eval(multiple, 0.1, 1, 0, 0.075)
             with multiple.open("a") as handle:
                 handle.write(
                     "step:1 - val/em/nq:0.2 - val/search_count/nq:1 - "
-                    "val/no_search_ratio/nq:0 - val/utility/nq:0.1\n"
+                    "val/no_search_ratio/nq:0 - val/utility/nq:0.175\n"
                 )
             with self.assertRaisesRegex(ValueError, "found 2"):
                 RESULTS.final_metrics(multiple)
@@ -194,7 +196,7 @@ class ResultsTest(unittest.TestCase):
             logs = {}
             for model in ("base", "reproduced", "control", "cost_aware"):
                 logs[model] = root / f"{model}.log"
-                self.write_eval(logs[model], 0.1, 1, 0, 0.05)
+                self.write_eval(logs[model], 0.1, 1, 0, 0.075)
             metadata = {}
             for role, checkpoint, parent in (
                 ("reproduced", "/checkpoints/r", "/models/base"),
