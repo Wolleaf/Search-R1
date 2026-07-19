@@ -89,6 +89,7 @@ def create(args: argparse.Namespace) -> None:
             "path": contained_relative(root, path),
             "sha256": sha256_file(path),
         })
+    artifacts.sort(key=lambda item: item["path"])
 
     payload = {
         "artifacts": artifacts,

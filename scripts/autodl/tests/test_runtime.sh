@@ -70,6 +70,7 @@ mkdir -p "$TEST_ROOT/handoff/model" "$TEST_ROOT/handoff/bm25" \
 printf 'model\n' >"$TEST_ROOT/handoff/model/config.json"
 printf 'index\n' >"$TEST_ROOT/handoff/bm25/segments_1"
 printf 'corpus\n' >"$TEST_ROOT/handoff/corpus/wiki-18.jsonl"
+printf 'source\n' >"$TEST_ROOT/handoff/corpus-source.gz"
 printf 'data\n' >"$TEST_ROOT/handoff/data/train.parquet"
 printf 'lock\n' >"$TEST_ROOT/handoff/requirements.lock"
 "$PYTHON_BIN" "$AUTODL_DIR/handoff.py" create \
@@ -80,6 +81,7 @@ printf 'lock\n' >"$TEST_ROOT/handoff/requirements.lock"
     --corpus "$TEST_ROOT/handoff/corpus" \
     --data "$TEST_ROOT/handoff/data" \
     --requirements "$TEST_ROOT/handoff/requirements.lock" \
+    --extra-file "$TEST_ROOT/handoff/corpus-source.gz" \
     --python-version 3.12.0 \
     --torch-version 2.8.0+cu128 \
     --output "$TEST_ROOT/handoff/manifests/cpu_handoff.json"
