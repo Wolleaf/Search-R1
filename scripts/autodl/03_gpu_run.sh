@@ -15,7 +15,7 @@ CORPUS_OFFSETS="$CORPUS_ROOT/wiki-18.offsets.u64"
 HANDOFF="$MANIFEST_DIR/cpu_handoff.json"
 RESULTS_DIR="$RUNS_ROOT/comparison"
 GPU_COUNT="${GPU_COUNT:-}"
-TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-4}"
+TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-8}"
 MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-256}"
 PRICE_PER_HOUR="${AUTODL_PRICE_PER_HOUR:-}"
 ALLOCATOR_CONFIG="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
@@ -27,8 +27,8 @@ validate_gpu_inputs() {
         printf 'Set GPU_COUNT explicitly to 1 or 2. No GPU auto-detection is performed.\n' >&2
         return 64
     }
-    [[ "$TRAIN_BATCH_SIZE" == 4 || "$TRAIN_BATCH_SIZE" == 2 ]] || {
-        printf 'TRAIN_BATCH_SIZE must be 4 or the documented OOM fallback 2.\n' >&2
+    [[ "$TRAIN_BATCH_SIZE" == 8 || "$TRAIN_BATCH_SIZE" == 4 ]] || {
+        printf 'TRAIN_BATCH_SIZE must be 8 or the documented OOM fallback 4.\n' >&2
         return 64
     }
     [[ "$MAX_RESPONSE_LENGTH" == 256 || "$MAX_RESPONSE_LENGTH" == 192 ]] || {

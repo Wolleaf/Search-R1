@@ -9,10 +9,10 @@ TRAIN_PYTHON="$PROJECT_ROOT/envs/train/bin/python"
 MODEL_DIR="$PROJECT_ROOT/models/Qwen3.5-2B"
 DATA_DIR="$PROJECT_ROOT/data/nq_small"
 GPU_COUNT="${GPU_COUNT:?Set GPU_COUNT explicitly to 1 or 2}"
-TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-4}"
+TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-8}"
 MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-256}"
 OUTPUT_DIR="${OUTPUT_DIR:?Set OUTPUT_DIR to the run checkpoint directory}"
-GRPO_GROUP_SIZE=8
+GRPO_GROUP_SIZE=5
 PPO_MINI_BATCH_SIZE=$((TRAIN_BATCH_SIZE * GRPO_GROUP_SIZE))
 readonly MAX_TURNS=4
 readonly MAX_START_LENGTH=1024
@@ -20,8 +20,8 @@ readonly MAX_OBS_LENGTH=384
 readonly RETRIEVER_TOPK=3
 
 [[ "$GPU_COUNT" == 1 || "$GPU_COUNT" == 2 ]] || { printf 'GPU_COUNT must be 1 or 2.\n' >&2; exit 64; }
-[[ "$TRAIN_BATCH_SIZE" == 4 || "$TRAIN_BATCH_SIZE" == 2 ]] || {
-    printf 'TRAIN_BATCH_SIZE must be 4 (default) or the documented OOM fallback 2.\n' >&2
+[[ "$TRAIN_BATCH_SIZE" == 8 || "$TRAIN_BATCH_SIZE" == 4 ]] || {
+    printf 'TRAIN_BATCH_SIZE must be 8 (default) or the documented OOM fallback 4.\n' >&2
     exit 64
 }
 [[ "$MAX_RESPONSE_LENGTH" == 256 || "$MAX_RESPONSE_LENGTH" == 192 ]] || {
@@ -150,7 +150,7 @@ HYDRA_ARGS=(
     actor_rollout_ref.model.use_remove_padding=false
     ++actor_rollout_ref.model.attn_implementation=sdpa
     actor_rollout_ref.actor.optim.lr=1e-6
-    actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.10
+    actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.285
     "actor_rollout_ref.actor.use_kl_loss=$USE_KL_LOSS"
     actor_rollout_ref.actor.kl_loss_coef=0.001
     actor_rollout_ref.actor.kl_loss_type=low_var_kl
@@ -166,7 +166,7 @@ HYDRA_ARGS=(
     actor_rollout_ref.rollout.n=1
     "actor_rollout_ref.rollout.n_agent=$GRPO_GROUP_SIZE"
     actor_rollout_ref.rollout.temperature=1.0
-    actor_rollout_ref.rollout.top_p=0.95
+    actor_rollout_ref.rollout.top_p=1.0
     actor_rollout_ref.rollout.top_k=0
     ++actor_rollout_ref.rollout.micro_batch_size=1
     "actor_rollout_ref.ref.log_prob_micro_batch_size=$GPU_COUNT"

@@ -275,8 +275,14 @@ for gpu_count in (1, 2):
             group_size = config.actor_rollout_ref.rollout.n_agent
             mini_batch_size = config.actor_rollout_ref.actor.ppo_mini_batch_size
             expected_mini_batch_size = config.data.train_batch_size * group_size
-            if group_size != 8 or mini_batch_size != expected_mini_batch_size:
+            if group_size != 5 or mini_batch_size != expected_mini_batch_size:
                 raise SystemExit(f"GRPO group or actor mini-batch mismatch in {path}")
+            if config.data.train_batch_size != 8:
+                raise SystemExit(f"default train batch size must be 8 in {path}")
+            if config.actor_rollout_ref.actor.optim.lr_warmup_steps_ratio != 0.285:
+                raise SystemExit(f"actor warmup ratio must be 0.285 in {path}")
+            if config.actor_rollout_ref.rollout.top_p != 1.0:
+                raise SystemExit(f"rollout top-p must be 1.0 in {path}")
             if config.trainer.n_gpus_per_node != gpu_count:
                 raise SystemExit(f"GPU count mismatch in {path}")
             if config.max_turns != 4:

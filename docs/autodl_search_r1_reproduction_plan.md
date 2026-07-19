@@ -41,7 +41,7 @@ A / Base：固定 Qwen3.5-2B
 | 项目 | 固定选择 |
 | --- | --- |
 | 模型 | `Qwen/Qwen3.5-2B` post-trained，revision `15852e8c16360a2fea060d615a32b45270f8a8fc` |
-| 算法 | GRPO，group size 8 |
+| 算法 | GRPO，group size 5 |
 | 数据 | NQ train-512、val-64、test-128，seed 42 |
 | 检索 | Wikipedia 2018 CPU BM25，top-k=3，`T_max=4` |
 | 硬件 | `GPU_COUNT=2`，两张 5090 级 GPU；不自动检测或改参 |
@@ -49,7 +49,7 @@ A / Base：固定 Qwen3.5-2B
 | 统一评测 | A/R/B/C 均使用 test-128、`T_max=4`、评测 `lambda=0.10` |
 | 总硬预算 | 300 元，其中 GPU 分项上限合计 250 元 |
 
-每个训练 step 使用 4 个 prompts，每个 prompt 采样 8 条轨迹，即 32 条 agent trajectories 和 1 次 actor update。R/B/C 合计 100 次更新、3200 条训练轨迹。R、B、C 只在固定终点保存正式权重；val-64 只作终点记录，不用于选择 checkpoint。
+每个训练 step 使用 8 个 prompts，每个 prompt 采样 5 条轨迹，即 40 条 agent trajectories 和 1 次 actor update。R/B/C 合计 100 次更新、4000 条训练轨迹。相较旧的 batch 4、group 8 配置，每步轨迹数从 32 增至 40，理论工作量增加 25%，因此不能宣称新配置训练更快。R、B、C 只在固定终点保存正式权重；val-64 只作终点记录，不用于选择 checkpoint。
 
 B/C 必须读取同一个 R60 路径及 digest，使用相同数据、shuffle、seed、batch、group size、学习率、warmup、KL、搜索预算、检索器、token 上限和硬件。唯一科学变量是训练奖励：B 的 `cost_lambda=0`，C 的 `cost_lambda=0.10`。两条分支都从 R 的模型权重创建新的 Adam、warmup 和数据加载状态，因此应称为 **stage-2 受控分叉/二阶段微调**，不是 optimizer 精确断点续训。
 
@@ -80,9 +80,9 @@ C 成本感知奖励：   r = r_em - 0.10 * n_search / 4
 仓库原依赖不能直接支持 Qwen3.5 与 RTX 5090，保留现有最小兼容策略：
 
 1. 使用 AutoDL PyTorch 2.8.0 / Python 3.12 / CUDA 12.8 镜像，Conda 环境名沿用 `llmdevelop`，在持久盘创建隔离 venv。
-2. 使用 HF rollout 而不是旧版 vLLM 适配层；PyTorch SDPA、bf16、temperature 1.0、top-p 0.95。
+2. 使用 HF rollout 而不是旧版 vLLM 适配层；PyTorch SDPA、bf16、temperature 1.0、top-p 1.0。
 3. 关闭 `flash_attention_2` 和 `use_remove_padding`，保留 retrieved-token loss masking、FSDP、gradient checkpointing 和 CPU offload。
-4. 默认 batch=4、group=8、actor mini-batch=32；actor/log-prob micro-batch 在两卡时为 2，rollout micro-batch=1。
+4. 默认 batch=8、group=5、actor mini-batch=40；actor/log-prob micro-batch 在两卡时为 2，rollout micro-batch=1。
 
 | 参数 | 默认值 |
 | --- | ---: |
@@ -91,11 +91,11 @@ C 成本感知奖励：   r = r_em - 0.10 * n_search / 4
 | 每次 `max_obs_length` | 384 |
 | `max_turns` | 4 |
 | `max_prompt_length` | 3584（由上述参数计算） |
-| learning rate / warmup | `1e-6` / 10% |
+| learning rate / warmup | `1e-6` / 28.5% |
 | KL coefficient | `0.001` |
 | `PYTORCH_CUDA_ALLOC_CONF` | `expandable_segments:True` |
 
-不先试单卡，不在运行中自动改参数。只有新的两卡 gate 明确 OOM，才由用户决定是否让 R/B/C 与全部评测共同回退到 batch=2、response=192、派生 prompt=3328；`T_max=4`、group size=8 和固定步数不降级。
+不先试单卡，不在运行中自动改参数。只有新的两卡 gate 明确 OOM，才由用户决定是否先让 R/B/C 与全部评测共同回退到 batch=4；仍 OOM 时再将 response 改为 192，并把 prompt 派生为 3328。`T_max=4`、group size=5 和固定步数不降级。
 
 ## 6. 三阶段执行与旧实验迁移
 
@@ -205,7 +205,7 @@ GPU 完成并关机后，再在不挂 GPU 的 CPU 阶段从原始日志导出 CS
 | CPU、100 GB 存储和阶段开销预留 | 50 |
 | **项目总硬上限** | **300** |
 
-四轮最坏生成次数从 3 次增至 5 次，旧 B=2 的 ETA 不能直接复用。按两卡 5.76 元/小时先做的粗略规划区间为 12-20 小时、约 69-115 元；最终只以新 gate 和正式 step 的实测为准。现有分项 timeout 已留有远大于该区间的硬余量，因此暂不扩到 350 元。预算是 fail-closed 上限：超时则失败，不自动降 turns、改 batch 或加钱。
+四轮最坏生成次数从 3 次增至 5 次，旧 B=2 的 ETA 不能直接复用。默认 batch 8、group 5 每步 40 条轨迹，比旧 batch 4、group 8 的 32 条多 25% 工作量，不能据此承诺更快。按两卡 5.76 元/小时粗略规划为 15-25 小时、约 86-144 元；最终只以新 gate 和正式 step 的实测为准。现有分项 timeout 已留有远大于该区间的硬余量，因此暂不扩到 350 元。预算是 fail-closed 上限：超时则失败，不自动降 turns、改 batch 或加钱。
 
 `T_max=4` 不改变模型参数量或 checkpoint 大小，只增加计算与少量日志。100 GB 盘仍预计使用 55-70 GB：固定环境、模型、语料和索引约 30-35 GB，R/B/C 权重约 12-18 GB，其余留给日志、Ray/WandB 和状态；无需再次扩容。
 
@@ -213,7 +213,7 @@ GPU 完成并关机后，再在不挂 GPU 的 CPU 阶段从原始日志导出 CS
 
 ## 12. 批准后的执行顺序
 
-1. 用户审阅并批准本文件，明确接受 `T_max=4`、默认 prompt=3584、NQ-only 边界和 300 元硬上限。
+1. 用户审阅并批准本文件，明确接受 `T_max=4`、batch 8、group size 5、默认 prompt=3584、NQ-only 边界和 300 元硬上限。
 2. 实现第 7 节的最小改动与测试，不触碰无关上游代码。
 3. 提交并 push 新 commit，记录完整 SHA；不提交本地论文 PDF 和来源笔记，除非用户另行要求。
 4. 用户以无 GPU 模式开机后，通过 SSH 更新固定 checkout 并重跑 CPU handoff；复用已校验的大资产。
