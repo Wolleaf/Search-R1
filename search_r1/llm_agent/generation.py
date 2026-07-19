@@ -194,7 +194,10 @@ class LLMGenerationManager:
             pad_sequence = v[0:1].repeat(padding_size, *[1] * (len(v.shape) - 1))
             padded_batch[k] = torch.cat([v, pad_sequence], dim=0)
 
-        padded_active_batch = DataProto.from_dict(padded_batch)
+        padded_active_batch = DataProto.from_dict(
+            padded_batch,
+            meta_info=active_batch.meta_info.copy(),
+        )
         for key in padded_active_batch.batch.keys():
             padded_active_batch.batch[key] = padded_active_batch.batch[key].long()
 
@@ -226,7 +229,7 @@ class LLMGenerationManager:
         active_mask = torch.ones(gen_batch.batch['input_ids'].shape[0], dtype=torch.bool)
         turns_stats = torch.ones(gen_batch.batch['input_ids'].shape[0], dtype=torch.int)
         valid_action_stats = torch.zeros(gen_batch.batch['input_ids'].shape[0], dtype=torch.int)
-        valid_search_stats = torch.zeros(gen_batch.batch['input_ids'].shape[0], dtype=torch.int)
+        executed_search_count = torch.zeros(gen_batch.batch['input_ids'].shape[0], dtype=torch.long)
         active_num_list = [active_mask.sum().item()]
         rollings = gen_batch
 
@@ -240,9 +243,10 @@ class LLMGenerationManager:
             )
             
             # gen_output = self.actor_rollout_wg.generate_sequences(rollings)
-            rollings_active = DataProto.from_dict({
-                k: v[active_mask] for k, v in rollings.batch.items()
-            })            
+            rollings_active = DataProto.from_dict(
+                {k: v[active_mask] for k, v in rollings.batch.items()},
+                meta_info=rollings.meta_info.copy(),
+            )
             gen_output = self._generate_with_gpu_padding(rollings_active)
 
             meta_info = gen_output.meta_info            
@@ -250,7 +254,7 @@ class LLMGenerationManager:
             responses_ids, responses_str = self.tensor_fn._example_level_pad(responses_ids, responses_str, active_mask)
 
             # Execute in environment and process observations
-            next_obs, dones, valid_action, is_search = self.execute_predictions(
+            next_obs, dones, valid_action, executed_search = self.execute_predictions(
                 responses_str, self.tokenizer.pad_token, active_mask
             )
             
@@ -259,7 +263,7 @@ class LLMGenerationManager:
             active_num_list.append(active_mask.sum().item())
             turns_stats[curr_active_mask] += 1
             valid_action_stats += torch.tensor(valid_action, dtype=torch.int)
-            valid_search_stats += torch.tensor(is_search, dtype=torch.int)
+            executed_search_count += torch.tensor(executed_search, dtype=torch.long)
 
             next_obs_ids = self._process_next_obs(next_obs)
             
@@ -283,9 +287,10 @@ class LLMGenerationManager:
             )
 
             # gen_output = self.actor_rollout_wg.generate_sequences(rollings)
-            rollings_active = DataProto.from_dict({
-                k: v[active_mask] for k, v in rollings.batch.items()
-            })            
+            rollings_active = DataProto.from_dict(
+                {k: v[active_mask] for k, v in rollings.batch.items()},
+                meta_info=rollings.meta_info.copy(),
+            )
             gen_output = self._generate_with_gpu_padding(rollings_active)
 
             meta_info = gen_output.meta_info            
@@ -293,7 +298,7 @@ class LLMGenerationManager:
             responses_ids, responses_str = self.tensor_fn._example_level_pad(responses_ids, responses_str, active_mask)
 
             # # Execute in environment and process observations
-            _, dones, valid_action, is_search = self.execute_predictions(
+            _, dones, valid_action, _ = self.execute_predictions(
                 responses_str, self.tokenizer.pad_token, active_mask, do_search=False
             )
 
@@ -301,7 +306,6 @@ class LLMGenerationManager:
             active_mask = active_mask * curr_active_mask
             active_num_list.append(active_mask.sum().item())
             valid_action_stats += torch.tensor(valid_action, dtype=torch.int)
-            valid_search_stats += torch.tensor(is_search, dtype=torch.int)
             
 
             original_right_side = self._update_right_side(
@@ -312,15 +316,23 @@ class LLMGenerationManager:
         meta_info['turns_stats'] = turns_stats.tolist()
         meta_info['active_mask'] = active_mask.tolist()
         meta_info['valid_action_stats'] = valid_action_stats.tolist()
-        meta_info['valid_search_stats'] = valid_search_stats.tolist()
+        # Keep the legacy aggregate for existing dashboards. Per-example reward
+        # code must use the tensor because meta_info is not batch-reordered.
+        meta_info['valid_search_stats'] = executed_search_count.tolist()
         
         print("ACTIVE_TRAJ_NUM:", active_num_list)
         
-        return self._compose_final_output(original_left_side, original_right_side, meta_info)
+        return self._compose_final_output(
+            original_left_side,
+            original_right_side,
+            meta_info,
+            executed_search_count,
+        )
 
     def _compose_final_output(self, left_side: Dict,
                             right_side: Dict,
-                            meta_info: Dict) -> Tuple[Dict, Dict]:
+                            meta_info: Dict,
+                            executed_search_count: torch.Tensor) -> DataProto:
         """Compose final generation output."""
         final_output = right_side.copy()
         final_output['prompts'] = left_side['input_ids']
@@ -344,13 +356,18 @@ class LLMGenerationManager:
         final_output['position_ids'] = self.tensor_fn.create_position_ids(
             final_output['attention_mask']
         )
+        final_output['executed_search_count'] = executed_search_count
         
         final_output = DataProto.from_dict(final_output)
         final_output.meta_info.update(meta_info)
         
         return final_output
 
-    def execute_predictions(self, predictions: List[str], pad_token: str, active_mask=None, do_search=True) -> List[str]:
+    def execute_predictions(self,
+                            predictions: List[str],
+                            pad_token: str,
+                            active_mask=None,
+                            do_search=True) -> Tuple[List[str], List[int], List[int], List[int]]:
         """
         Execute predictions across multiple environments.
         NOTE: the function is the actual `step` function in the environment
@@ -362,47 +379,52 @@ class LLMGenerationManager:
             pad_token: Token to use for padding
             
         Returns:
-            List of observation strings
+            Observations, done flags, valid-action flags, and per-example
+            executed-search flags.
         """
         cur_actions, contents = self.postprocess_predictions(predictions)
-        next_obs, dones, valid_action, is_search = [], [], [], []
-        
-        search_queries = [content for action, content in zip(cur_actions, contents) if action == 'search']
-        if do_search:
-            search_results = self.batch_search(search_queries)
-            assert len(search_results) == sum([1 for action in cur_actions if action == 'search'])
-        else:
-            search_results = [''] * sum([1 for action in cur_actions if action == 'search'])
+        next_obs, dones, valid_action, executed_search = [], [], [], []
 
-        for i, (action, active) in enumerate(zip(cur_actions, active_mask)):
+        if active_mask is None:
+            active_mask = [True] * len(cur_actions)
+        active_flags = [bool(active) for active in active_mask]
+        search_queries = [
+            content for action, content, active in zip(cur_actions, contents, active_flags)
+            if do_search and active and action == 'search'
+        ]
+        search_results = self.batch_search(search_queries) if search_queries else []
+        assert len(search_results) == len(search_queries)
+
+        for action, active in zip(cur_actions, active_flags):
             
             if not active:
                 next_obs.append('')
                 dones.append(1)
                 valid_action.append(0)
-                is_search.append(0)
+                executed_search.append(0)
             else:
                 if action == 'answer':
                     next_obs.append('')
                     dones.append(1)
                     valid_action.append(1)
-                    is_search.append(0)
+                    executed_search.append(0)
                 elif action == 'search':
-                    next_obs.append(f'\n\n<information>{search_results.pop(0).strip()}</information>\n\n')
+                    search_result = search_results.pop(0) if do_search else ''
+                    next_obs.append(f'\n\n<information>{search_result.strip()}</information>\n\n')
                     dones.append(0)
                     valid_action.append(1)
-                    is_search.append(1)
+                    executed_search.append(int(do_search))
                 else:
                     next_obs.append(f'\nMy previous action is invalid. \
 If I want to search, I should put the query between <search> and </search>. \
 If I want to give the final answer, I should put the answer between <answer> and </answer>. Let me try again.\n')
                     dones.append(0)
                     valid_action.append(0)
-                    is_search.append(0)
+                    executed_search.append(0)
             
         assert len(search_results) == 0
             
-        return next_obs, dones, valid_action, is_search
+        return next_obs, dones, valid_action, executed_search
 
     def postprocess_predictions(self, predictions: List[Any]) -> Tuple[List[int], List[bool]]:
         """
@@ -435,7 +457,7 @@ If I want to give the final answer, I should put the answer between <answer> and
             
         return actions, contents
 
-    def batch_search(self, queries: List[str] = None) -> str:
+    def batch_search(self, queries: List[str] = None) -> List[str]:
         """
         Batchified search for queries.
         Args:
@@ -455,7 +477,9 @@ If I want to give the final answer, I should put the answer between <answer> and
             "return_scores": True
         }
         
-        return requests.post(self.config.search_url, json=payload).json()
+        response = requests.post(self.config.search_url, json=payload, timeout=60)
+        response.raise_for_status()
+        return response.json()
 
     def _passages2string(self, retrieval_result):
         format_reference = ''

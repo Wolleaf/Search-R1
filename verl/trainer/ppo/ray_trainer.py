@@ -45,6 +45,13 @@ from search_r1.llm_agent.generation import LLMGenerationManager, GenerationConfi
 WorkerType = Type[Worker]
 
 
+def _next_training_step(completed_step, total_steps):
+    """Return the next one-based update number, or None after the final update."""
+    if completed_step >= total_steps:
+        return None
+    return completed_step + 1
+
+
 class Role(Enum):
     """
     To create more roles dynamically, you can subclass Role and add new members
@@ -274,6 +281,18 @@ def compute_data_metrics(batch, use_critic=True):
         metrics['env/ratio_of_valid_action'] = float((np.array(batch.meta_info['valid_action_stats'], dtype=np.int16) / np.array(batch.meta_info['turns_stats'], dtype=np.int16)).mean())
     if 'valid_search_stats' in batch.meta_info:
         metrics['env/number_of_valid_search'] = float(np.array(batch.meta_info['valid_search_stats'], dtype=np.int16).mean())
+    if 'executed_search_count' in batch.batch.keys():
+        search_count = batch.batch['executed_search_count'].float()
+        metrics['env/executed_search_count/mean'] = search_count.mean().detach().item()
+        metrics['env/executed_search_count/max'] = search_count.max().detach().item()
+        metrics['env/executed_search_count/min'] = search_count.min().detach().item()
+        metrics['env/no_search_ratio'] = (search_count == 0).float().mean().detach().item()
+    if 'sequence_em_scores' in batch.batch.keys():
+        em_scores = batch.batch['sequence_em_scores'].float()
+        metrics['env/em/mean'] = em_scores.mean().detach().item()
+    if 'sequence_search_costs' in batch.batch.keys():
+        search_costs = batch.batch['sequence_search_costs'].float()
+        metrics['env/search_cost/mean'] = search_costs.mean().detach().item()
 
 
     return metrics
@@ -440,6 +459,8 @@ class RayPPOTrainer(object):
         """
         import torch
         reward_tensor_lst = []
+        em_score_lst = []
+        search_count_lst = []
         data_source_lst = []
 
         gen_config = GenerationConfig(
@@ -493,6 +514,10 @@ class RayPPOTrainer(object):
                 reward_tensor = self.val_reward_fn(test_batch)
 
                 reward_tensor_lst.append(reward_tensor)
+                sequence_utility = reward_tensor.sum(-1)
+                em_score_lst.append(test_batch.batch.get('sequence_em_scores', sequence_utility))
+                search_count_lst.append(
+                    test_batch.batch.get('executed_search_count', torch.zeros_like(sequence_utility)))
                 data_source_lst.append(test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0]))
         else:
             for batch_dict in self.val_dataloader:
@@ -527,22 +552,39 @@ class RayPPOTrainer(object):
                     reward_tensor = self.val_reward_fn(test_batch)
 
                     reward_tensor_lst.append(reward_tensor)
+                    sequence_utility = reward_tensor.sum(-1)
+                    em_score_lst.append(test_batch.batch.get('sequence_em_scores', sequence_utility))
+                    search_count_lst.append(
+                        test_batch.batch.get('executed_search_count', torch.zeros_like(sequence_utility)))
                     data_source_lst.append(test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0]))
 
         reward_tensor = torch.cat([rw.sum(-1) for rw in reward_tensor_lst], dim=0).cpu()  # (batch_size,)
+        em_scores = torch.cat(em_score_lst, dim=0).float().cpu()
+        search_counts = torch.cat(search_count_lst, dim=0).float().cpu()
         # reward_tensor = torch.cat(reward_tensor_lst, dim=0).sum(-1).cpu()  # (batch_size,)
         data_sources = np.concatenate(data_source_lst, axis=0)
         # evaluate test_score based on data source
         data_source_reward = {}
+        data_source_em = {}
+        data_source_search_count = {}
         for i in range(reward_tensor.shape[0]):
             data_source = data_sources[i]
             if data_source not in data_source_reward:
                 data_source_reward[data_source] = []
+                data_source_em[data_source] = []
+                data_source_search_count[data_source] = []
             data_source_reward[data_source].append(reward_tensor[i].item())
+            data_source_em[data_source].append(em_scores[i].item())
+            data_source_search_count[data_source].append(search_counts[i].item())
 
         metric_dict = {}
         for data_source, rewards in data_source_reward.items():
             metric_dict[f'val/test_score/{data_source}'] = np.mean(rewards)
+            metric_dict[f'val/utility/{data_source}'] = np.mean(rewards)
+            metric_dict[f'val/em/{data_source}'] = np.mean(data_source_em[data_source])
+            metric_dict[f'val/search_count/{data_source}'] = np.mean(data_source_search_count[data_source])
+            metric_dict[f'val/no_search_ratio/{data_source}'] = np.mean(
+                np.asarray(data_source_search_count[data_source]) == 0)
 
         return metric_dict
 
@@ -669,8 +711,12 @@ class RayPPOTrainer(object):
             if self.config.trainer.get('val_only', False):
                 return
 
-        # we start from step 1
-        self.global_steps += 1
+        if self.total_training_steps <= 0:
+            return
+
+        # Training updates are numbered from one; step N must execute before
+        # the total-training-steps stop condition is evaluated.
+        self.global_steps = 1
 
         # Agent config preparation
         gen_config = GenerationConfig(
@@ -697,6 +743,7 @@ class RayPPOTrainer(object):
                 print(f'epoch {epoch}, step {self.global_steps}')
                 metrics = {}
                 timing_raw = {}
+                validated_this_step = False
 
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
                 batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n_agent, interleave=True)
@@ -827,6 +874,7 @@ class RayPPOTrainer(object):
                         with _timer('testing', timing_raw):
                             val_metrics: dict = self._validate()
                         metrics.update(val_metrics)
+                        validated_this_step = True
 
                     if self.config.trainer.save_freq > 0 and \
                             self.global_steps % self.config.trainer.save_freq == 0:
@@ -840,16 +888,16 @@ class RayPPOTrainer(object):
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
 
-                self.global_steps += 1
-
-                if self.global_steps >= self.total_training_steps:
+                next_step = _next_training_step(self.global_steps, self.total_training_steps)
+                if next_step is None:
 
                     # perform validation after training
-                    if self.val_reward_fn is not None:
+                    if self.val_reward_fn is not None and not validated_this_step:
                         val_metrics = self._validate()
                         pprint(f'Final validation metrics: {val_metrics}')
                         logger.log(data=val_metrics, step=self.global_steps)
                     return
+                self.global_steps = next_step
     
     def _create_loss_mask(self, batch, metrics):
         """Create loss mask for state tokens."""

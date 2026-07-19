@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "cloud_roots": [
+    "scripts/autodl"
+  ],
+  "exclude_globs": [],
+  "shell": {
+    "include_globs": [
+      "scripts/autodl/*.sh",
+      "scripts/autodl/**/*.sh"
+    ],
+    "executable_globs": [
+      "scripts/autodl/*.sh",
+      "scripts/autodl/**/*.sh"
+    ],
+    "allowed_shebangs": [
+      "#!/usr/bin/env bash"
+    ],
+    "require_tracked": true
+  },
+  "entrypoints": [
+    {
+      "id": "git",
+      "path": "scripts/autodl/01_git.sh",
+      "documentation": [
+        {
+          "path": "scripts/autodl/README.md",
+          "required_literals": [
+            "/root/autodl-tmp/autodl-bootstrap/01_git.sh"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "cpu",
+      "path": "scripts/autodl/02_cpu_prepare.sh",
+      "documentation": [
+        {
+          "path": "scripts/autodl/README.md",
+          "required_literals": [
+            "/root/autodl-tmp/search-r1/checkout/scripts/autodl/02_cpu_prepare.sh"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "gpu",
+      "path": "scripts/autodl/03_gpu_run.sh",
+      "documentation": [
+        {
+          "path": "scripts/autodl/README.md",
+          "required_literals": [
+            "/root/autodl-tmp/search-r1/checkout/scripts/autodl/03_gpu_run.sh"
+          ]
+        }
+      ]
+    }
+  ],
+  "shutdown": {
+    "enabled": false,
+    "scan_globs": [
+      "scripts/autodl/*.sh",
+      "scripts/autodl/**/*.sh",
+      "scripts/autodl/*.py",
+      "scripts/autodl/**/*.py"
+    ],
+    "owner_files": [],
+    "test_evidence": [],
+    "additional_invocation_regexes": []
+  }
+}

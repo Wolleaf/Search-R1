@@ -33,10 +33,21 @@ class RewardManager():
     """The reward manager.
     """
 
-    def __init__(self, tokenizer, num_examine, format_score=0.) -> None:
+    def __init__(self,
+                 tokenizer,
+                 num_examine,
+                 format_score=0.,
+                 cost_lambda=0.,
+                 max_searches=1) -> None:
         self.tokenizer = tokenizer
         self.num_examine = num_examine  # the number of batches of decoded responses to print to the console
         self.format_score = format_score
+        self.cost_lambda = float(cost_lambda)
+        self.max_searches = int(max_searches)
+        if self.cost_lambda < 0:
+            raise ValueError('cost_lambda must be non-negative')
+        if self.max_searches <= 0:
+            raise ValueError('max_searches must be positive')
 
     def __call__(self, data: DataProto):
         """We will expand this function gradually based on the available datasets"""
@@ -46,6 +57,21 @@ class RewardManager():
             return data.batch['rm_scores']
 
         reward_tensor = torch.zeros_like(data.batch['responses'], dtype=torch.float32)
+        em_scores = torch.zeros(len(data), dtype=torch.float32, device=reward_tensor.device)
+
+        if 'executed_search_count' in data.batch.keys():
+            search_counts = data.batch['executed_search_count'].to(device=reward_tensor.device, dtype=torch.float32)
+        elif self.cost_lambda == 0:
+            search_counts = torch.zeros(len(data), dtype=torch.float32, device=reward_tensor.device)
+        else:
+            raise KeyError('executed_search_count is required when cost_lambda is non-zero')
+
+        if search_counts.shape != (len(data),):
+            raise ValueError(
+                f'executed_search_count must have shape ({len(data)},), got {tuple(search_counts.shape)}')
+        if torch.any(search_counts < 0):
+            raise ValueError('executed_search_count must be non-negative')
+        search_costs = self.cost_lambda * search_counts / self.max_searches
 
         # all_scores = []
 
@@ -77,7 +103,8 @@ class RewardManager():
 
             score = compute_score_fn(solution_str=sequences_str, ground_truth=ground_truth, format_score=self.format_score)
 
-            reward_tensor[i, valid_response_length - 1] = score
+            em_scores[i] = score
+            reward_tensor[i, valid_response_length - 1] = score - search_costs[i]
             # all_scores.append(score)
 
             if data_source not in already_print_data_sources:
@@ -94,6 +121,10 @@ class RewardManager():
         # print(f"[DEBUG] all_scores min: {np.min(all_scores)}")
         # print(f"[DEBUG] all_scores std: {np.std(all_scores)}")
 
+        # Sequence-level components make EM and utility observable without
+        # decoding the response a second time in the trainer.
+        data.batch['sequence_em_scores'] = em_scores
+        data.batch['sequence_search_costs'] = search_costs
         return reward_tensor
 
 
@@ -112,6 +143,11 @@ def main(config):
 
 @ray.remote
 def main_task(config):
+    from verl.utils.random_utils import seed_everything
+
+    # This process owns data-loader shuffling and rule-based reward evaluation.
+    seed_everything(config.trainer.get('seed', 42))
+
     from verl.utils.fs import copy_local_path_from_hdfs
     from transformers import AutoTokenizer
 
@@ -151,7 +187,6 @@ def main_task(config):
     role_worker_mapping = {
         Role.ActorRollout: ray.remote(ActorRolloutRefWorker),
         Role.Critic: ray.remote(CriticWorker),
-        Role.RefPolicy: ray.remote(ActorRolloutRefWorker),
     }
 
     global_pool_id = 'global_pool'
@@ -161,8 +196,13 @@ def main_task(config):
     mapping = {
         Role.ActorRollout: global_pool_id,
         Role.Critic: global_pool_id,
-        Role.RefPolicy: global_pool_id,
     }
+
+    # Validation only generates responses; avoid loading a duplicate reference
+    # policy that is never queried on this path.
+    if not config.trainer.get('val_only', False):
+        role_worker_mapping[Role.RefPolicy] = ray.remote(ActorRolloutRefWorker)
+        mapping[Role.RefPolicy] = global_pool_id
 
     # we should adopt a multi-source reward function here
     # - for rule-based rm, we directly call a reward score
@@ -180,10 +220,16 @@ def main_task(config):
         role_worker_mapping[Role.RewardModel] = ray.remote(RewardModelWorker)
         mapping[Role.RewardModel] = global_pool_id
 
-    reward_fn = RewardManager(tokenizer=tokenizer, num_examine=0)
+    reward_fn = RewardManager(tokenizer=tokenizer,
+                              num_examine=0,
+                              cost_lambda=config.algorithm.get('cost_lambda', 0.0),
+                              max_searches=config.max_turns)
 
     # Note that we always use function-based RM for validation
-    val_reward_fn = RewardManager(tokenizer=tokenizer, num_examine=1)
+    val_reward_fn = RewardManager(tokenizer=tokenizer,
+                                  num_examine=1,
+                                  cost_lambda=config.algorithm.get('cost_lambda', 0.0),
+                                  max_searches=config.max_turns)
 
     resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
     trainer = RayPPOTrainer(config=config,

@@ -57,6 +57,10 @@ class ActorRolloutRefWorker(Worker):
         if not torch.distributed.is_initialized():
             torch.distributed.init_process_group(backend="nccl")
 
+        from verl.utils.random_utils import derive_rank_seed, seed_everything
+        self.worker_seed = derive_rank_seed(self.config.get('seed', 42), torch.distributed.get_rank())
+        seed_everything(self.worker_seed)
+
         # build device mesh for FSDP
         world_size = torch.distributed.get_world_size()
         from torch.distributed.device_mesh import init_device_mesh
@@ -115,7 +119,8 @@ class ActorRolloutRefWorker(Worker):
                                override_model_config,
                                use_remove_padding=False,
                                enable_gradient_checkpointing=False,
-                               trust_remote_code=False):
+                               trust_remote_code=False,
+                               attn_implementation='flash_attention_2'):
         from verl.utils.model import print_model_size, update_model_config
         from verl.utils.torch_dtypes import PrecisionType
         from transformers import AutoModelForCausalLM, AutoConfig
@@ -164,7 +169,7 @@ class ActorRolloutRefWorker(Worker):
             actor_module = AutoModelForCausalLM.from_pretrained(pretrained_model_name_or_path=local_path,
                                                                 torch_dtype=torch_dtype,
                                                                 config=actor_model_config,
-                                                                attn_implementation='flash_attention_2',
+                                                                attn_implementation=attn_implementation,
                                                                 trust_remote_code=trust_remote_code)
             # some parameters may not in torch_dtype. TODO(zhangchi.usc1992) remove this after we switch to fsdp2
             actor_module.to(torch_dtype)
@@ -307,7 +312,8 @@ class ActorRolloutRefWorker(Worker):
                 override_model_config=override_model_config,
                 use_remove_padding=use_remove_padding,
                 enable_gradient_checkpointing=self.config.model.get('enable_gradient_checkpointing', False),
-                trust_remote_code=self.config.model.get('trust_remote_code', False))
+                trust_remote_code=self.config.model.get('trust_remote_code', False),
+                attn_implementation=self.config.model.get('attn_implementation', 'flash_attention_2'))
 
             # get the original unwrapped module
             self.actor_module = self.actor_module_fsdp._fsdp_wrapped_module
@@ -338,7 +344,9 @@ class ActorRolloutRefWorker(Worker):
                                                                override_model_config=override_model_config,
                                                                use_remove_padding=use_remove_padding,
                                                                trust_remote_code=self.config.model.get(
-                                                                   'trust_remote_code', False))[0]
+                                                                   'trust_remote_code', False),
+                                                               attn_implementation=self.config.model.get(
+                                                                   'attn_implementation', 'flash_attention_2'))[0]
             if self._is_offload_param:
                 offload_fsdp_param_and_grad(module=self.ref_module_fsdp, offload_grad=self._is_offload_grad)
 
@@ -620,7 +628,9 @@ class CriticWorker(Worker):
             critic_module = AutoModelForTokenClassification.from_pretrained(pretrained_model_name_or_path=local_path,
                                                                             torch_dtype=torch_dtype,
                                                                             config=critic_model_config,
-                                                                            attn_implementation='flash_attention_2',
+                                                                            attn_implementation=config.model.get(
+                                                                                'attn_implementation',
+                                                                                'flash_attention_2'),
                                                                             trust_remote_code=trust_remote_code)
 
             # some parameters may not in torch_dtype
@@ -860,7 +870,9 @@ class RewardModelWorker(Worker):
             reward_module = AutoModelForTokenClassification.from_pretrained(pretrained_model_name_or_path=local_path,
                                                                             config=model_config,
                                                                             torch_dtype=torch.bfloat16,
-                                                                            attn_implementation='flash_attention_2',
+                                                                            attn_implementation=config.model.get(
+                                                                                'attn_implementation',
+                                                                                'flash_attention_2'),
                                                                             trust_remote_code=trust_remote_code)
             reward_module.to(torch.bfloat16)
         auto_wrap_policy = get_fsdp_wrap_policy(module=reward_module, config=self.config.model.fsdp_config)
@@ -886,7 +898,6 @@ class RewardModelWorker(Worker):
         torch.cuda.empty_cache()
 
     def _forward_micro_batch(self, micro_batch):
-        from flash_attn.bert_padding import pad_input, unpad_input, index_first_axis, rearrange
         from verl.utils.ulysses import ulysses_pad_and_slice_inputs, gather_outpus_and_unpad
 
         with torch.no_grad(), torch.autocast(device_type='cuda', dtype=torch.bfloat16):
@@ -896,6 +907,8 @@ class RewardModelWorker(Worker):
             position_ids = micro_batch['position_ids']
 
             if self.use_remove_padding:
+                from flash_attn.bert_padding import pad_input, unpad_input, index_first_axis, rearrange
+
                 input_ids_rmpad, indices, *_ = unpad_input(input_ids.unsqueeze(-1),
                                                            attention_mask)  # input_ids_rmpad (total_nnz, ...)
                 input_ids_rmpad = input_ids_rmpad.transpose(0, 1)  # (1, total_nnz)

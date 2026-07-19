@@ -16,11 +16,13 @@ data:
   shuffle_train_dataloader: True
 
 actor_rollout_ref:
+  seed: ${trainer.seed}
   hybrid_engine: True
   model:
     path: ~/models/deepseek-llm-7b-chat
     external_lib: null
     override_config: { }
+    attn_implementation: flash_attention_2
     enable_gradient_checkpointing: False
     use_remove_padding: False
   actor:
@@ -103,6 +105,7 @@ critic:
     tokenizer_path: ${actor_rollout_ref.model.path}
     override_config: { }
     external_lib: ${actor_rollout_ref.model.external_lib}
+    attn_implementation: ${actor_rollout_ref.model.attn_implementation}
     enable_gradient_checkpointing: False
     use_remove_padding: False
     fsdp_config:
@@ -132,6 +135,7 @@ reward_model:
     input_tokenizer: ${actor_rollout_ref.model.path}  # set this to null if the chat template is identical
     path: ~/models/FsfairX-LLaMA3-RM-v0.1
     external_lib: ${actor_rollout_ref.model.external_lib}
+    attn_implementation: ${actor_rollout_ref.model.attn_implementation}
     use_remove_padding: False
     fsdp_config:
       min_num_params: 0
@@ -153,6 +157,7 @@ algorithm:
   gamma: 1.0
   lam: 1.0
   adv_estimator: gae
+  cost_lambda: 0.0  # normalized retrieval penalty; max_turns is the denominator
   no_think_rl: False
   kl_penalty: kl  # how to estimate kl divergence
   kl_ctrl:
@@ -163,6 +168,7 @@ algorithm:
     end_state_marker: "</information>"
 
 trainer:
+  seed: 42
   total_epochs: 30
   total_training_steps: null
   project_name: verl_examples
