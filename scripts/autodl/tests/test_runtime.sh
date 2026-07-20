@@ -9,7 +9,11 @@ trap 'rm -rf -- "$TEST_ROOT"' EXIT
 wait_for_terminal() {
     local attempt="$1"
     for _ in {1..100}; do
-        [[ -f "$attempt/exit-code" ]] && return 0
+        if [[ -f "$attempt/exit-code" && -f "$attempt/terminal" &&
+              ! -e "$attempt/.starting" && ! -e "$attempt/.running" ]] &&
+            { [[ -f "$attempt/.success" ]] || [[ -f "$attempt/.failed" ]]; }; then
+            return 0
+        fi
         sleep 0.05
     done
     printf 'Timed out waiting for %s\n' "$attempt" >&2
@@ -21,6 +25,9 @@ printf '%s\n' \
     '#!/usr/bin/env bash' \
     'set -Eeuo pipefail' \
     "source '$AUTODL_DIR/lib/runtime.sh'" \
+    'if [[ -n "${SYNC_EVENT_LOG:-}" ]]; then' \
+    '  sync_path() { printf "%s\n" "$1" >>"$SYNC_EVENT_LOG"; }' \
+    'fi' \
     'case "${1:-}" in' \
     '  --worker) phase_worker test "$2" "$0" ;;' \
     '  --action) exit "${ACTION_RC:-0}" ;;' \
@@ -31,11 +38,13 @@ AUTODL_ROOT="$TEST_ROOT/project" ACTION_RC=0 bash "$FAKE"
 attempt="$(tr -d '\r\n' <"$TEST_ROOT/project/state/latest/test")"
 wait_for_terminal "$attempt"
 [[ "$(cat "$attempt/exit-code")" == 0 && -f "$attempt/.success" && ! -f "$attempt/.running" ]]
+[[ "$(grep -Fxc 'AUTODL_PHASE_TERMINAL state=success exit_code=0' "$attempt/phase.log")" == 1 ]]
 
 AUTODL_ROOT="$TEST_ROOT/project" ACTION_RC=7 bash "$FAKE"
 attempt="$(tr -d '\r\n' <"$TEST_ROOT/project/state/latest/test")"
 wait_for_terminal "$attempt"
 [[ "$(cat "$attempt/exit-code")" == 7 && -f "$attempt/.failed" ]]
+[[ "$(grep -Fxc 'AUTODL_PHASE_TERMINAL state=failed exit_code=7' "$attempt/phase.log")" == 1 ]]
 
 exec 8>"$TEST_ROOT/project/state/phase.lock"
 flock -n 8
@@ -43,7 +52,16 @@ AUTODL_ROOT="$TEST_ROOT/project" ACTION_RC=0 bash "$FAKE"
 attempt="$(tr -d '\r\n' <"$TEST_ROOT/project/state/latest/test")"
 wait_for_terminal "$attempt"
 [[ "$(cat "$attempt/exit-code")" == 75 && -f "$attempt/.failed" ]]
+[[ "$(grep -Fxc 'AUTODL_PHASE_TERMINAL state=failed exit_code=75' "$attempt/phase.log")" == 1 ]]
 exec 8>&-
+
+sync_events="$TEST_ROOT/sync-events.log"
+AUTODL_ROOT="$TEST_ROOT/project" ACTION_RC=0 SYNC_EVENT_LOG="$sync_events" bash "$FAKE"
+attempt="$(tr -d '\r\n' <"$TEST_ROOT/project/state/latest/test")"
+wait_for_terminal "$attempt"
+mapfile -t terminal_syncs < <(tail -n 3 "$sync_events")
+[[ "${terminal_syncs[0]}" == "$attempt/phase.log" ]]
+[[ "${terminal_syncs[1]}" == "$attempt" && "${terminal_syncs[2]}" == "$attempt" ]]
 
 source_repo="$TEST_ROOT/source-repo"
 mkdir "$source_repo"

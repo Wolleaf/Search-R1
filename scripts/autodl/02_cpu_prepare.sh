@@ -220,7 +220,7 @@ PY
     mkdir -p "$parent_placeholder"
     for gpu_count in 1 2; do
         for spec in \
-            'train|smoke|1|' \
+            'train|smoke|2|' \
             'train|reproduce|60|' \
             "train|control|20|$parent_placeholder" \
             "train|cost_aware|20|$parent_placeholder" \
@@ -316,7 +316,7 @@ for gpu_count in (1, 2):
     reproduced = configs[("train", "reproduce")]
     control = configs[("train", "control")]
     cost_aware = configs[("train", "cost_aware")]
-    expected_steps = ((smoke, 1), (reproduced, 60), (control, 20), (cost_aware, 20))
+    expected_steps = ((smoke, 2), (reproduced, 60), (control, 20), (cost_aware, 20))
     for config, steps in expected_steps:
         if config.trainer.total_training_steps != steps:
             raise SystemExit(f"training step mismatch for {config.trainer.experiment_name}")

@@ -18,6 +18,7 @@ readonly MAX_TURNS=4
 readonly MAX_START_LENGTH=1024
 readonly MAX_OBS_LENGTH=384
 readonly RETRIEVER_TOPK=3
+readonly SMOKE_STEPS=2
 
 [[ "$GPU_COUNT" == 1 || "$GPU_COUNT" == 2 ]] || { printf 'GPU_COUNT must be 1 or 2.\n' >&2; exit 64; }
 [[ "$TRAIN_BATCH_SIZE" == 8 || "$TRAIN_BATCH_SIZE" == 4 ]] || {
@@ -37,9 +38,9 @@ readonly MAX_PROMPT_LENGTH=$((MAX_START_LENGTH + MAX_TURNS * (MAX_RESPONSE_LENGT
 case "$MODE:$VARIANT" in
     train:smoke)
         COST_LAMBDA=0.0
-        TOTAL_STEPS="${3:-1}"
-        [[ "$TOTAL_STEPS" == 1 && $# -le 3 ]] || {
-            printf 'Smoke training is fixed at one step.\n' >&2
+        TOTAL_STEPS="${3:-$SMOKE_STEPS}"
+        [[ "$TOTAL_STEPS" == "$SMOKE_STEPS" && $# -le 3 ]] || {
+            printf 'Smoke training is fixed at %s steps.\n' "$SMOKE_STEPS" >&2
             exit 64
         }
         SAVE_FREQ="$TOTAL_STEPS"
@@ -104,7 +105,7 @@ case "$MODE:$VARIANT" in
         USE_KL_LOSS=false
         ;;
     *)
-        printf 'Usage: %s train smoke [1]\n' "$0" >&2
+        printf 'Usage: %s train smoke [2]\n' "$0" >&2
         printf '   or: %s train reproduce [STEPS]\n' "$0" >&2
         printf '   or: %s train {control|cost_aware} [STEPS] REPRODUCED_CHECKPOINT\n' "$0" >&2
         printf '   or: %s eval {base|reproduced|control|cost_aware} MODEL_PATH\n' "$0" >&2

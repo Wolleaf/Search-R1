@@ -15,6 +15,7 @@
 The main entry point to run the PPO algorithm
 """
 
+from functools import partial
 import logging
 import os
 import warnings
@@ -330,9 +331,21 @@ class ActorRolloutRefWorker(Worker):
             OmegaConf.set_struct(self.config.actor, True)
             with open_dict(self.config.actor):
                 self.config.actor.use_remove_padding = use_remove_padding
-            self.actor = DataParallelPPOActor(config=self.config.actor,
-                                              actor_module=self.actor_module_fsdp,
-                                              actor_optimizer=self.actor_optimizer)
+            optimizer_state_load_fn = None
+            optimizer_state_offload_fn = None
+            if self._is_offload_optimizer:
+                optimizer_state_load_fn = partial(
+                    load_fsdp_optimizer,
+                    optimizer=self.actor_optimizer,
+                    device_id=torch.cuda.current_device())
+                optimizer_state_offload_fn = partial(
+                    offload_fsdp_optimizer, optimizer=self.actor_optimizer)
+            self.actor = DataParallelPPOActor(
+                config=self.config.actor,
+                actor_module=self.actor_module_fsdp,
+                actor_optimizer=self.actor_optimizer,
+                optimizer_state_load_fn=optimizer_state_load_fn,
+                optimizer_state_offload_fn=optimizer_state_offload_fn)
 
         if self._is_rollout:
             self.rollout, self.rollout_sharding_manager = self._build_rollout()
@@ -369,8 +382,6 @@ class ActorRolloutRefWorker(Worker):
             load_fsdp_param_and_grad(module=self.actor_module_fsdp,
                                      device_id=torch.cuda.current_device(),
                                      load_grad=self._is_offload_grad)
-        if self._is_offload_optimizer:
-            load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=torch.cuda.current_device())
 
         data.batch = data.batch.cuda()
 
@@ -400,8 +411,6 @@ class ActorRolloutRefWorker(Worker):
 
         if self._is_offload_param:
             offload_fsdp_param_and_grad(module=self.actor_module_fsdp, offload_grad=self._is_offload_grad)
-        if self._is_offload_optimizer:
-            offload_fsdp_optimizer(optimizer=self.actor_optimizer)
         torch.cuda.empty_cache()
         return output
 

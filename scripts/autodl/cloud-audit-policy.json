@@ -57,15 +57,36 @@
     }
   ],
   "shutdown": {
-    "enabled": false,
+    "enabled": true,
     "scan_globs": [
       "scripts/autodl/*.sh",
       "scripts/autodl/**/*.sh",
       "scripts/autodl/*.py",
       "scripts/autodl/**/*.py"
     ],
-    "owner_files": [],
-    "test_evidence": [],
-    "additional_invocation_regexes": []
+    "owner_files": [
+      "scripts/autodl/04_watch_and_shutdown.sh"
+    ],
+    "test_evidence": [
+      {
+        "id": "shutdown-test-hook",
+        "owner_required_literals": [
+          "SEARCH_R1_AUTODL_TEST_MODE",
+          "SEARCH_R1_AUTODL_TEST_SHUTDOWN_LOG",
+          "SEARCH_R1_AUTODL_TEST_SHUTDOWN_BINARY"
+        ],
+        "test_globs": [
+          "scripts/autodl/tests/test_shutdown_watchdog.sh"
+        ],
+        "test_required_literals": [
+          "SEARCH_R1_AUTODL_TEST_MODE",
+          "SEARCH_R1_AUTODL_TEST_SHUTDOWN_LOG",
+          "SEARCH_R1_AUTODL_TEST_SHUTDOWN_BINARY"
+        ]
+      }
+    ],
+    "additional_invocation_regexes": [
+      "^[ \\t]*\"\\$\\{shutdown_argv\\[@\\]\\}\"[ \\t]*$"
+    ]
   }
 }

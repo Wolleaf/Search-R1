@@ -1,6 +1,6 @@
 # AutoDL 三阶段操作说明
 
-本目录是 Search-R1-small 云端复现的唯一入口。固定镜像为 **PyTorch 2.8.0 / Python 3.12 / Ubuntu 22.04 / CUDA 12.8**，持久目录为 `/root/autodl-tmp/search-r1`。正常流程始终是 **Git -> CPU -> GPU**；脚本不扫描机器规格、不自动改配置、不自动重试，也不执行关机。
+本目录是 Search-R1-small 云端复现的唯一入口。固定镜像为 **PyTorch 2.8.0 / Python 3.12 / Ubuntu 22.04 / CUDA 12.8**，持久目录为 `/root/autodl-tmp/search-r1`。正常流程始终是 **Git -> CPU -> GPU**；脚本不扫描机器规格、不自动改配置、不自动重试。GPU phase 本身不关机；需要时显式绑定本次 attempt 启动独立 watchdog。
 
 正式实验固定为：A（原始 Qwen3.5-2B）经原奖励 60 steps 得到 R；B（原奖励）和 C（`cost_lambda=0.10`）再从同一个 R 分别训练 20 steps。R/B/C 使用固定最终 checkpoint，不按 val 指标选择。主对比是 B vs C；A vs R 仅为 Search-R1-small sanity check。
 
@@ -39,7 +39,9 @@ GPU_COUNT=2 AUTODL_PRICE_PER_HOUR=5.76 \
 bash /root/autodl-tmp/search-r1/checkout/scripts/autodl/03_gpu_run.sh
 ```
 
-若控制台整机价格发生变化，替换 `5.76`。入口先离线验证 handoff，再启动 CPU BM25 服务。随后运行两个 1-step gate：先以 A 完成 rollout、搜索、反向与 checkpoint，再用该 checkpoint 执行 `train control 1`，验证 actor/ref 的子 checkpoint 加载。两者成功后只删除 gate 权重，日志和终态保留。
+若控制台整机价格发生变化，替换 `5.76`。入口先离线验证 handoff，再启动 CPU BM25 服务。随后运行两个工程 gate：基础 gate 连续训练 2 steps，确保第 2 次 backward 覆盖已经初始化的 Adam 状态；再从其 `global_step_2` 执行 1-step control gate，验证 actor/ref 子 checkpoint 加载。两者成功后只删除 gate 权重，日志和终态保留。
+
+仍保持全参数 FSDP 微调。`optimizer_offload=true` 时，Adam 状态在 forward/backward 期间留在 CPU，只在每次 `optimizer.step()` 前回载到 GPU，并在 step 后立即卸载。该改动不改变损失、梯度、优化器或科学配置，只缩短 optimizer state 与长序列激活同时驻留显存的时间。
 
 正式阶段依次运行 `train reproduce 60`、`train control 20 <R60>` 和 `train cost_aware 20 <R60>`，仅保留 R60、B20、C20 三个正式 checkpoint。最后以 `eval base|reproduced|control|cost_aware` 在同一 test-128 上评测 A/R/B/C，四路都用 `lambda=0.10` 计算 utility，并分别报告 EM 与实际搜索次数。结果写入 `runs/comparison/results.md`。
 
@@ -49,7 +51,7 @@ B/C 只从 R 的模型权重启动；Adam、warmup、数据 shuffle 状态和 KL
 
 默认配置为两张 GPU、train batch 8、GRPO group size 5、最多 4 次搜索、retriever top-k 3、start 1024、observation 384、response 256、warmup ratio 0.285、temperature/top-p 1.0，每步 40 条轨迹，并固定 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`。`max_prompt_length` 按真实循环固定为 `1024 + 4 * (response + 384)`，默认是 3584；搜索轮数不能通过环境变量覆盖。不再先试单卡。相较旧的 batch 4、group 8 配置，每步轨迹从 32 增至 40，理论工作量增加 25%，因此不能宣称新配置训练更快。
 
-只有两卡 gate OOM 时才人工重跑整个 GPU 阶段：先设置 `TRAIN_BATCH_SIZE=4`，仍失败再加 `MAX_RESPONSE_LENGTH=192`，此时 `max_prompt_length` 自动派生为 3328。R/B/C 必须共享同一卡数和同一组回退参数。失败不会自动重试、不会覆盖旧 attempt，也不会采用早于固定终点的 checkpoint。
+只有新的两卡 2-step gate 仍明确 OOM 时才人工重跑整个 GPU 阶段：先保持 batch 8、group 5，仅设置 `MAX_RESPONSE_LENGTH=192`，此时 `max_prompt_length` 自动派生为 3328；仍失败才再设置 `TRAIN_BATCH_SIZE=4`。R/B/C 必须共享同一卡数和同一组回退参数。失败不会自动重试、不会覆盖旧 attempt，也不会采用早于固定终点的 checkpoint。
 
 ## 预算与存储
 
@@ -70,4 +72,11 @@ cat "$attempt/exit-code"
 
 将 `phase` 改为 `git` 或 `cpu` 可查看对应阶段。完成必须同时满足原始 `exit-code=0`、终态 `success` 和 `.success`，不能只看日志末行。每个 attempt 均保留独立日志、原始 exit code、时间和成功/失败标记；GPU 阶段启用 Hugging Face、Datasets、Transformers、pip 与 WandB 离线模式，缺失资产会直接失败。
 
-脚本**不会执行 guest shutdown**。无论成功、失败还是人工停止，都先通过 SSH 确认终态，再到 AutoDL 控制台确认实例已经停止且不再计费。guest 内关机或 SSH 断开本身都不能证明云端停止计费。
+GPU phase 启动后，用入口打印出的**精确绝对路径**显式安装 watchdog：
+
+```bash
+bash /root/autodl-tmp/search-r1/checkout/scripts/autodl/04_watch_and_shutdown.sh "$attempt"
+tail -f "$attempt/shutdown-watchdog.log"
+```
+
+watchdog 同时支持成功和失败终态，但只有在 commit/checkout、持久盘、exact attempt、phase lock、原始 exit code、唯一终态 marker 和日志 sentinel 全部重新验证后才会调用 AutoDL 的 `/usr/bin/shutdown`（无参数）。成功终态还必须通过 `comparison.sha256`、results、`gpu.ok` 以及 attempt 自身的 `comparison-digest` 交叉校验。锁冲突、状态不完整、校验失败或 dry-run 会保持开机并记录 `shutdown-skipped`；test mode 只记录模拟状态，绝不调用真实 backend。`shutdown-requested` 表示即将调用 backend，`shutdown-dispatched` 只表示 backend 已返回 0，两者都不能证明 AutoDL 控制平面已停止。无论 watchdog 结果如何，仍须在 AutoDL 控制台确认实例已停止且不再计费；SSH 断开本身不能证明停止计费。

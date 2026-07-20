@@ -16,7 +16,7 @@ Single Process Actor
 """
 
 import itertools
-from typing import Iterable, Tuple
+from typing import Callable, Iterable, Optional, Tuple
 
 import torch
 from torch import nn
@@ -41,11 +41,15 @@ class DataParallelPPOActor(BasePPOActor):
         config,
         actor_module: nn.Module,
         actor_optimizer: torch.optim.Optimizer = None,
+        optimizer_state_load_fn: Optional[Callable[[], None]] = None,
+        optimizer_state_offload_fn: Optional[Callable[[], None]] = None,
     ):
         """When optimizer is None, it is Reference Policy"""
         super().__init__(config)
         self.actor_module = actor_module
         self.actor_optimizer = actor_optimizer
+        self.optimizer_state_load_fn = optimizer_state_load_fn
+        self.optimizer_state_offload_fn = optimizer_state_offload_fn
         self.use_remove_padding = self.config.get('use_remove_padding', False)
         print(f'Actor use_remove_padding={self.use_remove_padding}')
         self.ulysses_sequence_parallel_size = self.config.ulysses_sequence_parallel_size
@@ -147,7 +151,13 @@ class DataParallelPPOActor(BasePPOActor):
             grad_norm = self.actor_module.clip_grad_norm_(max_norm=self.config.grad_clip)
         else:
             grad_norm = torch.nn.utils.clip_grad_norm_(self.actor_module.parameters(), max_norm=self.config.grad_clip)
-        self.actor_optimizer.step()
+        try:
+            if self.optimizer_state_load_fn is not None:
+                self.optimizer_state_load_fn()
+            self.actor_optimizer.step()
+        finally:
+            if self.optimizer_state_offload_fn is not None:
+                self.optimizer_state_offload_fn()
         return grad_norm
 
     def compute_log_prob(self, data: DataProto) -> torch.Tensor:

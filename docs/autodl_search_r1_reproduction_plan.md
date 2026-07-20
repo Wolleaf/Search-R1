@@ -84,6 +84,8 @@ C 成本感知奖励：   r = r_em - 0.10 * n_search / 4
 3. 关闭 `flash_attention_2` 和 `use_remove_padding`，保留 retrieved-token loss masking、FSDP、gradient checkpointing 和 CPU offload。
 4. 默认 batch=8、group=5、actor mini-batch=40；actor/log-prob micro-batch 在两卡时为 2，rollout micro-batch=1。
 
+保持全参数微调，不切换 LoRA。实测 step 1 成功而 step 2 OOM 的主要新增量不是模型参数或 batch 本身，而是第一次 `optimizer.step()` 后才创建的 Adam `m/v` 状态：旧实现会在下一次 forward/backward 前把全部状态回载到 GPU，使其与长序列激活和大词表 logits 重叠。最小修复是让 optimizer state 在反向期间继续驻留 CPU，只在每次 `optimizer.step()` 前回载，并在 step 后立即卸载；损失函数、梯度、Adam 更新公式和所有科学参数均不变。
+
 | 参数 | 默认值 |
 | --- | ---: |
 | `max_start_length` | 1024 |
@@ -95,7 +97,7 @@ C 成本感知奖励：   r = r_em - 0.10 * n_search / 4
 | KL coefficient | `0.001` |
 | `PYTORCH_CUDA_ALLOC_CONF` | `expandable_segments:True` |
 
-不先试单卡，不在运行中自动改参数。只有新的两卡 gate 明确 OOM，才由用户决定是否先让 R/B/C 与全部评测共同回退到 batch=4；仍 OOM 时再将 response 改为 192，并把 prompt 派生为 3328。`T_max=4`、group size=5 和固定步数不降级。
+不先试单卡，不在运行中自动改参数。只有修复后的两卡 2-step gate 仍明确 OOM，才由用户决定是否先保持 batch=8、group=5 并将 response 回退到 192（prompt 自动派生为 3328）；仍 OOM 时再让 R/B/C 与全部评测共同回退到 batch=4。`T_max=4`、group size=5 和固定步数不降级。
 
 ## 6. 三阶段执行与旧实验迁移
 
@@ -106,6 +108,8 @@ C 成本感知奖励：   r = r_em - 0.10 * n_search / 4
 用户批准本方案后才修改代码、运行测试、提交和 push。云端 checkout 必须固定到新的 40 位 commit、detached HEAD 且工作区干净。GitHub 直连失败时继续使用完整 Git bundle，不用不可信的临时源码副本。
 
 旧的两轮 GPU attempt `20260719T135124Z-1441-19817` 已按用户要求 TERM，外层终态为 `failed/143`。它的 1-step gate 日志和 R 的已完成 step 只保留为 B=2 工程诊断证据；没有 `global_step_60`，不得作为新实验的 R，也不得进入最终 A/R/B/C 表。
+
+四轮配置的 GPU attempt `20260720T014406Z-1468-5995` 中，R run `20260720T022258Z-1500-22251` 在 step 1 完成后、step 2 的 `loss.backward()` 发生 CUDA OOM，外层已持久化为 `failed/1`，且没有可采用的正式 checkpoint。这个现象正好暴露了 Adam 状态首次创建后的驻留时序；因此不能用旧的 1-step gate 宣称配置稳定，也不能把它简单归因于 batch=8。
 
 ### 阶段二：CPU 无卡准备
 
@@ -124,9 +128,9 @@ CPU 阶段需要重新完成：
 GPU phase 只接受与新 commit 匹配的 handoff，然后严格串行执行：
 
 1. 启动本机 CPU BM25 服务并通过 health check。
-2. Gate 1：A -> smoke 1 step，验证四轮 rollout、检索、奖励、反向、终点 val 和保存。
-3. Gate 2：从 Gate 1 checkpoint -> control 1 step，验证 actor/ref 子 checkpoint 重载。
-4. 两个 gate 成功后精确删除两个 `global_step_1`，保留日志、终态和清理证据。
+2. Gate 1：A -> smoke 2 steps，验证四轮 rollout、检索、奖励、连续两次反向以及 `global_step_2` 保存；第 2 步必须在 Adam 状态已经初始化后成功。
+3. Gate 2：从 Gate 1 的 `global_step_2` -> control 1 step，验证 actor/ref 子 checkpoint 重载并保存 `global_step_1`。
+4. 两个 gate 成功后分别精确删除 `smoke/global_step_2` 与 `control/global_step_1`，保留日志、终态和清理证据。
 5. A -> R60；验证并只保留 `global_step_60`。
 6. 同一 R60 -> B20 与 C20；分别只保留 `global_step_20`。
 7. 依次评测 A、R、B、C，并生成结果、lineage 和 checksum。
@@ -135,16 +139,16 @@ GPU phase 只接受与新 commit 匹配的 handoff，然后严格串行执行：
 
 ## 7. 用户批准后的最小实现清单
 
-只修改与四轮一致性和本次实测可靠性直接相关的文件：
+在已经完成的四轮与成本奖励实现上，本轮只增加与实测 step-2 OOM 和付费停机直接相关的最小改动：
 
-- `scripts/autodl/train_small_grpo.sh`：固定 `MAX_TURNS=4`，由 start/response/observation 派生 prompt 上限，并让两个 gate、R/B/C 和四路 eval 共用。
-- `scripts/autodl/results.py`：把统一 utility 的旧 `/2` 改为具名 `MAX_SEARCHES=4`，继续严格拒绝不一致的评测记录。
-- `scripts/autodl/02_cpu_prepare.sh`：新增 resolved-config 的 turn、top-k 和 prompt-length 合同检查。
-- `tests/test_cost_aware_reward.py`：覆盖 0/1/4 次搜索在 `T_max=4` 下的成本及 batch reorder。
-- `scripts/autodl/tests/test_results.py`：把合法 fixture 全部更新为 `/4`，保留故意不一致的负测试。
-- `scripts/autodl/README.md`：同步四轮参数、三阶段命令、失败处理和人工确认计费说明。
+- `verl/workers/actor/dp_actor.py`、`verl/workers/fsdp_workers.py`：把 Adam 状态回载移动到梯度裁剪之后、`optimizer.step()` 之前，并在 step 的 `finally` 中立即卸载；不改变全参数训练数学语义。
+- `tests/test_optimizer_state_offload_order.py`：断言累积 backward 期间不回载状态，以及每次更新严格执行 `backward -> load -> step -> offload`。
+- `scripts/autodl/train_small_grpo.sh`、`02_cpu_prepare.sh`、`03_gpu_run.sh`：基础 gate 固定为 2 steps，checkpoint-load gate 保持 1 step，并分别校验和清理精确终点。
+- `scripts/autodl/lib/runtime.sh`：先向 phase log 写入并同步唯一 terminal sentinel，再原子发布终态，供外部 watchdog 验证。
+- `scripts/autodl/04_watch_and_shutdown.sh` 及负向测试：仅对显式给出的 exact GPU attempt 授权；完整终态和成功产物校验后才调用绑定且重新校验的 `/usr/bin/shutdown`。
+- `scripts/autodl/README.md`、本规划与静态审计策略：同步 gate、OOM 诊断、回退顺序、watchdog 命令及控制台计费确认要求。
 
-核心 `RewardManager` 已从 `config.max_turns` 取得归一化分母，agent loop 也已支持任意正整数 turns，因此不修改奖励、generation 或运行时状态机。根目录通用 `train_ppo.sh`/`train_grpo.sh` 不属于本 AutoDL 入口，也不改。为避免过度设计，不新增统一配置服务、恢复 DAG 或自动调参器；重复常量由 CPU resolved-config gate 防漂移。本次人工停止暴露的嵌套进程组信号问题单独记录，不混入改变科学配置的 commit；下一次云端运行仍使用绑定 exact attempt 的 watchdog 保证终态后关机。
+核心 `RewardManager`、agent generation loop、loss、学习率、batch=8、group=5、response=256、`T_max=4`、R/B/C 步数和预算都不改，也不引入 LoRA、自动调参、恢复 DAG 或额外实验分支。根目录通用 `train_ppo.sh`/`train_grpo.sh` 不属于本 AutoDL 入口，继续不改。
 
 ## 8. 验证与重新准入
 
@@ -154,13 +158,15 @@ GPU phase 只接受与新 commit 匹配的 handoff，然后严格串行执行：
 python -m pytest -q
 python -m unittest -v scripts.autodl.tests.test_results
 bash scripts/autodl/tests/test_runtime.sh
-bash -n scripts/autodl/train_small_grpo.sh scripts/autodl/02_cpu_prepare.sh scripts/autodl/03_gpu_run.sh
-yapf --diff scripts/autodl/results.py tests/test_cost_aware_reward.py scripts/autodl/tests/test_results.py
+bash scripts/autodl/tests/test_shutdown_watchdog.sh
+bash -n scripts/autodl/*.sh scripts/autodl/**/*.sh
+python -m compileall scripts/autodl verl/workers
+yapf --diff verl/workers/actor/dp_actor.py verl/workers/fsdp_workers.py tests/test_optimizer_state_offload_order.py
 ```
 
-还要静态检查 canonical 文档和生产入口中不存在旧的 `max_turns=2`、utility `/2`、每次扣 0.05 等残留。新 commit push 后，云端必须依次重跑 Git seal 和 CPU handoff；旧 B=2 的 gate 成功不能替代新 B=4 gate。
+还要运行 AutoDL 静态审计、`git diff --check`，检查 shell 执行位，并确认 canonical 文档和生产入口中不存在旧的 `max_turns=2`、utility `/2`、每次扣 0.05 或“两个 gate 都是 1 step”等残留。新 commit push 后，云端必须依次重跑 Git seal 和 CPU handoff；旧 commit 的 gate 成功不能替代新 2-step gate。
 
-GPU 准入以两级 gate 为准：必须同时证明四轮配置成功组合、无 OOM/Traceback、真实检索可用、一步反向完成、checkpoint 能保存并重载。gate 只验证工程可运行，不作为科学结果。
+GPU 准入以两级 gate 为准：必须同时证明四轮配置成功组合、无 OOM/Traceback、真实检索可用、Adam 已初始化后的第 2 次反向完成、checkpoint 能保存并重载。gate 只验证工程可运行，不作为科学结果。
 
 ## 9. 训练资料与面试证据
 
@@ -195,7 +201,7 @@ GPU 完成并关机后，再在不挂 GPU 的 CPU 阶段从原始日志导出 CS
 
 | 付费项 | 硬上限（元） |
 | --- | ---: |
-| Base 1-step gate | 15 |
+| Base 2-step gate | 15 |
 | checkpoint-load 1-step gate | 15 |
 | R：60 steps | 100 |
 | B：20 steps | 40 |
@@ -209,7 +215,7 @@ GPU 完成并关机后，再在不挂 GPU 的 CPU 阶段从原始日志导出 CS
 
 `T_max=4` 不改变模型参数量或 checkpoint 大小，只增加计算与少量日志。100 GB 盘仍预计使用 55-70 GB：固定环境、模型、语料和索引约 30-35 GB，R/B/C 权重约 12-18 GB，其余留给日志、Ray/WandB 和状态；无需再次扩容。
 
-仓库训练脚本不做无条件关机。每次 GPU attempt 单独安装绑定 exact attempt、commit、持久盘、锁和 `/usr/bin/shutdown` hash 的 watchdog。它必须等待完整 terminal、原始 exit code、日志 sentinel 和 durable sync；成功时还要执行 `sha256sum -c comparison.sha256` 并验证 `gpu.ok == sha256(comparison.sha256)`，失败或人工 TERM 时也只有在终态完整后才请求 guest shutdown。锁冲突、状态不完整或校验失败一律保持开机。guest shutdown 只代表已派发请求，最终仍由用户在 AutoDL 控制台确认实例停止且不再计费。
+GPU phase 本身不做无条件关机。每次 GPU attempt 单独显式安装绑定 exact attempt、commit、checkout tree、持久盘、phase lock 和 `/usr/bin/shutdown` digest 的 watchdog。它必须等待完整 terminal、原始 exit code、唯一匹配 marker、日志 sentinel 和 durable sync；成功时还要执行 `sha256sum -c comparison.sha256`，并验证 `gpu.ok == attempt/comparison-digest == sha256(comparison.sha256)`，从而拒绝属于其他 attempt 的全局结果包。失败或人工 TERM 时也只有在终态完整后才请求 guest shutdown。锁冲突、状态不完整、成功产物校验失败或 dry-run 一律保持开机并记录原因；test mode 只模拟状态流转，不执行真实关机。`shutdown-requested` 表示 backend 即将被调用，`shutdown-dispatched` 仅表示 backend 返回 0，最终仍由用户在 AutoDL 控制台确认实例停止且不再计费。
 
 ## 12. 批准后的执行顺序
 

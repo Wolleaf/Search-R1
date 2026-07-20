@@ -61,7 +61,7 @@ new_attempt() {
 publish_terminal() {
     local attempt="$1"
     local rc="$2"
-    local state marker
+    local state marker phase_log sentinel
     if ((rc == 0)); then
         state='success'
         marker='.success'
@@ -70,10 +70,19 @@ publish_terminal() {
         marker='.failed'
     fi
 
+    phase_log="$attempt/phase.log"
+    [[ -f "$phase_log" && ! -L "$phase_log" ]] || {
+        printf 'Cannot publish terminal sentinel to %s\n' "$phase_log" >&2
+        return 1
+    }
+    sentinel="AUTODL_PHASE_TERMINAL state=$state exit_code=$rc"
+    printf '%s\n' "$sentinel" >>"$phase_log"
+    sync_path "$phase_log"
+
     atomic_write "$attempt/exit-code" "$rc"$'\n'
     atomic_write "$attempt/finished-at" "$(utc_now)"$'\n'
     atomic_write "$attempt/terminal" "$state"$'\n'
-    : >"$attempt/$marker"
+    atomic_write "$attempt/$marker" ''
     sync_path "$attempt"
     rm -f -- "$attempt/.starting" "$attempt/.running"
     sync_path "$attempt"

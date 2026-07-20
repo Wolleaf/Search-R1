@@ -21,6 +21,9 @@ PRICE_PER_HOUR="${AUTODL_PRICE_PER_HOUR:-}"
 ALLOCATOR_CONFIG="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 readonly REPRODUCE_STEPS=60
 readonly BRANCH_STEPS=20
+# Step 2 exercises backward after Adam has initialized its optimizer state.
+readonly BASE_GATE_STEPS=2
+readonly CHECKPOINT_LOAD_GATE_STEPS=1
 
 validate_gpu_inputs() {
     [[ "$GPU_COUNT" == 1 || "$GPU_COUNT" == 2 ]] || {
@@ -132,7 +135,10 @@ run_job() {
     local -a job_args
     case "$mode:$variant" in
         train:smoke)
-            [[ "$argument" == 1 ]] || { printf 'Base smoke gate is fixed at one step.\n' >&2; return 64; }
+            [[ "$argument" == "$BASE_GATE_STEPS" ]] || {
+                printf 'Base smoke gate is fixed at %s steps.\n' "$BASE_GATE_STEPS" >&2
+                return 64
+            }
             budget_rmb=15
             ;;
         train:reproduce)
@@ -143,12 +149,13 @@ run_job() {
             budget_rmb=100
             ;;
         train:control)
-            if [[ "$argument" == 1 ]]; then
+            if [[ "$argument" == "$CHECKPOINT_LOAD_GATE_STEPS" ]]; then
                 budget_rmb=15
             elif [[ "$argument" == "$BRANCH_STEPS" ]]; then
                 budget_rmb=40
             else
-                printf 'Control is allowed only for the one-step gate or step %s endpoint.\n' "$BRANCH_STEPS" >&2
+                printf 'Control is allowed only for the %s-step checkpoint-load gate or step %s endpoint.\n' \
+                    "$CHECKPOINT_LOAD_GATE_STEPS" "$BRANCH_STEPS" >&2
                 return 64
             fi
             ;;
@@ -307,11 +314,16 @@ record_lineage() {
 }
 
 delete_gate_checkpoint() {
-    local run_dir="$1" checkpoint="$2" variant="$3"
+    local run_dir="$1" checkpoint="$2" variant="$3" gate_steps="$4"
     local canonical_run canonical_runs_root expected_checkpoint bytes metadata
+    [[ "$variant:$gate_steps" == "smoke:$BASE_GATE_STEPS" ||
+        "$variant:$gate_steps" == "control:$CHECKPOINT_LOAD_GATE_STEPS" ]] || {
+        printf 'Refusing cleanup for unknown gate endpoint: %s step %s\n' "$variant" "$gate_steps" >&2
+        return 1
+    }
     canonical_run="$(readlink -f -- "$run_dir")"
     canonical_runs_root="$(readlink -f -- "$RUNS_ROOT")"
-    expected_checkpoint="$canonical_run/checkpoints/actor/global_step_1"
+    expected_checkpoint="$canonical_run/checkpoints/actor/global_step_$gate_steps"
     [[ "$canonical_run" == "$canonical_runs_root/"* ]] || {
         printf 'Refusing gate cleanup outside the runs root: %s\n' "$run_dir" >&2
         return 1
@@ -328,7 +340,7 @@ delete_gate_checkpoint() {
     }
     grep -Fxq 'job_mode=train' "$run_dir/run.env" \
         && grep -Fxq "variant=$variant" "$run_dir/run.env" \
-        && grep -Fxq 'train_steps=1' "$run_dir/run.env" || {
+        && grep -Fxq "train_steps=$gate_steps" "$run_dir/run.env" || {
         printf 'Refusing cleanup of a non-gate run: %s\n' "$run_dir" >&2
         return 1
     }
@@ -336,6 +348,7 @@ delete_gate_checkpoint() {
     atomic_write "$run_dir/checkpoint-cleanup.env" \
         "requested_at=$(utc_now)"$'\n'\
 "target=$checkpoint"$'\n'\
+"train_steps=$gate_steps"$'\n'\
 "bytes=$bytes"$'\n'\
 "reason=successful-gate-is-not-a-scientific-checkpoint"$'\n'
     sync_path "$run_dir"
@@ -390,7 +403,7 @@ gpu_action() {
     local reproduce_checkpoint control_checkpoint cost_checkpoint
     local reproduce_digest control_digest cost_digest
     local reproduce_config_digest control_config_digest cost_config_digest
-    local comparison_checksums
+    local comparison_checksums comparison_digest
     validate_gpu_inputs
     commit="$(expected_commit)"
     verify_checkout "$commit"
@@ -494,14 +507,14 @@ PY
         return 1
     }
 
-    run_job train smoke 1
+    run_job train smoke "$BASE_GATE_STEPS"
     base_gate_run="$LAST_RUN_DIR"
-    base_gate_checkpoint="$(fixed_checkpoint "$base_gate_run" 1)"
-    run_job train control 1 "$base_gate_checkpoint"
+    base_gate_checkpoint="$(fixed_checkpoint "$base_gate_run" "$BASE_GATE_STEPS")"
+    run_job train control "$CHECKPOINT_LOAD_GATE_STEPS" "$base_gate_checkpoint"
     branch_gate_run="$LAST_RUN_DIR"
-    branch_gate_checkpoint="$(fixed_checkpoint "$branch_gate_run" 1)"
-    delete_gate_checkpoint "$branch_gate_run" "$branch_gate_checkpoint" control
-    delete_gate_checkpoint "$base_gate_run" "$base_gate_checkpoint" smoke
+    branch_gate_checkpoint="$(fixed_checkpoint "$branch_gate_run" "$CHECKPOINT_LOAD_GATE_STEPS")"
+    delete_gate_checkpoint "$branch_gate_run" "$branch_gate_checkpoint" control "$CHECKPOINT_LOAD_GATE_STEPS"
+    delete_gate_checkpoint "$base_gate_run" "$base_gate_checkpoint" smoke "$BASE_GATE_STEPS"
 
     run_job train reproduce "$REPRODUCE_STEPS"
     reproduce_run="$LAST_RUN_DIR"
@@ -567,8 +580,11 @@ PY
     )"
     atomic_write "$RESULTS_DIR/comparison.sha256" "$comparison_checksums"$'\n'
     sync_path "$RESULTS_DIR"
-    atomic_write "$MANIFEST_DIR/gpu.ok" "$(file_sha256 "$RESULTS_DIR/comparison.sha256")"$'\n'
+    comparison_digest="$(file_sha256 "$RESULTS_DIR/comparison.sha256")"
+    atomic_write "$MANIFEST_DIR/gpu.ok" "$comparison_digest"$'\n'
     sync_path "$MANIFEST_DIR"
+    atomic_write "$_attempt/comparison-digest" "$comparison_digest"$'\n'
+    sync_path "$_attempt"
     cleanup_retriever
     trap - EXIT
     printf 'Completed comparison: %s/results.md\n' "$RESULTS_DIR"
