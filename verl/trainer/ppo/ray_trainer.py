@@ -585,14 +585,39 @@ class RayPPOTrainer(object):
             if len(retrieval_events) != search_count:
                 raise ValueError(
                     'retrieval event count does not match executed_search_count')
+            executed_generation_events = [
+                event for event in generation_events
+                if bool(event.get('executed_search', False))
+            ]
+            if len(executed_generation_events) != search_count:
+                raise ValueError(
+                    'generation event count does not match executed_search_count')
+            if ([event.get('turn') for event in executed_generation_events]
+                    != [event.get('turn') for event in retrieval_events]):
+                raise ValueError(
+                    'generation and retrieval event turns are not aligned')
+            for generation_event, retrieval_event in zip(
+                    executed_generation_events, retrieval_events):
+                generated_turns = parse_search_r1_transcript(
+                    generation_event['text'])
+                environment_action = next((turn for turn in generated_turns
+                                           if turn['action'] in ('search',
+                                                                 'answer')),
+                                          None)
+                if (environment_action is None
+                        or environment_action['action'] != 'search'
+                        or environment_action['search_query']
+                        != retrieval_event['query']):
+                    raise ValueError(
+                        'executed generation event does not match retrieval event')
             retrieval_index = 0
             for turn in turns:
                 turn['retrieved_docs'] = []
                 turn['retrieval_executed'] = False
                 if (turn['action'] == 'search'
-                        and retrieval_index < len(retrieval_events)
-                        and turn['search_query']
-                        == retrieval_events[retrieval_index]['query']):
+                        and retrieval_index < len(retrieval_events)):
+                    # Environment events are authoritative and ordered; a
+                    # tokenizer round trip may normalize the decoded query.
                     turn['retrieved_docs'] = retrieval_events[
                         retrieval_index]['documents']
                     turn['retrieval_executed'] = True

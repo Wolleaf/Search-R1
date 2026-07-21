@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import numpy as np
 from omegaconf import OmegaConf
+import pytest
 import torch
 
 from search_r1.trajectory_trace import TraceJsonlWriter
@@ -12,6 +13,10 @@ from verl.trainer.ppo.ray_trainer import RayPPOTrainer, _compute_group_metrics
 
 class _Tokenizer:
 
+    def __init__(self, decoded_query='France capital', trailing_output=''):
+        self.decoded_query = decoded_query
+        self.trailing_output = trailing_output
+
     def decode(self, token_ids):
         prompt = (
             '<|im_start|>user\nUse <answer> Beijing </answer>. '
@@ -20,9 +25,10 @@ class _Tokenizer:
         if len(token_ids) <= 2:
             return prompt
         return prompt + (
-            '<think>I should verify it.</think><search>France capital</search>'
+            f'<think>I should verify it.</think><search>{self.decoded_query}</search>'
             '<information>Doc 1 says Paris.</information>'
-            '<think>The evidence is clear.</think><answer>Paris</answer>')
+            '<think>The evidence is clear.</think><answer>Paris</answer>'
+            f'{self.trailing_output}')
 
 
 def _object_array(values):
@@ -31,7 +37,14 @@ def _object_array(values):
     return output
 
 
-def test_training_trace_integration_keeps_group_fields_aligned(tmp_path):
+@pytest.mark.parametrize(('decoded_query', 'trailing_output'), [
+    ('France capital', ''),
+    ('France  capital', ''),
+    ('France capital',
+     '<answer>Paris, France</answer><search>France capital</search>'),
+])
+def test_training_trace_integration_keeps_group_fields_aligned(
+        tmp_path, decoded_query, trailing_output):
     batch_size = 5
     tensors = {
         'prompts': torch.tensor([[1, 2]] * batch_size),
@@ -57,6 +70,9 @@ def test_training_trace_integration_keeps_group_fields_aligned(tmp_path):
         'text': '<search>France capital</search>',
         'token_count': 3,
         'clipped': False,
+        'valid_action': True,
+        'done': False,
+        'executed_search': True,
     }] for _ in range(batch_size)]
     batch = DataProto.from_dict(
         tensors=tensors,
@@ -77,7 +93,7 @@ def test_training_trace_integration_keeps_group_fields_aligned(tmp_path):
     )
 
     trainer = object.__new__(RayPPOTrainer)
-    trainer.tokenizer = _Tokenizer()
+    trainer.tokenizer = _Tokenizer(decoded_query, trailing_output)
     trainer.global_steps = 1
     trainer.config = OmegaConf.create({
         'data': {'max_prompt_length': 32},
@@ -105,6 +121,15 @@ def test_training_trace_integration_keeps_group_fields_aligned(tmp_path):
     assert records[0]['question'] == 'What is the capital of France?'
     assert records[0]['retrieval_events'][0]['documents'][0]['document_id'] == '7'
     assert records[0]['parent_checkpoint_digest'] == 'a' * 64
+    executed_turns = [
+        turn for turn in records[0]['turns']
+        if turn['retrieval_executed']
+    ]
+    assert len(executed_turns) == 1
+    assert executed_turns[0]['search_query'] == decoded_query
+    if trailing_output:
+        assert records[0]['turns'][-1]['action'] == 'search'
+        assert records[0]['turns'][-1]['retrieval_executed'] is False
 
     metrics = _compute_group_metrics(batch)
     assert metrics['env/group/all_wrong_ratio'] == 0.0
