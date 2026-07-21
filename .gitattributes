@@ -1,0 +1,6 @@
+docs/results/search-r1-small-20260720/results.csv -text -diff
+docs/results/search-r1-small-20260720/results.md text eol=lf
+docs/results/search-r1-small-20260720/lineage.tsv text eol=lf
+docs/results/search-r1-small-20260720/comparison.sha256 text eol=lf
+docs/results/search-r1-small-20260720/training_metrics.csv -text -diff
+docs/results/search-r1-small-20260720/generated.sha256 text eol=lf

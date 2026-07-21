@@ -80,3 +80,18 @@ tail -f "$attempt/shutdown-watchdog.log"
 ```
 
 watchdog 同时支持成功和失败终态，但只有在 commit/checkout、持久盘、exact attempt、phase lock、原始 exit code、唯一终态 marker 和日志 sentinel 全部重新验证后才会调用 AutoDL 的 `/usr/bin/shutdown`（无参数）。成功终态还必须通过 `comparison.sha256`、results、`gpu.ok` 以及 attempt 自身的 `comparison-digest` 交叉校验。锁冲突、状态不完整、校验失败或 dry-run 会保持开机并记录 `shutdown-skipped`；test mode 只记录模拟状态，绝不调用真实 backend。`shutdown-requested` 表示即将调用 backend，`shutdown-dispatched` 只表示 backend 已返回 0，两者都不能证明 AutoDL 控制平面已停止。无论 watchdog 结果如何，仍须在 AutoDL 控制台确认实例已停止且不再计费；SSH 断开本身不能证明停止计费。
+
+## CPU 后处理
+
+GPU 成功并关机后，不需要重新运行 CPU prepare、训练或评测。先校验 `runs/comparison/comparison.sha256`，再在无 GPU 实例或本地环境从 R/B/C 的原始日志导出逐 step CSV 和曲线：
+
+```bash
+python scripts/autodl/export_training_curves.py \
+  --reproduced-log <R60-attempt>/train.log \
+  --control-log <B20-attempt>/train.log \
+  --cost-aware-log <C20-attempt>/train.log \
+  --results-csv <project-root>/runs/comparison/results.csv \
+  --output-dir <export-dir>
+```
+
+输出固定为 `training_metrics.csv`、`training_curves.png` 和 `final_comparison.png`。CSV 中的训练 EM 使用独立的 `env/em/mean`，不会把 C 日志里已经扣除成本的 reward 误当作准确率；派生 utility 与最终评测统一使用 `lambda=0.10` 和 `/4`。曲线是未平滑的 per-step 聚合值，不代表逐 trajectory 样本。

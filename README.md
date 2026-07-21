@@ -36,6 +36,14 @@ We support different RL methods (e.g., PPO, GRPO, reinforce), different LLMs (e.
 
 Paper: [link1](https://arxiv.org/pdf/2503.09516), [link2](https://arxiv.org/abs/2505.15117); Model and data: [link](https://huggingface.co/collections/PeterJinGo/search-r1-67d1a021202731cb065740f5); Twitter thread: [link](https://x.com/BowenJin13/status/1895544294473109889); Full experiment log: [prelim](https://wandb.ai/peterjin/Search-R1-open); [v0.1](https://wandb.ai/peterjin/Search-R1-nq_hotpotqa_train); [v0.2](https://wandb.ai/peterjin/Search-R1-v0.2); [v0.3](https://wandb.ai/peterjin/Search-R1-v0.3). Details about these logs and methods can be find [here](https://github.com/PeterGriffinJin/Search-R1/blob/main/docs/experiment_log.md).
 
+## Qwen3.5 Small-Scale Reproduction (This Branch)
+
+This branch adds a minimal two-GPU AutoDL workflow for full-parameter GRPO training of Qwen3.5-2B and a controlled search-cost reward experiment. On NQ test-128, the reproduced model improved EM from 3.9% to 16.4%. The cost-aware branch reduced searches by 97.0% versus its matched control but also reduced EM, exposing a no-search policy collapse rather than a successful cost-quality trade-off.
+
+- [Experiment design and reproducible cloud workflow](docs/autodl_search_r1_reproduction_plan.md)
+- [Final metrics, curves, lineage, and interpretation](docs/results/search-r1-small-20260720/README.md)
+- [AutoDL operator commands](scripts/autodl/README.md)
+
 
 ![single-turn](public/main.png)
 
