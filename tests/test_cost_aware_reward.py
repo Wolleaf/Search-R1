@@ -4,6 +4,7 @@ import torch
 
 from verl import DataProto
 from verl.trainer import main_ppo
+from verl.trainer.ppo import core_algos
 
 
 class _Tokenizer:
@@ -58,6 +59,62 @@ def test_cost_reward_is_normalized_by_max_searches():
     assert reward.sum(-1).tolist() == pytest.approx([0.9, -0.025])
     assert data.batch['sequence_em_scores'].tolist() == [1.0, 0.0]
     assert data.batch['sequence_search_costs'].tolist() == pytest.approx([0.1, 0.025])
+    assert data.batch['sequence_train_rewards'].tolist() == pytest.approx([0.9, -0.025])
+    assert data.batch['sequence_posthoc_utilities'].tolist() == pytest.approx([0.9, -0.025])
+
+
+def test_correct_only_cost_is_gated_by_em_but_keeps_posthoc_utility():
+    data = _data(search_counts=[4, 1])
+    reward = main_ppo.RewardManager(
+        tokenizer=_Tokenizer(),
+        num_examine=0,
+        cost_lambda=0.1,
+        max_searches=4,
+        cost_reward_mode='correct_only',
+    )(data)
+
+    assert reward.sum(-1).tolist() == pytest.approx([0.9, 0.0])
+    assert data.batch['sequence_train_rewards'].tolist() == pytest.approx([0.9, 0.0])
+    assert data.batch['sequence_posthoc_utilities'].tolist() == pytest.approx([0.9, -0.025])
+
+
+def test_unknown_cost_reward_mode_is_rejected():
+    with pytest.raises(ValueError, match='cost_reward_mode'):
+        main_ppo.RewardManager(
+            tokenizer=_Tokenizer(), num_examine=0, cost_reward_mode='unknown')
+
+    with pytest.raises(ValueError, match='finite'):
+        main_ppo.RewardManager(
+            tokenizer=_Tokenizer(), num_examine=0, cost_lambda=float('nan'))
+
+
+def test_correct_only_all_wrong_group_has_zero_advantage():
+    data = _data(search_counts=[0, 4])
+    data.batch['responses'][0, -1] = 12
+    reward = main_ppo.RewardManager(
+        tokenizer=_Tokenizer(),
+        num_examine=0,
+        cost_lambda=0.1,
+        max_searches=4,
+        cost_reward_mode='correct_only',
+    )(data)
+
+    advantages, _ = core_algos.compute_grpo_outcome_advantage(
+        token_level_rewards=reward,
+        eos_mask=torch.ones_like(reward),
+        index=np.array(['same-question', 'same-question'], dtype=object),
+    )
+
+    assert reward.sum(-1).tolist() == [0.0, 0.0]
+    assert torch.count_nonzero(advantages).item() == 0
+
+
+def test_search_count_cannot_exceed_the_execution_budget():
+    manager = main_ppo.RewardManager(
+        tokenizer=_Tokenizer(), num_examine=0, cost_lambda=0.1, max_searches=4)
+
+    with pytest.raises(ValueError, match='exceeds'):
+        manager(_data(search_counts=[0, 5]))
 
 
 def test_search_cost_stays_aligned_after_batch_reorder():

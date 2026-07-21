@@ -38,16 +38,21 @@ class RewardManager():
                  num_examine,
                  format_score=0.,
                  cost_lambda=0.,
-                 max_searches=1) -> None:
+                 max_searches=1,
+                 cost_reward_mode='linear') -> None:
         self.tokenizer = tokenizer
         self.num_examine = num_examine  # the number of batches of decoded responses to print to the console
         self.format_score = format_score
         self.cost_lambda = float(cost_lambda)
         self.max_searches = int(max_searches)
-        if self.cost_lambda < 0:
-            raise ValueError('cost_lambda must be non-negative')
+        self.cost_reward_mode = str(cost_reward_mode)
+        if not np.isfinite(self.cost_lambda) or self.cost_lambda < 0:
+            raise ValueError('cost_lambda must be finite and non-negative')
         if self.max_searches <= 0:
             raise ValueError('max_searches must be positive')
+        if self.cost_reward_mode not in ('linear', 'correct_only'):
+            raise ValueError(
+                "cost_reward_mode must be 'linear' or 'correct_only'")
 
     def __call__(self, data: DataProto):
         """We will expand this function gradually based on the available datasets"""
@@ -71,7 +76,11 @@ class RewardManager():
                 f'executed_search_count must have shape ({len(data)},), got {tuple(search_counts.shape)}')
         if torch.any(search_counts < 0):
             raise ValueError('executed_search_count must be non-negative')
+        if torch.any(search_counts > self.max_searches):
+            raise ValueError('executed_search_count exceeds max_searches')
         search_costs = self.cost_lambda * search_counts / self.max_searches
+        train_rewards = torch.zeros_like(em_scores)
+        posthoc_utilities = torch.zeros_like(em_scores)
 
         # all_scores = []
 
@@ -104,7 +113,12 @@ class RewardManager():
             score = compute_score_fn(solution_str=sequences_str, ground_truth=ground_truth, format_score=self.format_score)
 
             em_scores[i] = score
-            reward_tensor[i, valid_response_length - 1] = score - search_costs[i]
+            posthoc_utilities[i] = score - search_costs[i]
+            if self.cost_reward_mode == 'correct_only':
+                train_rewards[i] = score * (1.0 - search_costs[i])
+            else:
+                train_rewards[i] = posthoc_utilities[i]
+            reward_tensor[i, valid_response_length - 1] = train_rewards[i]
             # all_scores.append(score)
 
             if data_source not in already_print_data_sources:
@@ -125,6 +139,8 @@ class RewardManager():
         # decoding the response a second time in the trainer.
         data.batch['sequence_em_scores'] = em_scores
         data.batch['sequence_search_costs'] = search_costs
+        data.batch['sequence_train_rewards'] = train_rewards
+        data.batch['sequence_posthoc_utilities'] = posthoc_utilities
         return reward_tensor
 
 
@@ -223,13 +239,16 @@ def main_task(config):
     reward_fn = RewardManager(tokenizer=tokenizer,
                               num_examine=0,
                               cost_lambda=config.algorithm.get('cost_lambda', 0.0),
-                              max_searches=config.max_turns)
+                              max_searches=config.max_turns,
+                              cost_reward_mode=config.algorithm.get(
+                                  'cost_reward_mode', 'linear'))
 
     # Note that we always use function-based RM for validation
     val_reward_fn = RewardManager(tokenizer=tokenizer,
                                   num_examine=1,
                                   cost_lambda=config.algorithm.get('cost_lambda', 0.0),
-                                  max_searches=config.max_turns)
+                                  max_searches=config.max_turns,
+                                  cost_reward_mode='linear')
 
     resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
     trainer = RayPPOTrainer(config=config,

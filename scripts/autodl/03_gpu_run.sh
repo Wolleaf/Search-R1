@@ -19,6 +19,7 @@ TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-8}"
 MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-256}"
 PRICE_PER_HOUR="${AUTODL_PRICE_PER_HOUR:-}"
 ALLOCATOR_CONFIG="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+RUN_BUDGET_PROFILE="${AUTODL_RUN_BUDGET_PROFILE:-legacy}"
 readonly REPRODUCE_STEPS=60
 readonly BRANCH_STEPS=20
 # Step 2 exercises backward after Adam has initialized its optimizer state.
@@ -50,6 +51,10 @@ validate_gpu_inputs() {
     command -v timeout >/dev/null 2>&1 || {
         printf 'GNU timeout is required for the GPU budget cap.\n' >&2
         return 1
+    }
+    [[ "$RUN_BUDGET_PROFILE" == legacy || "$RUN_BUDGET_PROFILE" == gated_followup ]] || {
+        printf 'AUTODL_RUN_BUDGET_PROFILE must be legacy or gated_followup.\n' >&2
+        return 64
     }
 }
 
@@ -86,6 +91,7 @@ finish_run_record() {
     local run_dir="$1" rc="$2" started_epoch="$3" started_at="$4"
     local budget_rmb="$5" timeout_seconds="$6"
     local job_mode="$7" variant="$8" requested_steps="$9" input_model="${10}"
+    local trace_output_dir="${11:-}"
     local finished_epoch elapsed state marker timed_out=false
     local resolved_config_sha256=unavailable
     finished_epoch="$(date +%s)"
@@ -115,6 +121,7 @@ finish_run_record() {
 "train_batch_size=$TRAIN_BATCH_SIZE"$'\n'\
 "max_response_length=$MAX_RESPONSE_LENGTH"$'\n'\
 "input_model=$input_model"$'\n'\
+"trace_output_dir=$trace_output_dir"$'\n'\
 "resolved_config_sha256=$resolved_config_sha256"$'\n'\
 "pytorch_cuda_alloc_conf=$ALLOCATOR_CONFIG"$'\n'\
 "price_per_hour=$PRICE_PER_HOUR"$'\n'\
@@ -130,8 +137,11 @@ finish_run_record() {
 
 run_job() {
     local mode="$1" variant="$2" argument="${3:-}" model_path="${4:-}"
+    local input_model_digest="${5:-}"
     local parent run_dir started_epoch started_at rc budget_rmb timeout_seconds
-    local requested_steps=0 input_model
+    local requested_steps=0 input_model trace_manifest expected_trace_rows trace_stage
+    local trace_checkpoint_digest='' trace_parent_checkpoint_digest=''
+    local trace_output_dir=''
     local -a job_args
     case "$mode:$variant" in
         train:smoke)
@@ -166,18 +176,53 @@ run_job() {
             }
             budget_rmb=40
             ;;
-        eval:base|eval:reproduced|eval:control|eval:cost_aware) budget_rmb=10 ;;
+        train:cost_aware_gated)
+            if [[ "$RUN_BUDGET_PROFILE" != gated_followup ]]; then
+                printf 'C-gated is available only in the gated follow-up workflow.\n' >&2
+                return 64
+            elif [[ "$argument" == "$BASE_GATE_STEPS" ]]; then
+                budget_rmb=8
+            elif [[ "$argument" == "$BRANCH_STEPS" ]]; then
+                budget_rmb=25
+            else
+                printf 'C-gated is allowed only for the %s-step gate or step %s endpoint.\n' \
+                    "$BASE_GATE_STEPS" "$BRANCH_STEPS" >&2
+                return 64
+            fi
+            ;;
+        eval:base|eval:reproduced|eval:control|eval:cost_aware|eval:cost_aware_gated)
+            if [[ "$RUN_BUDGET_PROFILE" == gated_followup ]]; then
+                budget_rmb=5
+            else
+                budget_rmb=10
+            fi
+            ;;
         *) printf 'No budget is defined for %s:%s.\n' "$mode" "$variant" >&2; return 64 ;;
     esac
     if [[ "$mode" == train ]]; then
         requested_steps="$argument"
-        if [[ "$variant" == control || "$variant" == cost_aware ]]; then
+        if [[ "$variant" == control || "$variant" == cost_aware ||
+              "$variant" == cost_aware_gated ]]; then
             input_model="$model_path"
         else
             input_model="$MODEL_DIR"
         fi
     else
         input_model="$argument"
+    fi
+    if [[ -n "$input_model_digest" && ! "$input_model_digest" =~ ^[0-9a-f]{64}$ ]]; then
+        printf 'Input model digest is invalid for %s:%s.\n' "$mode" "$variant" >&2
+        return 64
+    fi
+    if [[ "$RUN_BUDGET_PROFILE" == gated_followup && "$mode" == eval &&
+          -z "$input_model_digest" ]]; then
+        printf 'Evaluation requires the exact input checkpoint digest for trace provenance.\n' >&2
+        return 64
+    fi
+    if [[ "$mode" == eval ]]; then
+        trace_checkpoint_digest="$input_model_digest"
+    else
+        trace_parent_checkpoint_digest="$input_model_digest"
     fi
     timeout_seconds="$(awk -v budget="$budget_rmb" -v price="$PRICE_PER_HOUR" \
         'BEGIN { printf "%d", budget / price * 3600 }')"
@@ -197,6 +242,13 @@ run_job() {
     atomic_write "$parent/latest" "$run_dir"$'\n'
     started_epoch="$(date +%s)"
     started_at="$(utc_now)"
+    trace_stage="$variant"
+    if [[ "$mode:$variant:$argument" == "train:cost_aware_gated:$BASE_GATE_STEPS" ]]; then
+        trace_stage=cost_aware_gated_gate
+    fi
+    if [[ "$RUN_BUDGET_PROFILE" == gated_followup ]]; then
+        trace_output_dir="$run_dir/traces"
+    fi
     printf 'Starting %s %s (budget %s RMB, timeout %ss); log: %s/train.log\n' \
         "$mode" "$variant" "$budget_rmb" "$timeout_seconds" "$run_dir"
 
@@ -211,6 +263,11 @@ run_job() {
         GPU_COUNT="$GPU_COUNT" \
         TRAIN_BATCH_SIZE="$TRAIN_BATCH_SIZE" \
         MAX_RESPONSE_LENGTH="$MAX_RESPONSE_LENGTH" \
+        TRACE_OUTPUT_DIR="$trace_output_dir" \
+        TRACE_STAGE="$trace_stage" \
+        TRACE_RUN_ID="$(basename -- "$run_dir")" \
+        TRACE_CHECKPOINT_DIGEST="$trace_checkpoint_digest" \
+        TRACE_PARENT_CHECKPOINT_DIGEST="$trace_parent_checkpoint_digest" \
         AUTODL_ROOT="$PROJECT_ROOT" \
         bash "$CHECKOUT_DIR/scripts/autodl/train_small_grpo.sh" \
         "${job_args[@]}" \
@@ -221,15 +278,35 @@ run_job() {
         GPU_COUNT="$GPU_COUNT" \
         TRAIN_BATCH_SIZE="$TRAIN_BATCH_SIZE" \
         MAX_RESPONSE_LENGTH="$MAX_RESPONSE_LENGTH" \
+        TRACE_OUTPUT_DIR="$trace_output_dir" \
+        TRACE_STAGE="$trace_stage" \
+        TRACE_RUN_ID="$(basename -- "$run_dir")" \
+        TRACE_CHECKPOINT_DIGEST="$trace_checkpoint_digest" \
+        TRACE_PARENT_CHECKPOINT_DIGEST="$trace_parent_checkpoint_digest" \
         AUTODL_ROOT="$PROJECT_ROOT" \
         timeout --signal=TERM --kill-after=120s "${timeout_seconds}s" \
             bash "$CHECKOUT_DIR/scripts/autodl/train_small_grpo.sh" \
             "${job_args[@]}" >>"$run_dir/train.log" 2>&1
         rc=$?
     fi
+    if ((rc == 0)) && [[ -n "$trace_output_dir" ]]; then
+        if [[ "$mode" == train ]]; then
+            trace_manifest="$run_dir/traces/train_trajectories.manifest.json"
+            expected_trace_rows=$((requested_steps * TRAIN_BATCH_SIZE * 5))
+        else
+            trace_manifest="$run_dir/traces/eval_predictions.manifest.json"
+            expected_trace_rows=128
+        fi
+        PYTHONPATH="$CHECKOUT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
+        "$TRAIN_ENV/bin/python" -m search_r1.trajectory_trace verify \
+            --manifest "$trace_manifest" \
+            --expected-rows "$expected_trace_rows" >>"$run_dir/train.log" 2>&1
+        rc=$?
+    fi
     set -e
     finish_run_record "$run_dir" "$rc" "$started_epoch" "$started_at" \
-        "$budget_rmb" "$timeout_seconds" "$mode" "$variant" "$requested_steps" "$input_model"
+        "$budget_rmb" "$timeout_seconds" "$mode" "$variant" "$requested_steps" "$input_model" \
+        "$trace_output_dir"
     LAST_RUN_DIR="$run_dir"
     if ((rc != 0)); then
         printf '%s %s failed with exit code %s; inspect %s/train.log\n' "$mode" "$variant" "$rc" "$run_dir" >&2
@@ -275,6 +352,7 @@ record_lineage() {
     local run_dir="$1" role="$2" checkpoint="$3" checkpoint_digest="$4"
     local parent_checkpoint="$5" parent_checkpoint_digest="$6"
     local checkout_commit="$7" cpu_handoff_digest="$8" cost_lambda="$9"
+    local cost_reward_mode="${10:-linear}"
     local metadata resolved_config_sha256 value
     resolved_config_sha256="$(file_sha256 "$run_dir/resolved-config.yaml")"
     for value in "$role" "$checkpoint" "$parent_checkpoint"; do
@@ -306,7 +384,8 @@ record_lineage() {
 "checkout_commit=$checkout_commit"$'\n'\
 "cpu_handoff_digest=$cpu_handoff_digest"$'\n'\
 "seed=42"$'\n'\
-"cost_lambda=$cost_lambda"$'\n'
+"cost_lambda=$cost_lambda"$'\n'\
+"cost_reward_mode=$cost_reward_mode"$'\n'
     atomic_write "$run_dir/lineage.tsv" \
         $'role\tcheckpoint\tcheckpoint_digest\tparent_checkpoint\tparent_checkpoint_digest\tcheckout_commit\tcpu_handoff_digest\tresolved_config_sha256\n'\
 "$role"$'\t'"$checkpoint"$'\t'"$checkpoint_digest"$'\t'"$parent_checkpoint"$'\t'"$parent_checkpoint_digest"$'\t'"$checkout_commit"$'\t'"$cpu_handoff_digest"$'\t'"$resolved_config_sha256"$'\n'
@@ -317,7 +396,8 @@ delete_gate_checkpoint() {
     local run_dir="$1" checkpoint="$2" variant="$3" gate_steps="$4"
     local canonical_run canonical_runs_root expected_checkpoint bytes metadata
     [[ "$variant:$gate_steps" == "smoke:$BASE_GATE_STEPS" ||
-        "$variant:$gate_steps" == "control:$CHECKPOINT_LOAD_GATE_STEPS" ]] || {
+        "$variant:$gate_steps" == "control:$CHECKPOINT_LOAD_GATE_STEPS" ||
+        "$variant:$gate_steps" == "cost_aware_gated:$BASE_GATE_STEPS" ]] || {
         printf 'Refusing cleanup for unknown gate endpoint: %s step %s\n' "$variant" "$gate_steps" >&2
         return 1
     }
@@ -399,7 +479,7 @@ gpu_action() {
     local retriever_pid='' retriever_log ready=false base_model base_model_digest
     local base_gate_run branch_gate_run reproduce_run control_run cost_run
     local base_eval reproduced_eval control_eval cost_eval
-    local base_gate_checkpoint branch_gate_checkpoint
+    local base_gate_checkpoint branch_gate_checkpoint base_gate_digest
     local reproduce_checkpoint control_checkpoint cost_checkpoint
     local reproduce_digest control_digest cost_digest
     local reproduce_config_digest control_config_digest cost_config_digest
@@ -411,8 +491,10 @@ gpu_action() {
         printf 'CPU phase is not sealed; refusing paid GPU work.\n' >&2
         return 1
     }
-    rm -f -- "$MANIFEST_DIR/gpu.ok"
-    sync_path "$MANIFEST_DIR"
+    if [[ "${AUTODL_GPU_PIPELINE:-legacy}" == legacy ]]; then
+        rm -f -- "$MANIFEST_DIR/gpu.ok"
+        sync_path "$MANIFEST_DIR"
+    fi
 
     # Everything after this point is deliberately offline except localhost retrieval.
     export HF_HUB_OFFLINE=1
@@ -507,16 +589,32 @@ PY
         return 1
     }
 
-    run_job train smoke "$BASE_GATE_STEPS"
+    if [[ "${AUTODL_GPU_PIPELINE:-legacy}" == cost_aware_gated ]]; then
+        declare -F cost_aware_gated_pipeline >/dev/null || {
+            printf 'The C-gated pipeline callback is unavailable.\n' >&2
+            return 1
+        }
+        cost_aware_gated_pipeline "$_attempt" "$commit" "$recorded_digest" \
+            "$base_model" "$base_model_digest"
+        cleanup_retriever
+        trap - EXIT
+        return 0
+    elif [[ "${AUTODL_GPU_PIPELINE:-legacy}" != legacy ]]; then
+        printf 'Unknown GPU pipeline: %s\n' "$AUTODL_GPU_PIPELINE" >&2
+        return 64
+    fi
+
+    run_job train smoke "$BASE_GATE_STEPS" '' "$base_model_digest"
     base_gate_run="$LAST_RUN_DIR"
     base_gate_checkpoint="$(fixed_checkpoint "$base_gate_run" "$BASE_GATE_STEPS")"
-    run_job train control "$CHECKPOINT_LOAD_GATE_STEPS" "$base_gate_checkpoint"
+    base_gate_digest="$(tree_sha256 "$base_gate_checkpoint")"
+    run_job train control "$CHECKPOINT_LOAD_GATE_STEPS" "$base_gate_checkpoint" "$base_gate_digest"
     branch_gate_run="$LAST_RUN_DIR"
     branch_gate_checkpoint="$(fixed_checkpoint "$branch_gate_run" "$CHECKPOINT_LOAD_GATE_STEPS")"
     delete_gate_checkpoint "$branch_gate_run" "$branch_gate_checkpoint" control "$CHECKPOINT_LOAD_GATE_STEPS"
     delete_gate_checkpoint "$base_gate_run" "$base_gate_checkpoint" smoke "$BASE_GATE_STEPS"
 
-    run_job train reproduce "$REPRODUCE_STEPS"
+    run_job train reproduce "$REPRODUCE_STEPS" '' "$base_model_digest"
     reproduce_run="$LAST_RUN_DIR"
     reproduce_checkpoint="$(fixed_checkpoint "$reproduce_run" "$REPRODUCE_STEPS")"
     reproduce_digest="$(tree_sha256 "$reproduce_checkpoint")"
@@ -524,7 +622,7 @@ PY
     record_lineage "$reproduce_run" reproduced "$reproduce_checkpoint" "$reproduce_digest" \
         "$base_model" "$base_model_digest" "$commit" "$recorded_digest" 0
 
-    run_job train control "$BRANCH_STEPS" "$reproduce_checkpoint"
+    run_job train control "$BRANCH_STEPS" "$reproduce_checkpoint" "$reproduce_digest"
     control_run="$LAST_RUN_DIR"
     control_checkpoint="$(fixed_checkpoint "$control_run" "$BRANCH_STEPS")"
     control_digest="$(tree_sha256 "$control_checkpoint")"
@@ -532,7 +630,7 @@ PY
     record_lineage "$control_run" control "$control_checkpoint" "$control_digest" \
         "$reproduce_checkpoint" "$reproduce_digest" "$commit" "$recorded_digest" 0
 
-    run_job train cost_aware "$BRANCH_STEPS" "$reproduce_checkpoint"
+    run_job train cost_aware "$BRANCH_STEPS" "$reproduce_checkpoint" "$reproduce_digest"
     cost_run="$LAST_RUN_DIR"
     cost_checkpoint="$(fixed_checkpoint "$cost_run" "$BRANCH_STEPS")"
     cost_digest="$(tree_sha256 "$cost_checkpoint")"
@@ -540,13 +638,13 @@ PY
     record_lineage "$cost_run" cost_aware "$cost_checkpoint" "$cost_digest" \
         "$reproduce_checkpoint" "$reproduce_digest" "$commit" "$recorded_digest" 0.10
 
-    run_job eval base "$base_model"
+    run_job eval base "$base_model" '' "$base_model_digest"
     base_eval="$LAST_RUN_DIR"
-    run_job eval reproduced "$reproduce_checkpoint"
+    run_job eval reproduced "$reproduce_checkpoint" '' "$reproduce_digest"
     reproduced_eval="$LAST_RUN_DIR"
-    run_job eval control "$control_checkpoint"
+    run_job eval control "$control_checkpoint" '' "$control_digest"
     control_eval="$LAST_RUN_DIR"
-    run_job eval cost_aware "$cost_checkpoint"
+    run_job eval cost_aware "$cost_checkpoint" '' "$cost_digest"
     cost_eval="$LAST_RUN_DIR"
 
     write_lineage_manifest \
@@ -591,19 +689,25 @@ PY
     printf 'The script does not shut down AutoDL. Confirm stopped state and billing in the console.\n'
 }
 
-case "${1:-}" in
-    --worker)
-        phase_worker gpu "${2:?missing attempt directory}" "$0"
-        ;;
-    --action)
-        gpu_action "${2:?missing attempt directory}"
-        ;;
-    '')
-        validate_gpu_inputs
-        phase_launch gpu "$0"
-        ;;
-    *)
-        printf 'Usage: GPU_COUNT={1|2} AUTODL_PRICE_PER_HOUR=<price> bash %s\n' "$0" >&2
-        exit 64
-        ;;
-esac
+main() {
+    case "${1:-}" in
+        --worker)
+            phase_worker gpu "${2:?missing attempt directory}" "$0"
+            ;;
+        --action)
+            gpu_action "${2:?missing attempt directory}"
+            ;;
+        '')
+            validate_gpu_inputs
+            phase_launch gpu "$0"
+            ;;
+        *)
+            printf 'Usage: GPU_COUNT={1|2} AUTODL_PRICE_PER_HOUR=<price> bash %s\n' "$0" >&2
+            exit 64
+            ;;
+    esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

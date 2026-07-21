@@ -26,9 +26,18 @@ bash /root/autodl-tmp/autodl-bootstrap/01_git.sh
 bash /root/autodl-tmp/search-r1/checkout/scripts/autodl/02_cpu_prepare.sh
 ```
 
-CPU 阶段复用 Conda `llmdevelop` 的镜像 Python，在持久盘创建 train/retriever venv；下载并固定 Qwen3.5-2B、BM25 索引和 wiki-18 corpus；生成 NQ 512/64/128；完成 tokenizer、真实 BM25、数据与奖励测试；组合 1/2 GPU 的四种训练 mode 和四种评测 mode；最后发布自校验的 `manifests/cpu_handoff.json`。
+CPU 阶段复用 Conda `llmdevelop` 的镜像 Python，在持久盘创建 train/retriever venv；下载并固定 Qwen3.5-2B、BM25 索引和 wiki-18 corpus；生成 NQ 512/64/128；完成 tokenizer、真实 BM25、数据与奖励测试；组合并校验全部生产配置；最后发布自校验的 `manifests/cpu_handoff.json`。
 
 handoff 与完整 Git commit、依赖、资产、数据和 resolved config 绑定。**本次新 commit 会使旧 handoff 失效，必须重新运行本阶段。** 已存在且通过校验的模型、语料、索引、数据和环境可以复用，不需要重复下载。CPU 成功后在 AutoDL 控制台停止 CPU 实例，并确认下一实例挂载同一个 100 GB 数据盘。
+
+已有完整 CPU handoff、环境和资产时，本次 C-gated follow-up 使用离线增量 reseal，不执行 pip/apt、snapshot download、语料展开或数据重建：
+
+```bash
+AUTODL_RESEAL_ONLY=1 \
+bash /root/autodl-tmp/search-r1/checkout/scripts/autodl/02_cpu_prepare.sh
+```
+
+该路径先校验旧 handoff 的全部 digest、两个 Python 环境 freeze、Java、模型/数据/索引/语料，再运行新增测试与配置组合，最后按新 commit 发布 handoff。任何旧证据或资产不一致都会失败关闭；不要退回联网重建来掩盖不一致。
 
 ### 3. GPU 离线训练
 
@@ -46,6 +55,19 @@ bash /root/autodl-tmp/search-r1/checkout/scripts/autodl/03_gpu_run.sh
 正式阶段依次运行 `train reproduce 60`、`train control 20 <R60>` 和 `train cost_aware 20 <R60>`，仅保留 R60、B20、C20 三个正式 checkpoint。最后以 `eval base|reproduced|control|cost_aware` 在同一 test-128 上评测 A/R/B/C，四路都用 `lambda=0.10` 计算 utility，并分别报告 EM 与实际搜索次数。结果写入 `runs/comparison/results.md`。
 
 B/C 只从 R 的模型权重启动；Adam、warmup、数据 shuffle 状态和 KL reference 都会分别重新初始化。这是 stage-2 受控分叉，不是精确续训。单 seed 与 test-128 只能展示趋势，不能宣称统计显著性。
+
+### C-gated 独立增量实验
+
+已有 R60、B20 和 C-old20 后，不再运行上面的完整 `03_gpu_run.sh`。两卡实例只运行：
+
+```bash
+GPU_COUNT=2 AUTODL_PRICE_PER_HOUR=5.76 \
+bash /root/autodl-tmp/search-r1/checkout/scripts/autodl/05_gpu_cost_aware_gated.sh
+```
+
+该入口校验旧 `runs/comparison/lineage.tsv` 及 R/B/C-old checkpoint digest；从同一 R60 运行 2-step C-gated 日志 gate，成功后删除 gate 权重；再从 R60 全新训练固定 C-gated20。B 和 C-old 只做 trace-only test-128 推理，不更新权重；最后评测 C-gated，严格校验 `80/800/128` 轨迹行数和 manifest，并生成三路逐题配对、答对/答错清单、搜索转移、独立训练 CSV/SVG 曲线。旧 `runs/comparison`、`manifests/gpu.ok` 和历史 C-old 证据不会被覆盖。
+
+follow-up 的分项硬上限是 gate 8 元、正式训练 25 元、三路评测各 5 元，合计 48 元。它只限制失控运行，不代表预计支出；不做 val EM 科学早停，只有工程错误或证据校验失败才停止。
 
 ## 固定配置与回退
 
@@ -79,7 +101,7 @@ bash /root/autodl-tmp/search-r1/checkout/scripts/autodl/04_watch_and_shutdown.sh
 tail -f "$attempt/shutdown-watchdog.log"
 ```
 
-watchdog 同时支持成功和失败终态，但只有在 commit/checkout、持久盘、exact attempt、phase lock、原始 exit code、唯一终态 marker 和日志 sentinel 全部重新验证后才会调用 AutoDL 的 `/usr/bin/shutdown`（无参数）。成功终态还必须通过 `comparison.sha256`、results、`gpu.ok` 以及 attempt 自身的 `comparison-digest` 交叉校验。锁冲突、状态不完整、校验失败或 dry-run 会保持开机并记录 `shutdown-skipped`；test mode 只记录模拟状态，绝不调用真实 backend。`shutdown-requested` 表示即将调用 backend，`shutdown-dispatched` 只表示 backend 已返回 0，两者都不能证明 AutoDL 控制平面已停止。无论 watchdog 结果如何，仍须在 AutoDL 控制台确认实例已停止且不再计费；SSH 断开本身不能证明停止计费。
+watchdog 同时支持成功和失败终态，但只有在 commit/checkout、持久盘、exact attempt、phase lock、原始 exit code、唯一终态 marker 和日志 sentinel 全部重新验证后才会调用 AutoDL 的 `/usr/bin/shutdown`（无参数）。旧流程成功时校验 `comparison.sha256`、results、`gpu.ok` 和 attempt digest；C-gated follow-up 则校验独立 result root 的全部 `evidence.sha256` 条目、新 marker 和 attempt digest，不借用或改写旧 `gpu.ok`。锁冲突、状态不完整、校验失败或 dry-run 会保持开机并记录 `shutdown-skipped`；test mode 只记录模拟状态，绝不调用真实 backend。`shutdown-requested` 表示即将调用 backend，`shutdown-dispatched` 只表示 backend 已返回 0，两者都不能证明 AutoDL 控制平面已停止。无论 watchdog 结果如何，仍须在 AutoDL 控制台确认实例已停止且不再计费；SSH 断开本身不能证明停止计费。
 
 ## CPU 后处理
 

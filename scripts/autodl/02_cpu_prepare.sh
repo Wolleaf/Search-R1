@@ -72,7 +72,9 @@ resolve_llmdevelop_python() {
 cpu_action() {
     local _attempt="$1"
     local commit base_python train_python retriever_python python_version torch_version handoff_digest gpu_count
-    local spec mode variant steps model_path config_output_dir parent_placeholder
+    local previous_commit previous_python previous_torch
+    local spec mode variant steps model_path config_output_dir parent_placeholder trace_placeholder
+    local trace_digest_placeholder trace_checkpoint_digest trace_parent_digest trace_output trace_stage
     local -a command_args
     commit="$(expected_commit)"
     verify_checkout "$commit"
@@ -80,46 +82,92 @@ cpu_action() {
         printf 'Missing requirements-autodl.lock in the pinned checkout.\n' >&2
         return 1
     }
+    rm -f -- "$MANIFEST_DIR/cpu.ok"
+    sync_path "$MANIFEST_DIR"
 
-    base_python="$(resolve_llmdevelop_python)"
-    [[ -x "$base_python" ]] || {
-        printf 'llmdevelop Python is not executable: %s\n' "$base_python" >&2
-        return 1
-    }
-    check_runtime "$base_python"
+    if [[ "${AUTODL_RESEAL_ONLY:-0}" == 1 ]]; then
+        export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1 PIP_NO_INDEX=1
+        train_python="$TRAIN_ENV/bin/python"
+        retriever_python="$RETRIEVER_ENV/bin/python"
+        [[ -x "$train_python" && -x "$retriever_python" &&
+            -f "$HANDOFF" && -f "$HANDOFF.sha256" ]] || {
+            printf 'Incremental reseal requires the existing environments and CPU handoff.\n' >&2
+            return 1
+        }
+        check_runtime "$train_python"
+        "$train_python" -m pip check
+        "$retriever_python" -c 'import sys; assert sys.version_info[:2] == (3, 12)'
+        IFS=$'\t' read -r previous_commit previous_python previous_torch < <(
+            "$train_python" - "$HANDOFF" <<'PY'
+import json
+from pathlib import Path
+import sys
 
-    mkdir -p "$PROJECT_ROOT/envs" "$CACHE_ROOT" "$DATA_ROOT" "$PROJECT_ROOT/models" "$MANIFEST_DIR"
-    if [[ ! -x "$TRAIN_ENV/bin/python" ]]; then
-        "$base_python" -m venv --system-site-packages "$TRAIN_ENV"
-    fi
-    train_python="$TRAIN_ENV/bin/python"
-    check_runtime "$train_python"
-    "$train_python" -m pip install --requirement "$CHECKOUT_DIR/requirements-autodl.lock"
-    "$train_python" -m pip check
-    check_runtime "$train_python"
+payload = json.loads(Path(sys.argv[1]).read_text())
+print(payload["checkout_commit"], payload["python_version"], payload["torch_version"], sep="\t")
+PY
+        )
+        "$train_python" "$CHECKOUT_DIR/scripts/autodl/handoff.py" verify \
+            --root "$PROJECT_ROOT" \
+            --commit "$previous_commit" \
+            --python-version "$previous_python" \
+            --torch-version "$previous_torch" \
+            --manifest "$HANDOFF"
+        "$train_python" -m pip freeze --all >"$_attempt/train-freeze.current.txt"
+        "$retriever_python" -m pip freeze --all >"$_attempt/retriever-freeze.current.txt"
+        cmp -s "$MANIFEST_DIR/train-freeze.txt" "$_attempt/train-freeze.current.txt" || {
+            printf 'Train environment changed since the previous handoff.\n' >&2
+            return 1
+        }
+        cmp -s "$MANIFEST_DIR/retriever-freeze.txt" "$_attempt/retriever-freeze.current.txt" || {
+            printf 'Retriever environment changed since the previous handoff.\n' >&2
+            return 1
+        }
+        java -version >"$MANIFEST_DIR/java-version.txt" 2>&1
+        grep -Eq 'version "21([.]|")' "$MANIFEST_DIR/java-version.txt" || {
+            printf 'OpenJDK 21 is required by Pyserini 1.1.\n' >&2
+            return 1
+        }
+    elif [[ "${AUTODL_RESEAL_ONLY:-0}" == 0 ]]; then
+        base_python="$(resolve_llmdevelop_python)"
+        [[ -x "$base_python" ]] || {
+            printf 'llmdevelop Python is not executable: %s\n' "$base_python" >&2
+            return 1
+        }
+        check_runtime "$base_python"
 
-    # Pyserini 1.1 is kept isolated so it cannot replace the image's PyTorch.
-    apt-get update
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends openjdk-21-jre-headless
-    java -version >"$MANIFEST_DIR/java-version.txt" 2>&1
-    grep -Eq 'version "21([.]|")' "$MANIFEST_DIR/java-version.txt" || {
-        printf 'OpenJDK 21 is required by Pyserini 1.1.\n' >&2
-        return 1
-    }
-    if [[ ! -x "$RETRIEVER_ENV/bin/python" ]]; then
-        "$base_python" -m venv "$RETRIEVER_ENV"
-    fi
-    retriever_python="$RETRIEVER_ENV/bin/python"
-    "$retriever_python" -m pip install \
-        'pyserini==1.1.0' --no-deps
-    "$retriever_python" -m pip install \
-        'pyjnius>=1.6,<2' \
-        'fastapi==0.139.2' \
-        'uvicorn==0.51.0' \
-        'pydantic>=2.10,<3'
-    "$retriever_python" -c 'import sys; assert sys.version_info[:2] == (3, 12)'
+        mkdir -p "$PROJECT_ROOT/envs" "$CACHE_ROOT" "$DATA_ROOT" "$PROJECT_ROOT/models" "$MANIFEST_DIR"
+        if [[ ! -x "$TRAIN_ENV/bin/python" ]]; then
+            "$base_python" -m venv --system-site-packages "$TRAIN_ENV"
+        fi
+        train_python="$TRAIN_ENV/bin/python"
+        check_runtime "$train_python"
+        "$train_python" -m pip install --requirement "$CHECKOUT_DIR/requirements-autodl.lock"
+        "$train_python" -m pip check
+        check_runtime "$train_python"
 
-    "$train_python" - "$MODEL_DIR" "$BM25_ROOT" "$CORPUS_SOURCE_ROOT" <<PY
+        # Pyserini 1.1 is kept isolated so it cannot replace the image's PyTorch.
+        apt-get update
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends openjdk-21-jre-headless
+        java -version >"$MANIFEST_DIR/java-version.txt" 2>&1
+        grep -Eq 'version "21([.]|")' "$MANIFEST_DIR/java-version.txt" || {
+            printf 'OpenJDK 21 is required by Pyserini 1.1.\n' >&2
+            return 1
+        }
+        if [[ ! -x "$RETRIEVER_ENV/bin/python" ]]; then
+            "$base_python" -m venv "$RETRIEVER_ENV"
+        fi
+        retriever_python="$RETRIEVER_ENV/bin/python"
+        "$retriever_python" -m pip install \
+            'pyserini==1.1.0' --no-deps
+        "$retriever_python" -m pip install \
+            'pyjnius>=1.6,<2' \
+            'fastapi==0.139.2' \
+            'uvicorn==0.51.0' \
+            'pydantic>=2.10,<3'
+        "$retriever_python" -c 'import sys; assert sys.version_info[:2] == (3, 12)'
+
+        "$train_python" - "$MODEL_DIR" "$BM25_ROOT" "$CORPUS_SOURCE_ROOT" <<PY
 from huggingface_hub import snapshot_download
 import sys
 
@@ -148,7 +196,7 @@ snapshot_download(
 )
 PY
 
-    "$train_python" "$CHECKOUT_DIR/scripts/autodl/build_corpus_offsets.py" prepare \
+        "$train_python" "$CHECKOUT_DIR/scripts/autodl/build_corpus_offsets.py" prepare \
         --source "$CORPUS_GZIP" \
         --output-dir "$CORPUS_ROOT" \
         --revision "$CORPUS_REVISION" \
@@ -156,13 +204,17 @@ PY
         --source-bytes "$CORPUS_BYTES" \
         --member-bytes "$CORPUS_MEMBER_BYTES"
 
-    "$train_python" "$CHECKOUT_DIR/scripts/data_process/nq_small.py" \
+        "$train_python" "$CHECKOUT_DIR/scripts/data_process/nq_small.py" \
         --local-dir "$SMALL_DATA_DIR" \
         --revision "$DATA_REVISION" \
         --seed 42 \
         --train-size 512 \
         --val-size 64 \
         --test-size 128
+    else
+        printf 'AUTODL_RESEAL_ONLY must be 0 or 1.\n' >&2
+        return 64
+    fi
 
     "$train_python" - "$MODEL_DIR" "$SMALL_DATA_DIR" <<'PY'
 import json
@@ -204,7 +256,12 @@ PY
 
     "$train_python" -m pytest -q -p no:cacheprovider "$CHECKOUT_DIR/tests"
     PYTHON_BIN="$train_python" bash "$CHECKOUT_DIR/scripts/autodl/tests/test_runtime.sh"
+    bash "$CHECKOUT_DIR/scripts/autodl/tests/test_gated_config.sh"
+    bash "$CHECKOUT_DIR/scripts/autodl/tests/test_gated_followup.sh"
+    bash "$CHECKOUT_DIR/scripts/autodl/tests/test_shutdown_watchdog.sh"
     "$train_python" "$CHECKOUT_DIR/scripts/autodl/tests/test_results.py"
+    "$train_python" "$CHECKOUT_DIR/scripts/autodl/tests/test_paired_eval.py"
+    "$train_python" "$CHECKOUT_DIR/scripts/autodl/tests/test_export_gated_training.py"
     "$train_python" - "$CHECKOUT_DIR" <<'PY'
 from pathlib import Path
 import sys
@@ -217,53 +274,100 @@ PY
 
     config_output_dir="$PROJECT_ROOT/cache/config-compose/resolved-output"
     parent_placeholder="$PROJECT_ROOT/cache/config-compose/reproduced-checkpoint-placeholder"
-    mkdir -p "$parent_placeholder"
+    trace_placeholder="$PROJECT_ROOT/cache/config-compose/trace-output-placeholder"
+    trace_digest_placeholder="$(printf 'a%.0s' {1..64})"
+    mkdir -p "$parent_placeholder" "$trace_placeholder"
     for gpu_count in 1 2; do
         for spec in \
             'train|smoke|2|' \
             'train|reproduce|60|' \
             "train|control|20|$parent_placeholder" \
             "train|cost_aware|20|$parent_placeholder" \
+            "train|cost_aware_gated|20|$parent_placeholder" \
             "eval|base||$MODEL_DIR" \
             "eval|reproduced||$parent_placeholder" \
             "eval|control||$parent_placeholder" \
-            "eval|cost_aware||$parent_placeholder"; do
+            "eval|cost_aware||$parent_placeholder" \
+            "eval|cost_aware_gated||$parent_placeholder"; do
             IFS='|' read -r mode variant steps model_path <<<"$spec"
             command_args=("$mode" "$variant")
             case "$mode:$variant" in
                 train:smoke|train:reproduce)
                     command_args+=("$steps")
                     ;;
-                train:control|train:cost_aware)
+                train:control|train:cost_aware|train:cost_aware_gated)
                     command_args+=("$steps" "$model_path")
                     ;;
                 eval:*)
                     command_args+=("$model_path")
                     ;;
             esac
+            trace_output=''
+            trace_stage=''
+            trace_checkpoint_digest=''
+            trace_parent_digest=''
+            if [[ "$variant" == cost_aware_gated ]]; then
+                trace_output="$trace_placeholder"
+                trace_stage="$variant"
+                if [[ "$mode" == eval ]]; then
+                    trace_checkpoint_digest="$trace_digest_placeholder"
+                else
+                    trace_parent_digest="$trace_digest_placeholder"
+                fi
+            fi
             AUTODL_CONFIG_ONLY=1 \
                 AUTODL_ROOT="$PROJECT_ROOT" \
                 GPU_COUNT="$gpu_count" \
                 OUTPUT_DIR="$config_output_dir" \
+                TRACE_OUTPUT_DIR="$trace_output" \
+                TRACE_STAGE="$trace_stage" \
+                TRACE_RUN_ID=config-compose \
+                TRACE_CHECKPOINT_DIGEST="$trace_checkpoint_digest" \
+                TRACE_PARENT_CHECKPOINT_DIGEST="$trace_parent_digest" \
                 bash "$CHECKOUT_DIR/scripts/autodl/train_small_grpo.sh" \
                 "${command_args[@]}" \
                 >"$MANIFEST_DIR/config-${gpu_count}gpu-$variant-$mode.yaml"
+        done
+        AUTODL_CONFIG_ONLY=1 \
+            AUTODL_ROOT="$PROJECT_ROOT" \
+            GPU_COUNT="$gpu_count" \
+            OUTPUT_DIR="$config_output_dir" \
+            TRACE_OUTPUT_DIR="$trace_placeholder" \
+            TRACE_STAGE=cost_aware_gated_gate \
+            TRACE_RUN_ID=config-compose \
+            TRACE_PARENT_CHECKPOINT_DIGEST="$trace_digest_placeholder" \
+            bash "$CHECKOUT_DIR/scripts/autodl/train_small_grpo.sh" \
+            train cost_aware_gated 2 "$parent_placeholder" \
+            >"$MANIFEST_DIR/config-${gpu_count}gpu-cost_aware_gated-gate-train.yaml"
+        for variant in control cost_aware; do
+            AUTODL_CONFIG_ONLY=1 \
+                AUTODL_ROOT="$PROJECT_ROOT" \
+                GPU_COUNT="$gpu_count" \
+                OUTPUT_DIR="$config_output_dir" \
+                TRACE_OUTPUT_DIR="$trace_placeholder" \
+                TRACE_STAGE="$variant" \
+                TRACE_RUN_ID=config-compose \
+                TRACE_CHECKPOINT_DIGEST="$trace_digest_placeholder" \
+                bash "$CHECKOUT_DIR/scripts/autodl/train_small_grpo.sh" \
+                eval "$variant" "$parent_placeholder" \
+                >"$MANIFEST_DIR/config-${gpu_count}gpu-$variant-trace-eval.yaml"
         done
     done
 
     "$train_python" - \
         "$MANIFEST_DIR" \
         "$MODEL_DIR" \
-        "$parent_placeholder" <<'PY'
+        "$parent_placeholder" \
+        "$trace_placeholder" <<'PY'
 from copy import deepcopy
 from pathlib import Path
 import sys
 
 from omegaconf import OmegaConf
 
-manifest_dir, model_dir, parent_placeholder = map(Path, sys.argv[1:])
-train_variants = ("smoke", "reproduce", "control", "cost_aware")
-eval_variants = ("base", "reproduced", "control", "cost_aware")
+manifest_dir, model_dir, parent_placeholder, trace_placeholder = map(Path, sys.argv[1:])
+train_variants = ("smoke", "reproduce", "control", "cost_aware", "cost_aware_gated")
+eval_variants = ("base", "reproduced", "control", "cost_aware", "cost_aware_gated")
 
 for gpu_count in (1, 2):
     configs = {}
@@ -272,6 +376,12 @@ for gpu_count in (1, 2):
             path = manifest_dir / f"config-{gpu_count}gpu-{variant}-{mode}.yaml"
             config = OmegaConf.load(path)
             configs[(mode, variant)] = config
+            trace_output = config.trainer.get("trace_output_dir", None)
+            if variant == "cost_aware_gated":
+                if Path(trace_output) != trace_placeholder:
+                    raise SystemExit(f"trace output placeholder mismatch in {path}")
+            elif trace_output:
+                raise SystemExit(f"legacy config unexpectedly enables traces in {path}")
             group_size = config.actor_rollout_ref.rollout.n_agent
             mini_batch_size = config.actor_rollout_ref.actor.ppo_mini_batch_size
             expected_mini_batch_size = config.data.train_batch_size * group_size
@@ -316,7 +426,25 @@ for gpu_count in (1, 2):
     reproduced = configs[("train", "reproduce")]
     control = configs[("train", "control")]
     cost_aware = configs[("train", "cost_aware")]
-    expected_steps = ((smoke, 2), (reproduced, 60), (control, 20), (cost_aware, 20))
+    cost_aware_gated = configs[("train", "cost_aware_gated")]
+    gated_gate_path = manifest_dir / f"config-{gpu_count}gpu-cost_aware_gated-gate-train.yaml"
+    gated_gate = OmegaConf.load(gated_gate_path)
+    if Path(gated_gate.trainer.trace_output_dir) != trace_placeholder:
+        raise SystemExit(f"trace output placeholder mismatch in {gated_gate_path}")
+    trace_eval_configs = {}
+    for variant in ("control", "cost_aware"):
+        path = manifest_dir / f"config-{gpu_count}gpu-{variant}-trace-eval.yaml"
+        trace_config = OmegaConf.load(path)
+        trace_eval_configs[variant] = trace_config
+        if (Path(trace_config.trainer.trace_output_dir) != trace_placeholder
+                or trace_config.trainer.trace_stage != variant
+                or trace_config.trainer.trace_checkpoint_digest != "a" * 64
+                or not trace_config.trainer.val_only):
+            raise SystemExit(f"trace-only evaluation contract mismatch in {path}")
+    expected_steps = (
+        (smoke, 2), (reproduced, 60), (control, 20), (cost_aware, 20),
+        (cost_aware_gated, 20), (gated_gate, 2),
+    )
     for config, steps in expected_steps:
         if config.trainer.total_training_steps != steps:
             raise SystemExit(f"training step mismatch for {config.trainer.experiment_name}")
@@ -325,29 +453,62 @@ for gpu_count in (1, 2):
 
     if Path(reproduced.actor_rollout_ref.model.path) != model_dir:
         raise SystemExit("reproduction must start from the prepared base model")
-    for config in (control, cost_aware):
+    for config in (control, cost_aware, cost_aware_gated, gated_gate):
         if Path(config.actor_rollout_ref.model.path) != parent_placeholder:
             raise SystemExit("second-stage branch does not use the reproduced-checkpoint placeholder")
     train_lambdas = {
         variant: configs[("train", variant)].algorithm.cost_lambda for variant in train_variants
     }
-    if train_lambdas != {"smoke": 0.0, "reproduce": 0.0, "control": 0.0, "cost_aware": 0.10}:
+    if train_lambdas != {
+        "smoke": 0.0, "reproduce": 0.0, "control": 0.0,
+        "cost_aware": 0.10, "cost_aware_gated": 0.10,
+    }:
         raise SystemExit(f"unexpected training cost lambdas: {train_lambdas}")
+    train_reward_modes = {
+        variant: configs[("train", variant)].algorithm.cost_reward_mode
+        for variant in train_variants
+    }
+    if train_reward_modes != {
+        "smoke": "linear", "reproduce": "linear", "control": "linear",
+        "cost_aware": "linear", "cost_aware_gated": "correct_only",
+    } or gated_gate.algorithm.cost_reward_mode != "correct_only":
+        raise SystemExit(f"unexpected training reward modes: {train_reward_modes}")
 
     normalized_control = deepcopy(OmegaConf.to_container(control, resolve=True))
     normalized_cost = deepcopy(OmegaConf.to_container(cost_aware, resolve=True))
-    for normalized in (normalized_control, normalized_cost):
+    normalized_gated = deepcopy(OmegaConf.to_container(cost_aware_gated, resolve=True))
+    for normalized in (normalized_control, normalized_cost, normalized_gated):
         normalized["algorithm"]["cost_lambda"] = None
+        normalized["algorithm"]["cost_reward_mode"] = None
         normalized["trainer"]["experiment_name"] = None
-    if normalized_control != normalized_cost:
-        raise SystemExit("control and cost-aware branch configs differ beyond lambda and variant")
+        normalized["trainer"]["trace_output_dir"] = None
+        normalized["trainer"]["trace_stage"] = None
+        normalized["trainer"]["trace_run_id"] = None
+        normalized["trainer"]["trace_checkpoint_digest"] = None
+        normalized["trainer"]["trace_parent_checkpoint_digest"] = None
+    if not (normalized_control == normalized_cost == normalized_gated):
+        raise SystemExit("stage-2 configs differ beyond reward settings and variant")
+
+    for variant, trace_config in trace_eval_configs.items():
+        plain = deepcopy(OmegaConf.to_container(configs[("eval", variant)], resolve=True))
+        traced = deepcopy(OmegaConf.to_container(trace_config, resolve=True))
+        for normalized in (plain, traced):
+            for key in (
+                "trace_output_dir", "trace_stage", "trace_run_id",
+                "trace_checkpoint_digest", "trace_parent_checkpoint_digest",
+            ):
+                normalized["trainer"][key] = None
+        if plain != traced:
+            raise SystemExit(f"trace-only evaluation changes scientific config for {variant}")
 
     for variant in eval_variants:
         config = configs[("eval", variant)]
         expected_path = model_dir if variant == "base" else parent_placeholder
         if Path(config.actor_rollout_ref.model.path) != expected_path:
             raise SystemExit(f"evaluation model placeholder mismatch for {variant}")
-        if config.algorithm.cost_lambda != 0.10 or not config.trainer.val_only:
+        if (config.algorithm.cost_lambda != 0.10
+                or config.algorithm.cost_reward_mode != "linear"
+                or not config.trainer.val_only):
             raise SystemExit(f"evaluation contract mismatch for {variant}")
 PY
 
@@ -372,18 +533,28 @@ PY
         --extra-file "$MANIFEST_DIR/config-1gpu-reproduce-train.yaml" \
         --extra-file "$MANIFEST_DIR/config-1gpu-control-train.yaml" \
         --extra-file "$MANIFEST_DIR/config-1gpu-cost_aware-train.yaml" \
+        --extra-file "$MANIFEST_DIR/config-1gpu-cost_aware_gated-train.yaml" \
+        --extra-file "$MANIFEST_DIR/config-1gpu-cost_aware_gated-gate-train.yaml" \
         --extra-file "$MANIFEST_DIR/config-1gpu-base-eval.yaml" \
         --extra-file "$MANIFEST_DIR/config-1gpu-reproduced-eval.yaml" \
         --extra-file "$MANIFEST_DIR/config-1gpu-control-eval.yaml" \
         --extra-file "$MANIFEST_DIR/config-1gpu-cost_aware-eval.yaml" \
+        --extra-file "$MANIFEST_DIR/config-1gpu-cost_aware_gated-eval.yaml" \
+        --extra-file "$MANIFEST_DIR/config-1gpu-control-trace-eval.yaml" \
+        --extra-file "$MANIFEST_DIR/config-1gpu-cost_aware-trace-eval.yaml" \
         --extra-file "$MANIFEST_DIR/config-2gpu-smoke-train.yaml" \
         --extra-file "$MANIFEST_DIR/config-2gpu-reproduce-train.yaml" \
         --extra-file "$MANIFEST_DIR/config-2gpu-control-train.yaml" \
         --extra-file "$MANIFEST_DIR/config-2gpu-cost_aware-train.yaml" \
+        --extra-file "$MANIFEST_DIR/config-2gpu-cost_aware_gated-train.yaml" \
+        --extra-file "$MANIFEST_DIR/config-2gpu-cost_aware_gated-gate-train.yaml" \
         --extra-file "$MANIFEST_DIR/config-2gpu-base-eval.yaml" \
         --extra-file "$MANIFEST_DIR/config-2gpu-reproduced-eval.yaml" \
         --extra-file "$MANIFEST_DIR/config-2gpu-control-eval.yaml" \
         --extra-file "$MANIFEST_DIR/config-2gpu-cost_aware-eval.yaml" \
+        --extra-file "$MANIFEST_DIR/config-2gpu-cost_aware_gated-eval.yaml" \
+        --extra-file "$MANIFEST_DIR/config-2gpu-control-trace-eval.yaml" \
+        --extra-file "$MANIFEST_DIR/config-2gpu-cost_aware-trace-eval.yaml" \
         --python-version "$python_version" \
         --torch-version "$torch_version" \
         --output "$HANDOFF"

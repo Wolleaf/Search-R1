@@ -79,6 +79,31 @@ new_case() {
     chmod 0700 "$FAKE_SHUTDOWN"
 }
 
+replace_with_followup_results() {
+    local result_dir marker relative digest
+    local -a files=(
+        paired_results.csv correct_questions.csv wrong_questions.csv search_transition.csv
+        summary.json summary.md lineage.tsv run-index.tsv
+        gated_training_metrics.csv gated_training_curves.svg
+    )
+    result_dir="$PROJECT_ROOT/runs/cost-aware-gated/attempts/$(basename -- "$ATTEMPT")"
+    marker="$PROJECT_ROOT/manifests/cost-aware-gated/$(basename -- "$ATTEMPT").ok"
+    mkdir -p "$result_dir" "$(dirname -- "$marker")"
+    for relative in "${files[@]}"; do printf 'evidence:%s\n' "$relative" >"$result_dir/$relative"; done
+    (
+        cd "$PROJECT_ROOT"
+        for relative in "${files[@]}"; do
+            printf 'runs/cost-aware-gated/attempts/%s/%s\n' "$(basename -- "$ATTEMPT")" "$relative"
+        done | LC_ALL=C sort | while IFS= read -r relative; do sha256sum "$relative"; done
+    ) >"$result_dir/evidence.sha256"
+    digest="$(sha256sum "$result_dir/evidence.sha256" | cut -d' ' -f1)"
+    printf '%s\n' "$digest" >"$marker"
+    printf 'cost-aware-gated-v1\n' >"$ATTEMPT/result-contract"
+    printf '%s\n' "$result_dir" >"$ATTEMPT/result-root"
+    printf '%s\n' "$marker" >"$ATTEMPT/evidence-marker"
+    printf '%s\n' "$digest" >"$ATTEMPT/evidence-digest"
+}
+
 run_watchdog() {
     local backend_rc="$1" mode="$2"
     SEARCH_R1_AUTODL_TEST_MODE=1 \
@@ -162,6 +187,21 @@ run_watchdog 0 --test-foreground
 [[ ! -e "$ATTEMPT/shutdown-skipped" && ! -e "$ATTEMPT/shutdown-failed" ]]
 [[ "$(stat -c '%a' "$ATTEMPT/shutdown-capability.tsv")" == 600 ]]
 assert_order
+
+# The follow-up contract validates its own immutable result root without replacing legacy results.
+new_case followup-success 0 success
+replace_with_followup_results
+run_watchdog 0 --test-foreground
+[[ -f "$ATTEMPT/shutdown-safe" && -f "$ATTEMPT/shutdown-dispatched" ]]
+assert_order
+
+new_case followup-tampered 0 success
+replace_with_followup_results
+printf 'tampered\n' >>"$(cat "$ATTEMPT/result-root")/paired_results.csv"
+run_watchdog 0 --test-foreground
+[[ -f "$ATTEMPT/shutdown-skipped" && ! -e "$ATTEMPT/shutdown-safe" ]]
+grep -Fq 'reason=authorization-revalidation-failed' "$ATTEMPT/shutdown-skipped"
+assert_no_backend_event
 
 # The real detached path cannot run until its PID and admission nonce are durable.
 new_case detached-success 0 success

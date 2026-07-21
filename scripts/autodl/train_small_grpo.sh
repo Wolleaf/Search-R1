@@ -12,6 +12,11 @@ GPU_COUNT="${GPU_COUNT:?Set GPU_COUNT explicitly to 1 or 2}"
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-8}"
 MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-256}"
 OUTPUT_DIR="${OUTPUT_DIR:?Set OUTPUT_DIR to the run checkpoint directory}"
+TRACE_OUTPUT_DIR="${TRACE_OUTPUT_DIR:-}"
+TRACE_STAGE="${TRACE_STAGE:-}"
+TRACE_RUN_ID="${TRACE_RUN_ID:-}"
+TRACE_CHECKPOINT_DIGEST="${TRACE_CHECKPOINT_DIGEST:-}"
+TRACE_PARENT_CHECKPOINT_DIGEST="${TRACE_PARENT_CHECKPOINT_DIGEST:-}"
 GRPO_GROUP_SIZE=5
 PPO_MINI_BATCH_SIZE=$((TRAIN_BATCH_SIZE * GRPO_GROUP_SIZE))
 readonly MAX_TURNS=4
@@ -38,6 +43,7 @@ readonly MAX_PROMPT_LENGTH=$((MAX_START_LENGTH + MAX_TURNS * (MAX_RESPONSE_LENGT
 case "$MODE:$VARIANT" in
     train:smoke)
         COST_LAMBDA=0.0
+        COST_REWARD_MODE=linear
         TOTAL_STEPS="${3:-$SMOKE_STEPS}"
         [[ "$TOTAL_STEPS" == "$SMOKE_STEPS" && $# -le 3 ]] || {
             printf 'Smoke training is fixed at %s steps.\n' "$SMOKE_STEPS" >&2
@@ -53,6 +59,7 @@ case "$MODE:$VARIANT" in
         ;;
     train:reproduce)
         COST_LAMBDA=0.0
+        COST_REWARD_MODE=linear
         TOTAL_STEPS="${3:-60}"
         [[ $# -le 3 ]] || {
             printf 'Reproduction training always starts from the prepared base model.\n' >&2
@@ -66,7 +73,7 @@ case "$MODE:$VARIANT" in
         VAL_BEFORE_TRAIN=false
         USE_KL_LOSS=true
         ;;
-    train:control|train:cost_aware)
+    train:control|train:cost_aware|train:cost_aware_gated)
         if [[ $# == 3 && ! "$3" =~ ^[1-9][0-9]*$ ]]; then
             TOTAL_STEPS=20
             MODEL_PATH="$3"
@@ -77,10 +84,15 @@ case "$MODE:$VARIANT" in
             printf 'Pass the reproduced checkpoint shared by both second-stage branches.\n' >&2
             exit 64
         fi
-        if [[ "$VARIANT" == cost_aware ]]; then
+        if [[ "$VARIANT" == cost_aware_gated ]]; then
             COST_LAMBDA=0.10
+            COST_REWARD_MODE=correct_only
+        elif [[ "$VARIANT" == cost_aware ]]; then
+            COST_LAMBDA=0.10
+            COST_REWARD_MODE=linear
         else
             COST_LAMBDA=0.0
+            COST_REWARD_MODE=linear
         fi
         SAVE_FREQ="$TOTAL_STEPS"
         TEST_FREQ="$TOTAL_STEPS"
@@ -89,12 +101,13 @@ case "$MODE:$VARIANT" in
         VAL_BEFORE_TRAIN=false
         USE_KL_LOSS=true
         ;;
-    eval:base|eval:reproduced|eval:control|eval:cost_aware)
+    eval:base|eval:reproduced|eval:control|eval:cost_aware|eval:cost_aware_gated)
         [[ $# == 3 ]] || {
             printf 'Pass exactly one model/checkpoint path for evaluation.\n' >&2
             exit 64
         }
         COST_LAMBDA=0.10
+        COST_REWARD_MODE=linear
         TOTAL_STEPS=1
         SAVE_FREQ=-1
         TEST_FREQ=-1
@@ -107,8 +120,8 @@ case "$MODE:$VARIANT" in
     *)
         printf 'Usage: %s train smoke [2]\n' "$0" >&2
         printf '   or: %s train reproduce [STEPS]\n' "$0" >&2
-        printf '   or: %s train {control|cost_aware} [STEPS] REPRODUCED_CHECKPOINT\n' "$0" >&2
-        printf '   or: %s eval {base|reproduced|control|cost_aware} MODEL_PATH\n' "$0" >&2
+        printf '   or: %s train {control|cost_aware|cost_aware_gated} [STEPS] REPRODUCED_CHECKPOINT\n' "$0" >&2
+        printf '   or: %s eval {base|reproduced|control|cost_aware|cost_aware_gated} MODEL_PATH\n' "$0" >&2
         exit 64
         ;;
 esac
@@ -116,6 +129,34 @@ esac
 [[ "$TOTAL_STEPS" =~ ^[1-9][0-9]*$ ]] || { printf 'steps must be a positive integer.\n' >&2; exit 64; }
 [[ -d "$MODEL_PATH" ]] || { printf 'Model/checkpoint path is missing: %s\n' "$MODEL_PATH" >&2; exit 1; }
 mkdir -p "$OUTPUT_DIR" "$PROJECT_ROOT/cache/ray" "$PROJECT_ROOT/cache/wandb"
+TRACE_HYDRA_ARGS=()
+if [[ -n "$TRACE_OUTPUT_DIR" ]]; then
+    [[ "$TRACE_OUTPUT_DIR" == "$PROJECT_ROOT/"* && "$TRACE_OUTPUT_DIR" != *'/../'* ]] || {
+        printf 'TRACE_OUTPUT_DIR must stay under %s.\n' "$PROJECT_ROOT" >&2
+        exit 64
+    }
+    [[ -n "$TRACE_STAGE" && -n "$TRACE_RUN_ID" ]] || {
+        printf 'TRACE_STAGE and TRACE_RUN_ID are required when tracing is enabled.\n' >&2
+        exit 64
+    }
+    if [[ "$MODE" == eval && ! "$TRACE_CHECKPOINT_DIGEST" =~ ^[0-9a-f]{64}$ ]]; then
+        printf 'Evaluation tracing requires a 64-hex TRACE_CHECKPOINT_DIGEST.\n' >&2
+        exit 64
+    fi
+    if [[ -n "$TRACE_PARENT_CHECKPOINT_DIGEST" &&
+          ! "$TRACE_PARENT_CHECKPOINT_DIGEST" =~ ^[0-9a-f]{64}$ ]]; then
+        printf 'TRACE_PARENT_CHECKPOINT_DIGEST must be a 64-hex digest.\n' >&2
+        exit 64
+    fi
+    mkdir -p "$TRACE_OUTPUT_DIR"
+    TRACE_HYDRA_ARGS+=(
+        "++trainer.trace_output_dir=$TRACE_OUTPUT_DIR"
+        "++trainer.trace_stage=$TRACE_STAGE"
+        "++trainer.trace_run_id=$TRACE_RUN_ID"
+        "++trainer.trace_checkpoint_digest=$TRACE_CHECKPOINT_DIGEST"
+        "++trainer.trace_parent_checkpoint_digest=$TRACE_PARENT_CHECKPOINT_DIGEST"
+    )
+fi
 
 if [[ "$GPU_COUNT" == 1 ]]; then
     export CUDA_VISIBLE_DEVICES=0
@@ -145,6 +186,7 @@ HYDRA_ARGS=(
     data.shuffle_train_dataloader=true
     algorithm.adv_estimator=grpo
     "algorithm.cost_lambda=$COST_LAMBDA"
+    "++algorithm.cost_reward_mode=$COST_REWARD_MODE"
     algorithm.no_think_rl=false
     "actor_rollout_ref.model.path=$MODEL_PATH"
     actor_rollout_ref.model.enable_gradient_checkpointing=true
@@ -194,6 +236,7 @@ HYDRA_ARGS=(
     "max_turns=$MAX_TURNS"
     retriever.url=http://127.0.0.1:8000/retrieve
     "retriever.topk=$RETRIEVER_TOPK"
+    "${TRACE_HYDRA_ARGS[@]}"
 )
 
 cd "$CHECKOUT_DIR"

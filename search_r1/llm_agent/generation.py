@@ -1,5 +1,6 @@
 import torch
 import re
+import numpy as np
 from collections import defaultdict
 import os
 from typing import List, Dict, Any, Tuple
@@ -230,6 +231,8 @@ class LLMGenerationManager:
         turns_stats = torch.ones(gen_batch.batch['input_ids'].shape[0], dtype=torch.int)
         valid_action_stats = torch.zeros(gen_batch.batch['input_ids'].shape[0], dtype=torch.int)
         executed_search_count = torch.zeros(gen_batch.batch['input_ids'].shape[0], dtype=torch.long)
+        retrieval_events = [[] for _ in range(gen_batch.batch['input_ids'].shape[0])]
+        generation_events = [[] for _ in range(gen_batch.batch['input_ids'].shape[0])]
         active_num_list = [active_mask.sum().item()]
         rollings = gen_batch
 
@@ -252,11 +255,32 @@ class LLMGenerationManager:
             meta_info = gen_output.meta_info            
             responses_ids, responses_str = self._postprocess_responses(gen_output.batch['responses'])
             responses_ids, responses_str = self.tensor_fn._example_level_pad(responses_ids, responses_str, active_mask)
+            for index, active in enumerate(active_mask.tolist()):
+                if active:
+                    token_count = int((responses_ids[index] != self.tokenizer.pad_token_id).sum().item())
+                    generation_events[index].append({
+                        'turn': step,
+                        'text': responses_str[index],
+                        'token_count': token_count,
+                        'clipped': token_count >= getattr(
+                            self.config, 'max_response_length', responses_ids.shape[1]),
+                    })
 
             # Execute in environment and process observations
             next_obs, dones, valid_action, executed_search = self.execute_predictions(
                 responses_str, self.tokenizer.pad_token, active_mask
             )
+            for index, active in enumerate(active_mask.tolist()):
+                if active:
+                    generation_events[index][-1].update({
+                        'valid_action': bool(valid_action[index]),
+                        'done': bool(dones[index]),
+                        'executed_search': bool(executed_search[index]),
+                    })
+            for index, event in enumerate(self._last_execution_retrieval_events):
+                if event is not None:
+                    event['turn'] = step
+                    retrieval_events[index].append(event)
             
             curr_active_mask = torch.tensor([not done for done in dones], dtype=torch.bool)
             active_mask = active_mask * curr_active_mask
@@ -296,11 +320,28 @@ class LLMGenerationManager:
             meta_info = gen_output.meta_info            
             responses_ids, responses_str = self._postprocess_responses(gen_output.batch['responses'])
             responses_ids, responses_str = self.tensor_fn._example_level_pad(responses_ids, responses_str, active_mask)
+            for index, active in enumerate(active_mask.tolist()):
+                if active:
+                    token_count = int((responses_ids[index] != self.tokenizer.pad_token_id).sum().item())
+                    generation_events[index].append({
+                        'turn': self.config.max_turns,
+                        'text': responses_str[index],
+                        'token_count': token_count,
+                        'clipped': token_count >= getattr(
+                            self.config, 'max_response_length', responses_ids.shape[1]),
+                    })
 
             # # Execute in environment and process observations
-            _, dones, valid_action, _ = self.execute_predictions(
+            _, dones, valid_action, executed_search = self.execute_predictions(
                 responses_str, self.tokenizer.pad_token, active_mask, do_search=False
             )
+            for index, active in enumerate(active_mask.tolist()):
+                if active:
+                    generation_events[index][-1].update({
+                        'valid_action': bool(valid_action[index]),
+                        'done': bool(dones[index]),
+                        'executed_search': bool(executed_search[index]),
+                    })
 
             curr_active_mask = torch.tensor([not done for done in dones], dtype=torch.bool)
             active_mask = active_mask * curr_active_mask
@@ -327,12 +368,16 @@ class LLMGenerationManager:
             original_right_side,
             meta_info,
             executed_search_count,
+            retrieval_events,
+            generation_events,
         )
 
     def _compose_final_output(self, left_side: Dict,
                             right_side: Dict,
                             meta_info: Dict,
-                            executed_search_count: torch.Tensor) -> DataProto:
+                            executed_search_count: torch.Tensor,
+                            retrieval_events=None,
+                            generation_events=None) -> DataProto:
         """Compose final generation output."""
         final_output = right_side.copy()
         final_output['prompts'] = left_side['input_ids']
@@ -358,7 +403,18 @@ class LLMGenerationManager:
         )
         final_output['executed_search_count'] = executed_search_count
         
-        final_output = DataProto.from_dict(final_output)
+        non_tensors = None
+        if retrieval_events is not None:
+            aligned_events = np.empty(len(retrieval_events), dtype=object)
+            aligned_events[:] = retrieval_events
+            non_tensors = {'retrieval_events': aligned_events}
+        if generation_events is not None:
+            if non_tensors is None:
+                non_tensors = {}
+            aligned_generations = np.empty(len(generation_events), dtype=object)
+            aligned_generations[:] = generation_events
+            non_tensors['generation_events'] = aligned_generations
+        final_output = DataProto.from_dict(final_output, non_tensors=non_tensors)
         final_output.meta_info.update(meta_info)
         
         return final_output
@@ -393,27 +449,38 @@ class LLMGenerationManager:
             if do_search and active and action == 'search'
         ]
         search_results = self.batch_search(search_queries) if search_queries else []
+        search_metadata = getattr(self, '_last_batch_search_metadata', []) if search_queries else []
         assert len(search_results) == len(search_queries)
+        if len(search_metadata) != len(search_queries):
+            raise ValueError('retrieval metadata is not aligned with search results')
+        retrieval_events = []
 
-        for action, active in zip(cur_actions, active_flags):
+        for action, content, active in zip(cur_actions, contents, active_flags):
             
             if not active:
                 next_obs.append('')
                 dones.append(1)
                 valid_action.append(0)
                 executed_search.append(0)
+                retrieval_events.append(None)
             else:
                 if action == 'answer':
                     next_obs.append('')
                     dones.append(1)
                     valid_action.append(1)
                     executed_search.append(0)
+                    retrieval_events.append(None)
                 elif action == 'search':
                     search_result = search_results.pop(0) if do_search else ''
+                    metadata = search_metadata.pop(0) if do_search else None
                     next_obs.append(f'\n\n<information>{search_result.strip()}</information>\n\n')
                     dones.append(0)
                     valid_action.append(1)
                     executed_search.append(int(do_search))
+                    retrieval_events.append({
+                        'query': content,
+                        'documents': metadata if metadata is not None else [],
+                    } if do_search else None)
                 else:
                     next_obs.append(f'\nMy previous action is invalid. \
 If I want to search, I should put the query between <search> and </search>. \
@@ -421,8 +488,11 @@ If I want to give the final answer, I should put the answer between <answer> and
                     dones.append(0)
                     valid_action.append(0)
                     executed_search.append(0)
+                    retrieval_events.append(None)
             
         assert len(search_results) == 0
+        assert len(search_metadata) == 0
+        self._last_execution_retrieval_events = retrieval_events
             
         return next_obs, dones, valid_action, executed_search
 
@@ -466,6 +536,7 @@ If I want to give the final answer, I should put the answer between <answer> and
             search results which is concatenated into a string
         """
         results = self._batch_search(queries)['result']
+        self._last_batch_search_metadata = results
         
         return [self._passages2string(result) for result in results]
 

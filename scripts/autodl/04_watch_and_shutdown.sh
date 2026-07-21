@@ -321,7 +321,7 @@ validate_terminal_evidence() {
     [[ "$line_count" == 1 && "$marker_count" == 1 ]]
 }
 
-validate_success_artifacts() {
+validate_legacy_success_artifacts() {
     local project="${CAP[project_root]}" results expected_results gpu_ok attempt_digest_file
     local expected_digest recorded_digest attempt_digest expected_uid index file actual_line
     local -a files=(results.csv results.md lineage.tsv) checksum_lines
@@ -363,6 +363,85 @@ validate_success_artifacts() {
     sync_required "$attempt_digest_file" || return 1
     sync_required "$(dirname -- "$gpu_ok")" || return 1
     sync_required "${CAP[attempt]}"
+}
+
+validate_followup_success_artifacts() {
+    local project="${CAP[project_root]}" attempt="${CAP[attempt]}" expected_uid
+    local contract_file result_root_file marker_file digest_file results expected_results_parent
+    local marker expected_marker evidence expected_digest recorded_digest line relative path previous=''
+    local entry_count=0 file
+    local -a required=(
+        paired_results.csv correct_questions.csv wrong_questions.csv search_transition.csv
+        summary.json summary.md lineage.tsv run-index.tsv
+        gated_training_metrics.csv gated_training_curves.svg
+    )
+    declare -A seen=()
+    if [[ "${CAP[mode]}" == production ]]; then expected_uid=0; else expected_uid="$(id -u)"; fi
+    contract_file="$attempt/result-contract"
+    result_root_file="$attempt/result-root"
+    marker_file="$attempt/evidence-marker"
+    digest_file="$attempt/evidence-digest"
+    for file in "$contract_file" "$result_root_file" "$marker_file" "$digest_file"; do
+        validate_protected_regular "$file" "$expected_uid" || return 1
+        (( $(wc -l <"$file") == 1 )) || return 1
+        (( $(stat -c '%s' -- "$file") <= 4096 )) || return 1
+    done
+    [[ "$(tr -d '\r\n' <"$contract_file")" == cost-aware-gated-v1 ]] || return 1
+
+    results="$(canonical_existing "$(tr -d '\r\n' <"$result_root_file")")" || return 1
+    expected_results_parent="$project/runs/cost-aware-gated/attempts"
+    [[ -d "$expected_results_parent" && ! -L "$expected_results_parent" ]] || return 1
+    [[ "$(canonical_existing "$(dirname -- "$results")")" == "$expected_results_parent" ]] || return 1
+    [[ "$(basename -- "$results")" == "$(basename -- "$attempt")" &&
+        -d "$results" && ! -L "$results" ]] || return 1
+
+    marker="$(canonical_existing "$(tr -d '\r\n' <"$marker_file")")" || return 1
+    expected_marker="$project/manifests/cost-aware-gated/$(basename -- "$attempt").ok"
+    [[ "$marker" == "$expected_marker" ]] || return 1
+    validate_protected_regular "$marker" "$expected_uid" || return 1
+    evidence="$results/evidence.sha256"
+    validate_protected_regular "$evidence" "$expected_uid" && [[ -s "$evidence" ]] || return 1
+
+    while IFS= read -r line; do
+        [[ "$line" =~ ^([0-9a-f]{64})\ \ ([A-Za-z0-9._/-]+)$ ]] || return 1
+        expected_digest="${BASH_REMATCH[1]}"
+        relative="${BASH_REMATCH[2]}"
+        [[ "$relative" != /* && "$relative" != *'//'*
+            && "/$relative/" != *'/../'* && "$relative" > "$previous" ]] || return 1
+        previous="$relative"
+        path="$project/$relative"
+        [[ "$(canonical_existing "$path")" == "$path" ]] || return 1
+        validate_protected_regular "$path" "$expected_uid" || return 1
+        [[ "$(file_sha256 "$path")" == "$expected_digest" ]] || return 1
+        seen["$relative"]=1
+        entry_count=$((entry_count + 1))
+        sync_required "$path" || return 1
+    done <"$evidence"
+    ((entry_count >= 8)) || return 1
+    for file in "${required[@]}"; do
+        [[ ${seen["runs/cost-aware-gated/attempts/$(basename -- "$attempt")/$file"]+present} ]] || return 1
+    done
+
+    RESULTS_DIGEST="$(file_sha256 "$evidence")" || return 1
+    recorded_digest="$(tr -d '\r\n' <"$marker")"
+    [[ "$recorded_digest" == "$RESULTS_DIGEST" ]] || return 1
+    [[ "$(tr -d '\r\n' <"$digest_file")" == "$RESULTS_DIGEST" ]] || return 1
+    sync_required "$evidence" || return 1
+    sync_required "$results" || return 1
+    sync_required "$marker" || return 1
+    sync_required "$(dirname -- "$marker")" || return 1
+    sync_required "$attempt"
+}
+
+validate_success_artifacts() {
+    local contract="${CAP[attempt]}/result-contract"
+    RESULTS_DIGEST='not-required'
+    [[ "$WORK_STATE" == success ]] || return 0
+    if [[ -e "$contract" || -L "$contract" ]]; then
+        validate_followup_success_artifacts
+    else
+        validate_legacy_success_artifacts
+    fi
 }
 
 wait_for_terminal_evidence() {

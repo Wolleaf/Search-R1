@@ -21,6 +21,7 @@ import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from pprint import pprint
 from typing import Type, Dict
 
@@ -41,6 +42,9 @@ from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seql
 
 import re
 from search_r1.llm_agent.generation import LLMGenerationManager, GenerationConfig
+from search_r1.trajectory_trace import (TraceJsonlWriter,
+                                        parse_search_r1_transcript,
+                                        stable_sample_id)
 
 WorkerType = Type[Worker]
 
@@ -50,6 +54,48 @@ def _next_training_step(completed_step, total_steps):
     if completed_step >= total_steps:
         return None
     return completed_step + 1
+
+
+def _trace_question(decoded_prompt):
+    matches = re.findall(
+        r'Question:\s*(.*?)(?:<\|im_end\|>|<\|eot_id\|>|$)',
+        decoded_prompt,
+        flags=re.DOTALL,
+    )
+    if not matches:
+        raise ValueError('trace logging could not extract Question from the prompt')
+    question = matches[-1].strip()
+    if not question:
+        raise ValueError('trace logging extracted an empty question')
+    return question
+
+
+def _json_list(value):
+    if isinstance(value, np.ndarray):
+        value = value.tolist()
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    return [value]
+
+
+def _validation_metrics(data_sources, em_scores, search_counts, utilities):
+    grouped = defaultdict(lambda: {'em': [], 'searches': [], 'utility': []})
+    for data_source, em, searches, utility in zip(
+            data_sources, em_scores, search_counts, utilities):
+        values = grouped[data_source]
+        values['em'].append(float(em))
+        values['searches'].append(float(searches))
+        values['utility'].append(float(utility))
+
+    metrics = {}
+    for data_source, values in grouped.items():
+        metrics[f'val/test_score/{data_source}'] = np.mean(values['em'])
+        metrics[f'val/utility/{data_source}'] = np.mean(values['utility'])
+        metrics[f'val/em/{data_source}'] = np.mean(values['em'])
+        metrics[f'val/search_count/{data_source}'] = np.mean(values['searches'])
+        metrics[f'val/no_search_ratio/{data_source}'] = np.mean(
+            np.asarray(values['searches']) == 0)
+    return metrics
 
 
 class Role(Enum):
@@ -293,8 +339,65 @@ def compute_data_metrics(batch, use_critic=True):
     if 'sequence_search_costs' in batch.batch.keys():
         search_costs = batch.batch['sequence_search_costs'].float()
         metrics['env/search_cost/mean'] = search_costs.mean().detach().item()
+    if 'sequence_train_rewards' in batch.batch.keys():
+        train_rewards = batch.batch['sequence_train_rewards'].float()
+        metrics['env/train_reward/mean'] = train_rewards.mean().detach().item()
+    if 'sequence_posthoc_utilities' in batch.batch.keys():
+        utilities = batch.batch['sequence_posthoc_utilities'].float()
+        metrics['env/posthoc_utility/mean'] = utilities.mean().detach().item()
+    if all(key in batch.batch.keys() for key in (
+            'sequence_em_scores', 'executed_search_count',
+            'sequence_train_rewards', 'advantages')) and \
+            'uid' in batch.non_tensor_batch:
+        metrics.update(_compute_group_metrics(batch))
+
+    return metrics
 
 
+def _compute_group_metrics(batch):
+    em_scores = batch.batch['sequence_em_scores'].float()
+    search_counts = batch.batch['executed_search_count'].float()
+    rewards = batch.batch['sequence_train_rewards'].float()
+    response_width = batch.batch['responses'].shape[-1]
+    response_mask = batch.batch['attention_mask'][:, -response_width:].bool()
+    group_indices = defaultdict(list)
+    for index, uid in enumerate(batch.non_tensor_batch['uid']):
+        group_indices[uid].append(index)
+
+    correct_counts = []
+    reward_stds = []
+    for indices in group_indices.values():
+        correct_counts.append(int(em_scores[indices].sum().item()))
+        reward_stds.append(float(rewards[indices].std(unbiased=True).item()))
+    group_size = max(len(indices) for indices in group_indices.values())
+    metrics = {
+        'env/group/all_wrong_ratio': float(np.mean(
+            np.asarray(correct_counts) == 0)),
+        'env/group/reward_std/mean': float(np.mean(reward_stds)),
+    }
+    for count in range(group_size + 1):
+        metrics[f'env/group/correct_count_{count}_ratio'] = float(np.mean(
+            np.asarray(correct_counts) == count))
+
+    for label, mask in (('correct', em_scores == 1), ('wrong', em_scores == 0)):
+        if mask.any():
+            selected_searches = search_counts[mask]
+            metrics[f'env/search_count/{label}_mean'] = float(
+                selected_searches.mean().item())
+            metrics[f'env/no_search_ratio/{label}'] = float(
+                (selected_searches == 0).float().mean().item())
+
+    sequence_advantages = []
+    for index in range(len(batch)):
+        valid = batch.batch['advantages'][index][response_mask[index]]
+        if valid.numel():
+            sequence_advantages.append(float(valid[0].item()))
+    if sequence_advantages:
+        metrics.update({
+            'env/sequence_advantage/mean': float(np.mean(sequence_advantages)),
+            'env/sequence_advantage/min': float(np.min(sequence_advantages)),
+            'env/sequence_advantage/max': float(np.max(sequence_advantages)),
+        })
     return metrics
 
 
@@ -380,6 +483,8 @@ class RayPPOTrainer(object):
 
         self._create_dataloader()
         self._init_logger()
+        self.train_trace_writer = None
+        self.eval_trace_writer = None
     
     def _init_logger(self):
         from verl.utils.tracking import Tracking
@@ -387,6 +492,216 @@ class RayPPOTrainer(object):
                           experiment_name=self.config.trainer.experiment_name,
                           default_backend=self.config.trainer.logger,
                           config=OmegaConf.to_container(self.config, resolve=True))
+
+    def _init_trace_writer(self):
+        trace_output_dir = self.config.trainer.get('trace_output_dir', None)
+        if not trace_output_dir:
+            return
+
+        output_dir = Path(str(trace_output_dir))
+        stage = str(self.config.trainer.get(
+            'trace_stage', self.config.trainer.experiment_name))
+        run_id = str(self.config.trainer.get(
+            'trace_run_id', self.config.trainer.experiment_name))
+        if self.config.trainer.get('val_only', False):
+            checkpoint_digest = self.config.trainer.get(
+                'trace_checkpoint_digest', None)
+            if not checkpoint_digest:
+                raise ValueError(
+                    'trainer.trace_checkpoint_digest is required for evaluation traces')
+            expected_rows = len(self.val_dataloader) * int(
+                self.config.data.val_batch_size)
+            self.eval_trace_writer = TraceJsonlWriter(
+                output_dir / 'eval_predictions.jsonl',
+                record_type='eval',
+                expected_rows=expected_rows,
+                run_id=run_id,
+                stage=stage,
+            )
+        else:
+            expected_rows = (
+                int(self.total_training_steps)
+                * int(self.config.data.train_batch_size)
+                * int(self.config.actor_rollout_ref.rollout.n_agent)
+                * int(self.config.actor_rollout_ref.rollout.n)
+            )
+            self.train_trace_writer = TraceJsonlWriter(
+                output_dir / 'train_trajectories.jsonl',
+                record_type='train',
+                expected_rows=expected_rows,
+                run_id=run_id,
+                stage=stage,
+            )
+
+    def _common_trace_records(self, batch):
+        response_width = batch.batch['responses'].shape[-1]
+        prompt_width = batch.batch['prompts'].shape[-1]
+        records = []
+        for index in range(len(batch)):
+            item = batch[index]
+            prompt_length = int(
+                item.batch['attention_mask'][:prompt_width].sum().item())
+            response_length = int(
+                item.batch['attention_mask'][prompt_width:].sum().item())
+            prompt_ids = item.batch['prompts'][-prompt_length:]
+            response_ids = item.batch['responses'][:response_length]
+            decoded_prompt = self.tokenizer.decode(prompt_ids)
+            raw_trajectory = self.tokenizer.decode(
+                torch.cat((prompt_ids, response_ids)))
+            turns = parse_search_r1_transcript(raw_trajectory)
+            answers = [
+                turn['answer'] for turn in turns
+                if turn['action'] == 'answer' and turn['answer'] is not None
+            ]
+
+            extra_info = item.non_tensor_batch.get('extra_info', {})
+            if not isinstance(extra_info, dict):
+                raise ValueError('trace extra_info must be a dictionary')
+            source_index = extra_info.get(
+                'index', item.non_tensor_batch.get('index'))
+            source_split = extra_info.get('split')
+            if source_split == 'val':
+                source_split = 'train'
+            data_source = str(item.non_tensor_batch['data_source'])
+            if source_split not in ('train', 'test'):
+                raise ValueError(
+                    f'trace source split must be train or test, got {source_split!r}')
+            reward_model = item.non_tensor_batch['reward_model']
+            gold_answers = _json_list(
+                reward_model['ground_truth']['target'])
+            if not all(isinstance(answer, str) for answer in gold_answers):
+                raise ValueError('trace gold answers must be strings')
+
+            retrieval_events = item.non_tensor_batch.get(
+                'retrieval_events', [])
+            generation_events = item.non_tensor_batch.get(
+                'generation_events', [])
+            retrieval_events = (
+                [] if retrieval_events is None else _json_list(retrieval_events))
+            generation_events = (
+                [] if generation_events is None else _json_list(generation_events))
+            search_count = int(
+                item.batch['executed_search_count'].item())
+            if len(retrieval_events) != search_count:
+                raise ValueError(
+                    'retrieval event count does not match executed_search_count')
+            retrieval_index = 0
+            for turn in turns:
+                turn['retrieved_docs'] = []
+                turn['retrieval_executed'] = False
+                if (turn['action'] == 'search'
+                        and retrieval_index < len(retrieval_events)
+                        and turn['search_query']
+                        == retrieval_events[retrieval_index]['query']):
+                    turn['retrieved_docs'] = retrieval_events[
+                        retrieval_index]['documents']
+                    turn['retrieval_executed'] = True
+                    retrieval_index += 1
+            if retrieval_index != len(retrieval_events):
+                raise ValueError(
+                    'retrieval events could not be aligned to parsed search turns')
+
+            records.append({
+                'sample_id': stable_sample_id(
+                    data_source, source_split, source_index),
+                'source_index': int(source_index),
+                'source_split': source_split,
+                'data_source': data_source,
+                'question': _trace_question(decoded_prompt),
+                'gold_answers': gold_answers,
+                'raw_trajectory': raw_trajectory,
+                'turns': turns,
+                'extracted_answer': answers[-1] if answers else None,
+                'em': int(item.batch['sequence_em_scores'].item()),
+                'executed_search_count': search_count,
+                'posthoc_utility': float(
+                    item.batch['sequence_posthoc_utilities'].item()),
+                'response_tokens': response_length,
+                'response_clipped': any(
+                    bool(event['clipped']) for event in generation_events),
+                'turns_used': len(turns),
+                'invalid_action_count': sum(
+                    not turn['valid_action'] for turn in turns),
+                'retrieval_events': retrieval_events,
+                'generation_events': generation_events,
+                'generated_tokens': sum(
+                    int(event['token_count']) for event in generation_events),
+                'generation_clipped_count': sum(
+                    bool(event['clipped']) for event in generation_events),
+                'environment_invalid_action_count': sum(
+                    event.get('valid_action') is False
+                    for event in generation_events),
+                'unfinished_generation_count': sum(
+                    event.get('done') is False
+                    for event in generation_events),
+                'trajectory_capacity_tokens': int(
+                    self.config.data.max_prompt_length),
+                'reward_mode': str(self.config.algorithm.get(
+                    'cost_reward_mode', 'linear')),
+                'cost_lambda': float(self.config.algorithm.get(
+                    'cost_lambda', 0.0)),
+                'max_searches': int(self.config.max_turns),
+                'response_width': int(response_width),
+            })
+        return records
+
+    def _append_eval_traces(self, batch):
+        if self.eval_trace_writer is None:
+            return
+        checkpoint_digest = str(
+            self.config.trainer.trace_checkpoint_digest)
+        for record in self._common_trace_records(batch):
+            record['checkpoint_digest'] = checkpoint_digest
+            self.eval_trace_writer.append(record)
+
+    def _append_train_traces(self, batch):
+        if self.train_trace_writer is None:
+            return
+
+        records = self._common_trace_records(batch)
+        group_indices = defaultdict(list)
+        for index, record in enumerate(records):
+            group_indices[record['sample_id']].append(index)
+        expected_group_size = int(
+            self.config.actor_rollout_ref.rollout.n_agent)
+        response_mask = batch.batch['attention_mask'][:, -batch.batch['responses'].shape[-1]:]
+        parent_digest = self.config.trainer.get(
+            'trace_parent_checkpoint_digest', None)
+
+        for sample_id, indices in group_indices.items():
+            if len(indices) != expected_group_size:
+                raise ValueError(
+                    f'trace group {sample_id} has {len(indices)} trajectories, '
+                    f'expected {expected_group_size}')
+            rewards = batch.batch['sequence_train_rewards'][indices].float()
+            em_scores = batch.batch['sequence_em_scores'][indices].float()
+            reward_mean = float(rewards.mean().item())
+            reward_std = float(rewards.std(unbiased=True).item())
+            correct_count = int(em_scores.sum().item())
+            for index in indices:
+                valid_advantages = batch.batch['advantages'][index][
+                    response_mask[index].bool()]
+                if valid_advantages.numel() == 0:
+                    raise ValueError('trace trajectory has no valid response tokens')
+                record = records[index]
+                record.update({
+                    'step': int(self.global_steps),
+                    'group_uid': f'{self.global_steps}:{sample_id}',
+                    'group_slot': int(
+                        batch.non_tensor_batch['group_slot'][index]),
+                    'reward_em_only': float(
+                        batch.batch['sequence_em_scores'][index].item()),
+                    'train_reward': float(
+                        batch.batch['sequence_train_rewards'][index].item()),
+                    'group_correct_count': correct_count,
+                    'group_reward_mean': reward_mean,
+                    'group_reward_std': reward_std,
+                    'sequence_advantage': float(valid_advantages[0].item()),
+                })
+                if parent_digest:
+                    record['parent_checkpoint_digest'] = str(parent_digest)
+                self.train_trace_writer.append(record)
+        self.train_trace_writer.sync()
 
     def _create_dataloader(self):
         from torch.utils.data import DataLoader
@@ -458,9 +773,9 @@ class RayPPOTrainer(object):
         Accumulates metrics across all batches before computing final statistics.
         """
         import torch
-        reward_tensor_lst = []
         em_score_lst = []
         search_count_lst = []
+        utility_lst = []
         data_source_lst = []
 
         gen_config = GenerationConfig(
@@ -513,12 +828,14 @@ class RayPPOTrainer(object):
                 # for certain reward function (e.g. sandbox), the generation can overlap with reward
                 reward_tensor = self.val_reward_fn(test_batch)
 
-                reward_tensor_lst.append(reward_tensor)
                 sequence_utility = reward_tensor.sum(-1)
                 em_score_lst.append(test_batch.batch.get('sequence_em_scores', sequence_utility))
                 search_count_lst.append(
                     test_batch.batch.get('executed_search_count', torch.zeros_like(sequence_utility)))
+                utility_lst.append(test_batch.batch.get(
+                    'sequence_posthoc_utilities', sequence_utility))
                 data_source_lst.append(test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0]))
+                self._append_eval_traces(test_batch)
         else:
             for batch_dict in self.val_dataloader:
                 timing_raw = {}
@@ -551,40 +868,25 @@ class RayPPOTrainer(object):
                     # for certain reward function (e.g. sandbox), the generation can overlap with reward
                     reward_tensor = self.val_reward_fn(test_batch)
 
-                    reward_tensor_lst.append(reward_tensor)
                     sequence_utility = reward_tensor.sum(-1)
                     em_score_lst.append(test_batch.batch.get('sequence_em_scores', sequence_utility))
                     search_count_lst.append(
                         test_batch.batch.get('executed_search_count', torch.zeros_like(sequence_utility)))
+                    utility_lst.append(test_batch.batch.get(
+                        'sequence_posthoc_utilities', sequence_utility))
                     data_source_lst.append(test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0]))
+                    self._append_eval_traces(test_batch)
 
-        reward_tensor = torch.cat([rw.sum(-1) for rw in reward_tensor_lst], dim=0).cpu()  # (batch_size,)
         em_scores = torch.cat(em_score_lst, dim=0).float().cpu()
         search_counts = torch.cat(search_count_lst, dim=0).float().cpu()
-        # reward_tensor = torch.cat(reward_tensor_lst, dim=0).sum(-1).cpu()  # (batch_size,)
+        utilities = torch.cat(utility_lst, dim=0).float().cpu()
         data_sources = np.concatenate(data_source_lst, axis=0)
-        # evaluate test_score based on data source
-        data_source_reward = {}
-        data_source_em = {}
-        data_source_search_count = {}
-        for i in range(reward_tensor.shape[0]):
-            data_source = data_sources[i]
-            if data_source not in data_source_reward:
-                data_source_reward[data_source] = []
-                data_source_em[data_source] = []
-                data_source_search_count[data_source] = []
-            data_source_reward[data_source].append(reward_tensor[i].item())
-            data_source_em[data_source].append(em_scores[i].item())
-            data_source_search_count[data_source].append(search_counts[i].item())
+        metric_dict = _validation_metrics(
+            data_sources, em_scores, search_counts, utilities)
 
-        metric_dict = {}
-        for data_source, rewards in data_source_reward.items():
-            metric_dict[f'val/test_score/{data_source}'] = np.mean(rewards)
-            metric_dict[f'val/utility/{data_source}'] = np.mean(rewards)
-            metric_dict[f'val/em/{data_source}'] = np.mean(data_source_em[data_source])
-            metric_dict[f'val/search_count/{data_source}'] = np.mean(data_source_search_count[data_source])
-            metric_dict[f'val/no_search_ratio/{data_source}'] = np.mean(
-                np.asarray(data_source_search_count[data_source]) == 0)
+        if self.eval_trace_writer is not None:
+            self.eval_trace_writer.finalize()
+            self.eval_trace_writer = None
 
         return metric_dict
 
@@ -702,6 +1004,7 @@ class RayPPOTrainer(object):
 
         logger = self.logger
         self.global_steps = 0
+        self._init_trace_writer()
         # perform validation before training
         # currently, we only support validation using the reward_function.
         if self.val_reward_fn is not None and self.config.trainer.get('val_before_train', True):
@@ -746,7 +1049,11 @@ class RayPPOTrainer(object):
                 validated_this_step = False
 
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
-                batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n_agent, interleave=True)
+                prompt_batch_size = len(batch)
+                agent_count = int(self.config.actor_rollout_ref.rollout.n_agent)
+                batch = batch.repeat(repeat_times=agent_count, interleave=True)
+                batch.non_tensor_batch['group_slot'] = np.tile(
+                    np.arange(agent_count, dtype=object), prompt_batch_size)
 
                 # pop those keys for generation
                 gen_batch = batch.pop(batch_keys=['input_ids', 'attention_mask', 'position_ids'])
@@ -868,6 +1175,8 @@ class RayPPOTrainer(object):
                         actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])
                         metrics.update(actor_output_metrics)
 
+                    self._append_train_traces(batch)
+
                     # validate
                     if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and \
                         self.global_steps % self.config.trainer.test_freq == 0:
@@ -896,6 +1205,9 @@ class RayPPOTrainer(object):
                         val_metrics = self._validate()
                         pprint(f'Final validation metrics: {val_metrics}')
                         logger.log(data=val_metrics, step=self.global_steps)
+                    if self.train_trace_writer is not None:
+                        self.train_trace_writer.finalize()
+                        self.train_trace_writer = None
                     return
                 self.global_steps = next_step
     

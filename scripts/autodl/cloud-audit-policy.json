@@ -54,6 +54,18 @@
           ]
         }
       ]
+    },
+    {
+      "id": "gpu-cost-aware-gated",
+      "path": "scripts/autodl/05_gpu_cost_aware_gated.sh",
+      "documentation": [
+        {
+          "path": "scripts/autodl/README.md",
+          "required_literals": [
+            "/root/autodl-tmp/search-r1/checkout/scripts/autodl/05_gpu_cost_aware_gated.sh"
+          ]
+        }
+      ]
     }
   ],
   "shutdown": {

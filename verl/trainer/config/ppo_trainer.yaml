@@ -158,6 +158,7 @@ algorithm:
   lam: 1.0
   adv_estimator: gae
   cost_lambda: 0.0  # normalized retrieval penalty; max_turns is the denominator
+  cost_reward_mode: linear  # linear (legacy) or correct_only (C-gated training)
   no_think_rl: False
   kl_penalty: kl  # how to estimate kl divergence
   kl_ctrl:

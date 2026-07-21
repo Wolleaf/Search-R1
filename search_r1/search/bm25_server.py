@@ -170,7 +170,10 @@ class BM25Retriever:
                 parsed_document = self.corpus.get(hit.docid)
             else:
                 parsed_document = _parse_document(raw_document)
-            item: Dict[str, Any] = {"document": parsed_document}
+            item: Dict[str, Any] = {
+                "document": parsed_document,
+                "document_id": str(hit.docid),
+            }
             if return_scores:
                 item["score"] = float(hit.score)
             output.append(item)

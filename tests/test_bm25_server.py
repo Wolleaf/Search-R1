@@ -86,6 +86,7 @@ class Bm25ServerTest(unittest.TestCase):
 
         self.assertEqual(len(result), 2)
         self.assertEqual(result[0][0]["document"]["title"], "Title One")
+        self.assertEqual(result[0][0]["document_id"], "1")
         self.assertEqual(result[0][0]["score"], 2.5)
         self.assertEqual(result[1], [])
 

@@ -27,6 +27,7 @@ def test_execute_predictions_counts_only_active_retrievals():
 
     def batch_search(queries):
         seen_queries.extend(queries)
+        manager._last_batch_search_metadata = [None] * len(queries)
         return ['result'] * len(queries)
 
     manager.batch_search = batch_search
@@ -38,6 +39,31 @@ def test_execute_predictions_counts_only_active_retrievals():
 
     assert seen_queries == ['active']
     assert executed_search == [1, 0, 0]
+
+
+def test_execute_predictions_preserves_raw_retrieval_metadata_out_of_band():
+    manager = _manager()
+    documents = [{
+        'document_id': '42',
+        'score': 3.5,
+        'document': {'contents': 'Title\nPassage'},
+    }]
+
+    def batch_search(_):
+        manager._last_batch_search_metadata = [documents]
+        return ['Doc 1(Title: Title) Passage\n']
+
+    manager.batch_search = batch_search
+    manager.execute_predictions(
+        ['<search>query</search>'],
+        pad_token='<pad>',
+        active_mask=torch.tensor([True]),
+    )
+
+    assert manager._last_execution_retrieval_events == [{
+        'query': 'query',
+        'documents': documents,
+    }]
 
 
 def test_forced_final_search_is_not_counted_or_executed():
@@ -69,6 +95,29 @@ def test_search_count_is_a_reorderable_batch_tensor():
 
     output.reorder(torch.tensor([1, 0]))
     assert output.batch['executed_search_count'].tolist() == [2, 0]
+
+
+def test_retrieval_metadata_stays_aligned_after_batch_reorder():
+    manager = _manager()
+    output = manager._compose_final_output(
+        left_side={'input_ids': torch.tensor([[1], [2]])},
+        right_side={
+            'responses': torch.tensor([[3], [4]]),
+            'responses_with_info_mask': torch.tensor([[3], [4]]),
+        },
+        meta_info={},
+        executed_search_count=torch.tensor([1, 0]),
+        retrieval_events=[
+            [{'turn': 0, 'query': 'first', 'documents': []}],
+            [],
+        ],
+    )
+
+    output.reorder(torch.tensor([1, 0]))
+    assert output.non_tensor_batch['retrieval_events'].tolist() == [
+        [],
+        [{'turn': 0, 'query': 'first', 'documents': []}],
+    ]
 
 
 def test_odd_active_validation_batch_keeps_deterministic_sampling_metadata():
