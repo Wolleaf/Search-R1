@@ -63,6 +63,7 @@ def test_execute_predictions_preserves_raw_retrieval_metadata_out_of_band():
     assert manager._last_execution_retrieval_events == [{
         'query': 'query',
         'documents': documents,
+        'observation': 'Doc 1(Title: Title) Passage',
     }]
 
 

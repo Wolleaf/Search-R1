@@ -8,7 +8,9 @@ import torch
 
 from search_r1.trajectory_trace import TraceJsonlWriter
 from verl import DataProto
-from verl.trainer.ppo.ray_trainer import RayPPOTrainer, _compute_group_metrics
+from verl.trainer.ppo.ray_trainer import (RayPPOTrainer,
+                                          _compute_group_metrics,
+                                          _event_aligned_trace_turns)
 
 
 class _Tokenizer:
@@ -64,6 +66,7 @@ def test_training_trace_integration_keeps_group_fields_aligned(
             'score': 2.5,
             'document': {'contents': 'France\nParis is the capital.'},
         }],
+        'observation': 'Doc 1 says Paris.',
     }] for _ in range(batch_size)]
     generations = [[{
         'turn': 0,
@@ -73,6 +76,15 @@ def test_training_trace_integration_keeps_group_fields_aligned(
         'valid_action': True,
         'done': False,
         'executed_search': True,
+    }, {
+        'turn': 1,
+        'text': ('<think>The evidence is clear.</think>'
+                 f'<answer>Paris</answer>{trailing_output}'),
+        'token_count': 4,
+        'clipped': False,
+        'valid_action': True,
+        'done': True,
+        'executed_search': False,
     }] for _ in range(batch_size)]
     batch = DataProto.from_dict(
         tensors=tensors,
@@ -126,7 +138,9 @@ def test_training_trace_integration_keeps_group_fields_aligned(
         if turn['retrieval_executed']
     ]
     assert len(executed_turns) == 1
-    assert executed_turns[0]['search_query'] == decoded_query
+    assert executed_turns[0]['search_query'] == 'France capital'
+    assert executed_turns[0]['observation'] == 'Doc 1 says Paris.'
+    assert decoded_query in records[0]['raw_trajectory']
     if trailing_output:
         assert records[0]['turns'][-1]['action'] == 'search'
         assert records[0]['turns'][-1]['retrieval_executed'] is False
@@ -136,3 +150,120 @@ def test_training_trace_integration_keeps_group_fields_aligned(
     assert metrics['env/group/correct_count_1_ratio'] == 1.0
     assert metrics['env/search_count/correct_mean'] == 1.0
     assert metrics['env/search_count/wrong_mean'] == 1.0
+
+
+def test_trace_turns_respect_generation_boundaries_for_unclosed_tags():
+    generation_events = [{
+        'turn': 0,
+        'text': '<think>unfinished',
+        'valid_action': False,
+        'executed_search': False,
+    }, {
+        'turn': 1,
+        'text': '<search>France capital</search></think>',
+        'valid_action': True,
+        'executed_search': True,
+    }]
+    retrieval_events = [{
+        'turn': 1,
+        'query': 'France capital',
+        'documents': [{'document_id': '7'}],
+    }]
+
+    turns = _event_aligned_trace_turns(generation_events, retrieval_events, 1)
+
+    executed_turns = [turn for turn in turns if turn['retrieval_executed']]
+    assert len(executed_turns) == 1
+    assert executed_turns[0]['generation_turn'] == 1
+    assert executed_turns[0]['retrieved_docs'] == [{'document_id': '7'}]
+
+
+def test_trace_turns_reject_generation_retrieval_turn_mismatch():
+    generation_events = [{
+        'turn': 0,
+        'text': '<search>France capital</search>',
+        'valid_action': True,
+        'executed_search': True,
+    }]
+    retrieval_events = [{
+        'turn': 1,
+        'query': 'France capital',
+        'documents': [],
+    }]
+
+    with pytest.raises(ValueError, match='turns are not aligned'):
+        _event_aligned_trace_turns(generation_events, retrieval_events, 1)
+
+
+def test_trace_turns_preserve_environment_action_nested_in_think():
+    generation_events = [{
+        'turn': 0,
+        'text': '<think>try <search>France capital</search></think>',
+        'valid_action': True,
+        'executed_search': True,
+    }]
+    retrieval_events = [{
+        'turn': 0,
+        'query': 'France capital',
+        'documents': [{'document_id': '7'}],
+    }]
+
+    turns = _event_aligned_trace_turns(generation_events, retrieval_events, 1)
+
+    executed_turns = [turn for turn in turns if turn['retrieval_executed']]
+    assert len(executed_turns) == 1
+    assert executed_turns[0]['synthetic_environment_action'] is True
+    assert executed_turns[0]['search_query'] == 'France capital'
+
+
+def test_trace_turns_keep_forced_final_search_unexecuted():
+    generation_events = [{
+        'turn': 4,
+        'text': '<search>France capital</search>',
+        'valid_action': True,
+        'executed_search': False,
+    }]
+
+    turns = _event_aligned_trace_turns(generation_events, [], 0)
+
+    assert len(turns) == 1
+    assert turns[0]['action'] == 'search'
+    assert turns[0]['environment_action'] is True
+    assert turns[0]['retrieval_executed'] is False
+
+
+def test_trace_turns_bind_multiple_searches_without_using_trailing_search():
+    generation_events = [{
+        'turn': 0,
+        'text': '<search>first query</search>',
+        'valid_action': True,
+        'executed_search': True,
+    }, {
+        'turn': 1,
+        'text': '<search>second query</search>',
+        'valid_action': True,
+        'executed_search': True,
+    }, {
+        'turn': 2,
+        'text': '<answer>done</answer><search>unused query</search>',
+        'valid_action': True,
+        'executed_search': False,
+    }]
+    retrieval_events = [{
+        'turn': 0,
+        'query': 'first query',
+        'documents': [{'document_id': '1'}],
+    }, {
+        'turn': 1,
+        'query': 'second query',
+        'documents': [{'document_id': '2'}],
+    }]
+
+    turns = _event_aligned_trace_turns(generation_events, retrieval_events, 2)
+
+    executed_turns = [turn for turn in turns if turn['retrieval_executed']]
+    assert [turn['search_query'] for turn in executed_turns] == [
+        'first query', 'second query'
+    ]
+    assert turns[-1]['search_query'] == 'unused query'
+    assert turns[-1]['retrieval_executed'] is False

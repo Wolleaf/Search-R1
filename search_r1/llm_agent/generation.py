@@ -473,13 +473,15 @@ class LLMGenerationManager:
                 elif action == 'search':
                     search_result = search_results.pop(0) if do_search else ''
                     metadata = search_metadata.pop(0) if do_search else None
-                    next_obs.append(f'\n\n<information>{search_result.strip()}</information>\n\n')
+                    observation = search_result.strip()
+                    next_obs.append(f'\n\n<information>{observation}</information>\n\n')
                     dones.append(0)
                     valid_action.append(1)
                     executed_search.append(int(do_search))
                     retrieval_events.append({
                         'query': content,
                         'documents': metadata if metadata is not None else [],
+                        'observation': observation,
                     } if do_search else None)
                 else:
                     next_obs.append(f'\nMy previous action is invalid. \

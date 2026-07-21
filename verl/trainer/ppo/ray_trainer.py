@@ -78,6 +78,118 @@ def _json_list(value):
     return [value]
 
 
+def _event_aligned_trace_turns(generation_events, retrieval_events,
+                               search_count):
+    """Build trace turns at generation boundaries using environment events."""
+    if len(retrieval_events) != search_count:
+        raise ValueError(
+            'retrieval event count does not match executed_search_count')
+
+    generation_turn_ids = []
+    executed_generation_events = []
+    for event in generation_events:
+        if not isinstance(event, dict):
+            raise ValueError('generation events must be dictionaries')
+        turn_id = event.get('turn')
+        if isinstance(turn_id, bool) or not isinstance(turn_id, int):
+            raise ValueError('generation event turn must be an integer')
+        generation_turn_ids.append(turn_id)
+        if bool(event.get('executed_search', False)):
+            executed_generation_events.append(event)
+    if len(set(generation_turn_ids)) != len(generation_turn_ids):
+        raise ValueError('generation event turns must be unique')
+    if len(executed_generation_events) != search_count:
+        raise ValueError(
+            'generation event count does not match executed_search_count')
+
+    retrieval_turn_ids = []
+    for event in retrieval_events:
+        if not isinstance(event, dict):
+            raise ValueError('retrieval events must be dictionaries')
+        turn_id = event.get('turn')
+        if isinstance(turn_id, bool) or not isinstance(turn_id, int):
+            raise ValueError('retrieval event turn must be an integer')
+        retrieval_turn_ids.append(turn_id)
+    if len(set(retrieval_turn_ids)) != len(retrieval_turn_ids):
+        raise ValueError('retrieval event turns must be unique')
+    if ([event['turn'] for event in executed_generation_events]
+            != retrieval_turn_ids):
+        raise ValueError('generation and retrieval event turns are not aligned')
+
+    retrieval_by_turn = {
+        event['turn']: event for event in retrieval_events
+    }
+    turns = []
+    for event in generation_events:
+        event_text = str(event.get('text', ''))
+        event_turns = parse_search_r1_transcript(event_text)
+        if not event_turns:
+            event_turns = [{
+                'turn': 0,
+                'think': '',
+                'action': 'invalid',
+                'search_query': None,
+                'answer': None,
+                'observation': None,
+                'invalid_text': [],
+                'valid_action': False,
+            }]
+        action_match = re.search(r'<(search|answer)>(.*?)</\1>', event_text,
+                                 re.DOTALL)
+        environment_action = None
+        if action_match is not None:
+            action = action_match.group(1)
+            content = action_match.group(2).strip()
+            value_field = 'search_query' if action == 'search' else 'answer'
+            environment_action = next(
+                (turn for turn in event_turns
+                 if turn['action'] == action and turn[value_field] == content),
+                None)
+            if environment_action is None:
+                environment_action = {
+                    'turn': 0,
+                    'think': '',
+                    'action': action,
+                    'search_query': content if action == 'search' else None,
+                    'answer': content if action == 'answer' else None,
+                    'observation': None,
+                    'invalid_text': [],
+                    'valid_action': True,
+                    'synthetic_environment_action': True,
+                }
+                event_turns.append(environment_action)
+        if bool(event.get('valid_action', False)) != (action_match is not None):
+            raise ValueError(
+                'generation event valid_action does not match parsed action')
+
+        for turn in event_turns:
+            turn['generation_turn'] = event['turn']
+            turn['environment_action'] = turn is environment_action
+            turn['synthetic_environment_action'] = bool(
+                turn.get('synthetic_environment_action', False))
+            turn['retrieved_docs'] = []
+            turn['retrieval_executed'] = False
+
+        if bool(event.get('executed_search', False)):
+            retrieval_event = retrieval_by_turn[event['turn']]
+            if (environment_action is None
+                    or environment_action['action'] != 'search'
+                    or environment_action['search_query']
+                    != retrieval_event.get('query')):
+                raise ValueError(
+                    'executed generation event does not match retrieval event')
+            environment_action['retrieved_docs'] = retrieval_event.get(
+                'documents', [])
+            environment_action['observation'] = retrieval_event.get(
+                'observation')
+            environment_action['retrieval_executed'] = True
+
+        for turn in event_turns:
+            turn['turn'] = len(turns)
+            turns.append(turn)
+    return turns
+
+
 def _validation_metrics(data_sources, em_scores, search_counts, utilities):
     grouped = defaultdict(lambda: {'em': [], 'searches': [], 'utility': []})
     for data_source, em, searches, utility in zip(
@@ -548,11 +660,6 @@ class RayPPOTrainer(object):
             decoded_prompt = self.tokenizer.decode(prompt_ids)
             raw_trajectory = self.tokenizer.decode(
                 torch.cat((prompt_ids, response_ids)))
-            turns = parse_search_r1_transcript(raw_trajectory)
-            answers = [
-                turn['answer'] for turn in turns
-                if turn['action'] == 'answer' and turn['answer'] is not None
-            ]
 
             extra_info = item.non_tensor_batch.get('extra_info', {})
             if not isinstance(extra_info, dict):
@@ -582,49 +689,12 @@ class RayPPOTrainer(object):
                 [] if generation_events is None else _json_list(generation_events))
             search_count = int(
                 item.batch['executed_search_count'].item())
-            if len(retrieval_events) != search_count:
-                raise ValueError(
-                    'retrieval event count does not match executed_search_count')
-            executed_generation_events = [
-                event for event in generation_events
-                if bool(event.get('executed_search', False))
+            turns = _event_aligned_trace_turns(generation_events,
+                                                retrieval_events, search_count)
+            answers = [
+                turn['answer'] for turn in turns
+                if turn['action'] == 'answer' and turn['answer'] is not None
             ]
-            if len(executed_generation_events) != search_count:
-                raise ValueError(
-                    'generation event count does not match executed_search_count')
-            if ([event.get('turn') for event in executed_generation_events]
-                    != [event.get('turn') for event in retrieval_events]):
-                raise ValueError(
-                    'generation and retrieval event turns are not aligned')
-            for generation_event, retrieval_event in zip(
-                    executed_generation_events, retrieval_events):
-                generated_turns = parse_search_r1_transcript(
-                    generation_event['text'])
-                environment_action = next((turn for turn in generated_turns
-                                           if turn['action'] in ('search',
-                                                                 'answer')),
-                                          None)
-                if (environment_action is None
-                        or environment_action['action'] != 'search'
-                        or environment_action['search_query']
-                        != retrieval_event['query']):
-                    raise ValueError(
-                        'executed generation event does not match retrieval event')
-            retrieval_index = 0
-            for turn in turns:
-                turn['retrieved_docs'] = []
-                turn['retrieval_executed'] = False
-                if (turn['action'] == 'search'
-                        and retrieval_index < len(retrieval_events)):
-                    # Environment events are authoritative and ordered; a
-                    # tokenizer round trip may normalize the decoded query.
-                    turn['retrieved_docs'] = retrieval_events[
-                        retrieval_index]['documents']
-                    turn['retrieval_executed'] = True
-                    retrieval_index += 1
-            if retrieval_index != len(retrieval_events):
-                raise ValueError(
-                    'retrieval events could not be aligned to parsed search turns')
 
             records.append({
                 'sample_id': stable_sample_id(
