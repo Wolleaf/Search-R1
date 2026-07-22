@@ -24,13 +24,15 @@ if str(REPOSITORY_ROOT) not in sys.path:
 from search_r1.trajectory_trace import validate_trace_record  # noqa: E402
 
 ANALYSIS_SCHEMA = "search-r1.grouped-probe-analysis"
-ANALYSIS_SCHEMA_VERSION = 1
+ANALYSIS_SCHEMA_VERSION = 2
 EXPECTED_GROUPS = 64
 GROUP_SIZE = 5
 EXPECTED_ROWS = EXPECTED_GROUPS * GROUP_SIZE
 MAX_SEARCHES = 4
 MIN_MULTI_SEARCHES = 2
 MAX_QUERY_TOKEN_JACCARD = 0.8
+NEAR_MISS_DIAGNOSTIC_THRESHOLD = 16
+NEAR_MISS_EXAMPLE_LIMIT = 5
 CATEGORY_GROUPS = {"comparison": 40, "bridge": 24}
 THRESHOLDS = {
     "valid_correct_multi_search_count": 16,
@@ -76,6 +78,22 @@ def _phrase_visible(phrases: Sequence[str], text: str) -> bool:
     haystack = f" {_normalize_text(text)} "
     return any(normalized and f" {normalized} " in haystack
                for normalized in (_normalize_text(value) for value in phrases))
+
+
+def _cover_em(prediction: object, golden_answers: Sequence[str]) -> bool:
+    normalized_prediction = _normalize_text(prediction)
+    if not normalized_prediction:
+        return False
+    padded_prediction = f" {normalized_prediction} "
+    for answer in golden_answers:
+        normalized_answer = _normalize_text(answer)
+        if not normalized_answer:
+            continue
+        padded_answer = f" {normalized_answer} "
+        if (padded_prediction in padded_answer
+                or padded_answer in padded_prediction):
+            return True
+    return False
 
 
 def _query_token_jaccard(first: str, second: str) -> float:
@@ -466,15 +484,29 @@ def _load_trace(
         qualifies, failures = _qualification(raw_record, evidence)
         clean = (not raw_record["response_clipped"]
                  and raw_record["invalid_action_count"] == 0)
+        near_miss = int(raw_record["em"]) == 0 and failures == ["incorrect"]
         records.append({
-            "trace": raw_record,
-            "catalog": metadata,
-            "events": events,
-            "evidence": evidence,
-            "qualifies": qualifies,
-            "qualification_failures": failures,
-            "clean": clean,
-            "sample_key": sample_key,
+            "trace":
+            raw_record,
+            "catalog":
+            metadata,
+            "events":
+            events,
+            "evidence":
+            evidence,
+            "qualifies":
+            qualifies,
+            "qualification_failures":
+            failures,
+            "clean":
+            clean,
+            "near_miss":
+            near_miss,
+            "cover_em":
+            _cover_em(raw_record["extracted_answer"],
+                      metadata["gold_answers"]),
+            "sample_key":
+            sample_key,
         })
         observed_samples.add(sample_key)
 
@@ -554,6 +586,7 @@ def _group_records(records: Sequence[dict[str, Any]],
 
         members.sort(key=lambda member: member["trace"]["group_slot"])
         qualifying = [member for member in members if member["qualifies"]]
+        near_misses = [member for member in members if member["near_miss"]]
         clean_wrong = [
             member for member in members
             if member["clean"] and int(member["trace"]["em"]) == 0
@@ -609,6 +642,14 @@ def _group_records(records: Sequence[dict[str, Any]],
             len(qualifying),
             "qualifying_slots":
             [member["trace"]["group_slot"] for member in qualifying],
+            "near_miss_count":
+            len(near_misses),
+            "near_miss_slots":
+            [member["trace"]["group_slot"] for member in near_misses],
+            "near_miss_cover_em_count":
+            sum(member["cover_em"] for member in near_misses),
+            "near_miss_covered":
+            bool(near_misses),
             "clean_wrong_count":
             len(clean_wrong),
             "covered":
@@ -634,6 +675,7 @@ def _aggregate(records: Sequence[dict[str, Any]],
     invalid = sum(record["trace"]["invalid_action_count"] > 0
                   for record in records)
     valid_correct_multi = sum(record["qualifies"] for record in records)
+    near_misses = [record for record in records if record["near_miss"]]
     failures = Counter(reason for record in records
                        for reason in record["qualification_failures"])
     branches = Counter(record["evidence"]["evidence_branch"]
@@ -659,6 +701,17 @@ def _aggregate(records: Sequence[dict[str, Any]],
         valid_correct_multi,
         "valid_correct_multi_search_ratio":
         _ratio(valid_correct_multi, trajectory_count),
+        "near_miss_count":
+        len(near_misses),
+        "near_miss_ratio":
+        _ratio(len(near_misses), trajectory_count),
+        "near_miss_covered_question_count":
+        sum(group["near_miss_covered"] for group in groups),
+        "near_miss_cover_em_count":
+        sum(record["cover_em"] for record in near_misses),
+        "near_miss_cover_em_ratio":
+        (_ratio(sum(record["cover_em"] for record in near_misses),
+                len(near_misses)) if near_misses else 0.0),
         "covered_question_count":
         sum(group["covered"] for group in groups),
         "learnable_group_count":
@@ -726,6 +779,80 @@ def _decision(overall: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _near_miss_example(record: Mapping[str, Any]) -> dict[str, Any]:
+    trace = record["trace"]
+    evidence = record["evidence"]
+    return {
+        "record_id": trace["record_id"],
+        "sample_id": trace["sample_id"],
+        "group_slot": trace["group_slot"],
+        "category": record["catalog"]["category"],
+        "question": trace["question"],
+        "gold_answers": trace["gold_answers"],
+        "extracted_answer": trace["extracted_answer"],
+        "cover_em": record["cover_em"],
+        "executed_search_count": trace["executed_search_count"],
+        "queries": [event["query"] for event in record["events"]],
+        "query_token_jaccard": evidence["query_token_jaccard"],
+        "new_document_ids": evidence["new_document_ids"],
+        "new_supporting_titles": evidence["new_supporting_titles"],
+        "evidence_branch": evidence["evidence_branch"],
+        "raw_trajectory": trace["raw_trajectory"],
+        "turns": trace["turns"],
+        "retrieval_events": trace["retrieval_events"],
+    }
+
+
+def _near_miss_diagnostic(records: Sequence[dict[str, Any]],
+                          decision: str) -> dict[str, Any]:
+    near_misses = sorted(
+        (record for record in records if record["near_miss"]),
+        key=lambda record:
+        (str(record["trace"]["sample_id"]), record["trace"]["group_slot"]))
+    by_category = Counter(record["catalog"]["category"]
+                          for record in near_misses)
+    covered_questions = {record["sample_key"] for record in near_misses}
+    if decision == "GO":
+        diagnosis = "strict_gate_passed"
+    elif len(near_misses) >= NEAR_MISS_DIAGNOSTIC_THRESHOLD:
+        diagnosis = "retrieval_chain_present_review_answer_extraction"
+    else:
+        diagnosis = "correct_multisearch_exploration_absent_or_rare"
+    return {
+        "definition":
+        ("EM=0 while every non-EM valid-multisearch condition passes: "
+         "searches>=2, not clipped, no invalid action, query Jaccard<0.8, "
+         "a visible new document, and new supporting-title or answer evidence"
+         ),
+        "diagnostic_threshold":
+        NEAR_MISS_DIAGNOSTIC_THRESHOLD,
+        "threshold_met":
+        len(near_misses) >= NEAR_MISS_DIAGNOSTIC_THRESHOLD,
+        "affects_go_no_go":
+        False,
+        "diagnosis":
+        diagnosis,
+        "trajectory_count":
+        len(near_misses),
+        "covered_question_count":
+        len(covered_questions),
+        "by_category": {
+            category: by_category[category]
+            for category in CATEGORY_GROUPS
+        },
+        "cover_em_count":
+        sum(record["cover_em"] for record in near_misses),
+        "cover_em_definition":
+        ("after Unicode/case/punctuation normalization, prediction and any "
+         "gold alias contain one another on token boundaries; diagnostic only"
+         ),
+        "examples": [
+            _near_miss_example(record)
+            for record in near_misses[:NEAR_MISS_EXAMPLE_LIMIT]
+        ],
+    }
+
+
 def _trajectory_report(record: Mapping[str, Any]) -> dict[str, Any]:
     trace = record["trace"]
     metadata = record["catalog"]
@@ -746,6 +873,8 @@ def _trajectory_report(record: Mapping[str, Any]) -> dict[str, Any]:
         "response_clipped": trace["response_clipped"],
         "invalid_action_count": trace["invalid_action_count"],
         "clean": record["clean"],
+        "cover_em": record["cover_em"],
+        "near_miss": record["near_miss"],
         "valid_correct_multi_search": record["qualifies"],
         "qualification_failures": record["qualification_failures"],
         **evidence,
@@ -758,6 +887,7 @@ def _trajectory_report(record: Mapping[str, Any]) -> dict[str, Any]:
 def _markdown(summary: Mapping[str, Any]) -> str:
     overall = summary["overall"]
     decision = summary["go_no_go"]
+    near_miss = summary["near_miss_diagnostic"]
     lines = [
         "# Grouped Probe Analysis",
         "",
@@ -793,6 +923,9 @@ def _markdown(summary: Mapping[str, Any]) -> str:
         f"({overall['clipped_ratio']:.2%}); invalid-action trajectories: "
         f"{overall['invalid_action_trajectory_count']} "
         f"({overall['invalid_action_ratio']:.2%}).",
+        f"- Near misses: {near_miss['trajectory_count']} trajectories across "
+        f"{near_miss['covered_question_count']} questions; cover-EM "
+        f"{near_miss['cover_em_count']}; diagnosis: `{near_miss['diagnosis']}`.",
         "- Category metrics are available in `summary.json`; question- and "
         "trajectory-level evidence is in the companion JSONL files.",
         "",
@@ -803,8 +936,19 @@ def _markdown(summary: Mapping[str, Any]) -> str:
         "second-round document, and new supporting-title or first-visible answer evidence.",
         "A learnable group contains at least one such trajectory and at least one "
         "clean wrong trajectory, so correctness-gated group reward has non-zero contrast.",
+        "A near miss has EM=0 but passes every other valid multi-search condition. "
+        "The >=16 diagnostic threshold never changes the strict GO/NO-GO decision.",
         "",
     ])
+    if near_miss["examples"]:
+        lines.extend(["## Near-Miss Examples", ""])
+        for example in near_miss["examples"]:
+            lines.append(
+                f"- `{example['record_id']}` ({example['category']}, "
+                f"{example['executed_search_count']} searches): extracted "
+                f"`{example['extracted_answer']}`; cover-EM="
+                f"{str(example['cover_em']).lower()}.")
+        lines.append("")
     return "\n".join(lines)
 
 
@@ -864,6 +1008,7 @@ def analyze(args: argparse.Namespace) -> dict[str, Any]:
         ]
         by_category[category] = _aggregate(category_records, category_groups)
     decision = _decision(overall)
+    near_miss_diagnostic = _near_miss_diagnostic(records, decision["decision"])
     summary = {
         "schema": ANALYSIS_SCHEMA,
         "schema_version": ANALYSIS_SCHEMA_VERSION,
@@ -891,6 +1036,8 @@ def analyze(args: argparse.Namespace) -> dict[str, Any]:
             MIN_MULTI_SEARCHES,
             "max_query_token_jaccard":
             MAX_QUERY_TOKEN_JACCARD,
+            "near_miss_diagnostic_threshold":
+            NEAR_MISS_DIAGNOSTIC_THRESHOLD,
             "category_questions":
             CATEGORY_GROUPS,
             "thresholds":
@@ -903,11 +1050,15 @@ def analyze(args: argparse.Namespace) -> dict[str, Any]:
             "learnable_group_definition":
             ("at least one valid correct multi-search trajectory and at least "
              "one unclipped, invalid-action-free EM=0 trajectory"),
+            "near_miss_definition":
+            ("EM=0 and every non-EM valid-correct-multisearch condition passes; "
+             "diagnostic only and excluded from GO criteria"),
             "invalid_action_ratio_denominator":
             "trajectories",
         },
         "overall": overall,
         "by_category": by_category,
+        "near_miss_diagnostic": near_miss_diagnostic,
         "go_no_go": decision,
     }
     per_trajectory = sorted((_trajectory_report(record) for record in records),
@@ -920,14 +1071,28 @@ def analyze(args: argparse.Namespace) -> dict[str, Any]:
         _markdown(summary).encode("utf-8"),
         "go_no_go.json":
         _json_bytes({
-            "schema": ANALYSIS_SCHEMA,
-            "schema_version": ANALYSIS_SCHEMA_VERSION,
-            "decision": decision["decision"],
-            "criteria": decision["criteria"],
-            "failed_criteria": decision["failed_criteria"],
-            "trace_sha256": summary["input"]["trace_sha256"],
-            "catalog_sha256": summary["input"]["catalog_sha256"],
-            "checkpoint_digest": expected_digest,
+            "schema":
+            ANALYSIS_SCHEMA,
+            "schema_version":
+            ANALYSIS_SCHEMA_VERSION,
+            "decision":
+            decision["decision"],
+            "criteria":
+            decision["criteria"],
+            "failed_criteria":
+            decision["failed_criteria"],
+            "near_miss_diagnosis":
+            near_miss_diagnostic["diagnosis"],
+            "near_miss_count":
+            near_miss_diagnostic["trajectory_count"],
+            "near_miss_threshold_met":
+            near_miss_diagnostic["threshold_met"],
+            "trace_sha256":
+            summary["input"]["trace_sha256"],
+            "catalog_sha256":
+            summary["input"]["catalog_sha256"],
+            "checkpoint_digest":
+            expected_digest,
         }),
         "per_trajectory.jsonl":
         b"".join(

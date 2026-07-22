@@ -57,7 +57,7 @@ AUTODL_SEARCH_MIX_INCREMENTAL=1 \
 bash /root/autodl-tmp/search-r1/checkout/scripts/autodl/02_cpu_prepare.sh
 ```
 
-该模式只新增固定 revision 的 NQ/HotpotQA train JSONL，不重装环境或重下大资产。train venv 下载并校验源文件，retriever venv 生成真实 top-3 evidence，train venv 按 Qwen tokenizer 的实际 384-token observation 筛选并生成 Parquet，最后 retriever venv对最终 640 题重放约 960 次查询。NQ test-128 与现有 HotpotQA/2Wiki dev-256 都被排除；任一配额不足、source/evidence 不一致或重放漂移都会失败关闭。
+该模式只新增固定 revision 的 NQ/HotpotQA train JSONL，不重装环境或重下大资产。train venv 下载并校验源文件，retriever venv 生成真实 top-3 evidence，train venv 按 Qwen tokenizer 的实际 384-token observation 筛选并生成 Parquet；train 固定为 NQ 192、comparison 200、bridge 120，val 仍为 64/40/24。最终 retriever venv 对 640 题重放 1024 次查询。`selection_funnel.json` 记录各层候选、拒绝原因和差额；即使配额不足也先保存失败 receipt 再退出。NQ test-128 与现有 HotpotQA/2Wiki dev-256 都被排除；任一配额不足、source/evidence 不一致或重放漂移都会失败关闭。
 
 ### 3. GPU Base grouped probe
 
@@ -70,7 +70,7 @@ bash /root/autodl-tmp/search-r1/checkout/scripts/autodl/07_gpu_group_probe.sh
 
 若控制台整机价格变化，替换 `5.76`。该入口不训练、不保存 checkpoint；它在 `probe_multi_64.parquet` 上每题随机采样 5 条轨迹，共 320 条，固定 response 500、prompt 4096、validation batch 8。只有有效正确多搜不少于 16 条、覆盖不少于 8 题、可学习 group 不少于 8 个，且 clipped/invalid 各不高于 5%，结果才为 GO。
 
-分析器逐条保留完整思考、query、检索文档、答案、截断和非法动作，并按 comparison/bridge 分层。GO 与 NO-GO 都是本实现切片的终态：结果会完整封存并允许 watchdog 关机，不会自动训练或重试；只有人工确认 GO 后才另行实现下一训练切片。单次硬上限为 10 元。
+分析器逐条保留完整思考、query、检索文档、答案、截断和非法动作，并按 comparison/bridge 分层。它还报告“检索链合格但 strict EM=0”的 near-miss、cover-EM 和示例轨迹；`16/320` 只用于区分搜索策略缺失与答案抽取问题，不改变 GO/NO-GO。GO 与 NO-GO 都是本实现切片的终态：结果会完整封存并允许 watchdog 关机，不会自动训练或重试；只有人工确认 GO 后才另行实现下一训练切片。单次硬上限为 10 元。
 
 ## 历史 GPU 工作流（本轮不要运行）
 

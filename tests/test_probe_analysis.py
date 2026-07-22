@@ -297,6 +297,59 @@ def test_no_go_is_exit_zero_unless_explicitly_requested(
     ]) == 2
 
 
+def test_near_miss_diagnostic_preserves_strict_no_go(tmp_path: Path) -> None:
+    records = []
+    for sample_index in range(64):
+        for slot in range(5):
+            is_near_miss = sample_index < 8 and slot < 2
+            record = _record(sample_index,
+                             slot,
+                             em=0,
+                             searches=2 if is_near_miss else 1)
+            if is_near_miss:
+                expanded = f"Gold {sample_index} expanded"
+                record["extracted_answer"] = expanded
+                record["turns"][-1]["answer"] = expanded
+                record["raw_trajectory"] = record["raw_trajectory"].replace(
+                    f"<answer>Wrong {sample_index}</answer>",
+                    f"<answer>{expanded}</answer>")
+            records.append(record)
+    trace, catalog = _fixture(tmp_path, records)
+    output = tmp_path / "analysis"
+
+    summary = PROBE.analyze(_args(trace, catalog, output))
+
+    assert summary["decision"] == "NO-GO"
+    assert summary["overall"]["valid_correct_multi_search_count"] == 0
+    assert summary["overall"]["near_miss_count"] == 16
+    assert summary["overall"]["near_miss_covered_question_count"] == 8
+    assert summary["overall"]["near_miss_cover_em_count"] == 16
+    diagnostic = summary["near_miss_diagnostic"]
+    assert diagnostic["threshold_met"] is True
+    assert diagnostic["affects_go_no_go"] is False
+    assert diagnostic[
+        "diagnosis"] == "retrieval_chain_present_review_answer_extraction"
+    assert diagnostic["by_category"] == {
+        "comparison": 16,
+        "bridge": 0,
+    }
+    assert len(diagnostic["examples"]) == 5
+    assert diagnostic["examples"][0]["raw_trajectory"]
+    decision = json.loads(
+        (output / "go_no_go.json").read_text(encoding="utf-8"))
+    assert decision["decision"] == "NO-GO"
+    assert decision["near_miss_count"] == 16
+    assert decision["near_miss_threshold_met"] is True
+    rows = [
+        json.loads(line)
+        for line in (output / "per_trajectory.jsonl").read_text(
+            encoding="utf-8").splitlines()
+    ]
+    assert sum(row["near_miss"] for row in rows) == 16
+    assert "Near-Miss Examples" in (output /
+                                    "summary.md").read_text(encoding="utf-8")
+
+
 def test_learnable_requires_correct_multisearch_and_clean_wrong_contrast(
         tmp_path: Path) -> None:
     records = _passing_records()

@@ -25,7 +25,7 @@ CORPUS_SHA256 = "7abd929223399cd63c52b499f289bf4f9039be1e9f8c43e1cb3938305b2317d
 SEED = 42
 TOPK = 3
 MAX_OBS_LENGTH = 384
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 SELECTION_POLICY = "retrieval-verified-search-mix-v1"
 
 SOURCE_SPECS = {
@@ -59,20 +59,20 @@ CANDIDATE_LIMITS = {
 RETRIEVAL_TARGETS = {
     # These are feasibility floors; materialization applies the stricter
     # tokenizer, exclusion, and fixed-quota checks to the full evidence pool.
-    "comparison": 200,
-    "bridge": 120,
+    "comparison": 240,
+    "bridge": 144,
 }
 QUOTAS = {
     "single": {
-        "train": 256,
+        "train": 192,
         "val": 64
     },
     "comparison": {
-        "train": 160,
+        "train": 200,
         "val": 40
     },
     "bridge": {
-        "train": 96,
+        "train": 120,
         "val": 24
     },
 }
@@ -83,6 +83,7 @@ CATALOG_FILE = "catalog.jsonl"
 EXCLUSIONS_FILE = "exclusions.json"
 MANIFEST_FILE = "manifest.json"
 REPLAY_FILE = "retrieval_replay.json"
+SELECTION_FUNNEL_FILE = "selection_funnel.json"
 OUTPUT_FILES = {
     "train": "train_512.parquet",
     "val": "val_128.parquet",
@@ -125,6 +126,23 @@ class JsonlRows:
             raise ValueError(
                 f"Source row is not an object at {self.path}:{index + 1}")
         return value
+
+
+class SelectionQuotaError(ValueError):
+    """Carry deterministic selection counts when a fixed quota is infeasible."""
+
+    def __init__(self, shortfalls: Mapping[str, Mapping[str, int]],
+                 rejection_counts: Counter[str], stats: Mapping[str, Any]):
+        self.shortfalls = {
+            category: dict(values)
+            for category, values in shortfalls.items()
+        }
+        self.rejection_counts = Counter(rejection_counts)
+        self.stats = dict(stats)
+        details = ", ".join(
+            f"{category}={values['available']}/{values['required']}"
+            for category, values in sorted(self.shortfalls.items()))
+        super().__init__(f"Materialization quota shortfall: {details}")
 
 
 def canonical_json_bytes(value: object) -> bytes:
@@ -413,7 +431,7 @@ def _candidate(source: str, source_index: int,
 
 def collect_candidates(
     rows: JsonlRows, source: str, limits: Mapping[str, int]
-) -> tuple[dict[str, list[dict[str, Any]]], Counter[str]]:
+) -> tuple[dict[str, list[dict[str, Any]]], Counter[str], dict[str, Any]]:
     candidates: dict[str, list[dict[str, Any]]] = {
         category: []
         for category in limits
@@ -429,11 +447,52 @@ def collect_candidates(
         if category not in candidates:
             continue
         candidates[category].append(candidate)
+    after_prescreen = {
+        category: len(values)
+        for category, values in candidates.items()
+    }
     for category, values in candidates.items():
         values.sort(
             key=lambda item: stable_key("candidate", str(item["source_id"])))
         candidates[category] = values[:limits[category]]
-    return candidates, rejected
+    stats = {
+        "source_rows": len(rows),
+        "candidates_after_prescreen": after_prescreen,
+        "candidates_after_cap": {
+            category: len(values)
+            for category, values in candidates.items()
+        },
+    }
+    return candidates, rejected, stats
+
+
+def _selection_funnel_payload(
+        status: str,
+        stage: str,
+        retrieval: Mapping[str, Any],
+        materialize: Optional[Mapping[str, Any]] = None,
+        failure: Optional[Mapping[str, Any]] = None) -> dict[str, Any]:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "selection_policy": SELECTION_POLICY,
+        "seed": SEED,
+        "status": status,
+        "stage": stage,
+        "quotas": QUOTAS,
+        "candidate_limits": CANDIDATE_LIMITS,
+        "retrieval_targets": RETRIEVAL_TARGETS,
+        "retrieval": dict(retrieval),
+        "materialize": None if materialize is None else dict(materialize),
+        "failure": None if failure is None else dict(failure),
+    }
+
+
+def _write_selection_funnel(local_dir: Path, payload: Mapping[str,
+                                                              Any]) -> Path:
+    path = local_dir / SELECTION_FUNNEL_FILE
+    atomic_write(path, canonical_json_bytes(payload))
+    write_digest_sidecar(path)
+    return path
 
 
 def _serialize_hits(hits: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
@@ -490,9 +549,9 @@ def retrieve_evidence(local_dir: Path, index_path: Path, corpus_path: Path,
     local_dir = local_dir.resolve()
     nq_rows = JsonlRows(verify_source(local_dir, "nq"))
     hotpot_rows = JsonlRows(verify_source(local_dir, "hotpotqa"))
-    nq_candidates, nq_rejected = collect_candidates(
+    nq_candidates, nq_rejected, nq_stats = collect_candidates(
         nq_rows, "nq", {"single": CANDIDATE_LIMITS["single"]})
-    hotpot_candidates, hotpot_rejected = collect_candidates(
+    hotpot_candidates, hotpot_rejected, hotpot_stats = collect_candidates(
         hotpot_rows, "hotpotqa", {
             "comparison": CANDIDATE_LIMITS["comparison"],
             "bridge": CANDIDATE_LIMITS["bridge"],
@@ -504,9 +563,11 @@ def retrieve_evidence(local_dir: Path, index_path: Path, corpus_path: Path,
     rejection_counts = nq_rejected + hotpot_rejected
     evidence: list[dict[str, Any]] = []
     ordered_ids: list[str] = []
+    bm25_query_calls = 0
 
     for candidate in nq_candidates["single"]:
         ordered_ids.append(str(candidate["source_id"]))
+        bm25_query_calls += 1
         first = _serialize_hits(
             retriever.search(candidate["question"],
                              topk=TOPK,
@@ -522,9 +583,9 @@ def retrieve_evidence(local_dir: Path, index_path: Path, corpus_path: Path,
         })
 
     for category in ("comparison", "bridge"):
-        structurally_valid = 0
         for candidate in hotpot_candidates[category]:
             ordered_ids.append(str(candidate["source_id"]))
+            bm25_query_calls += 1
             first = _serialize_hits(
                 retriever.search(candidate["question"],
                                  topk=TOPK,
@@ -546,6 +607,7 @@ def retrieve_evidence(local_dir: Path, index_path: Path, corpus_path: Path,
                 rejection_counts[
                     f"retrieve:{category}:second_query_not_derivable"] += 1
                 continue
+            bm25_query_calls += 1
             second = _serialize_hits(
                 retriever.search(missing, topk=TOPK, return_scores=True))
             if missing not in _title_coverage([missing], second):
@@ -562,7 +624,6 @@ def retrieve_evidence(local_dir: Path, index_path: Path, corpus_path: Path,
             if new_document_count == 0 or not new_support:
                 rejection_counts[f"retrieve:{category}:no_new_document"] += 1
                 continue
-            structurally_valid += 1
             evidence.append({
                 **candidate,
                 "first_query": candidate["question"],
@@ -573,21 +634,75 @@ def retrieve_evidence(local_dir: Path, index_path: Path, corpus_path: Path,
                 "second_results": second,
                 "new_document_count": new_document_count,
             })
-        if structurally_valid < RETRIEVAL_TARGETS[category]:
-            raise ValueError(
-                f"{category} produced {structurally_valid} structurally valid "
-                f"retrieval chains; {RETRIEVAL_TARGETS[category]} are required"
-            )
 
     evidence.sort(
         key=lambda item: stable_key("evidence", str(item["source_id"])))
+    order_digest = hashlib.sha256("".join(
+        f"{sample_id}\n"
+        for sample_id in ordered_ids).encode("utf-8")).hexdigest()
+    candidates_after_prescreen = {
+        **nq_stats["candidates_after_prescreen"],
+        **hotpot_stats["candidates_after_prescreen"],
+    }
+    candidates_after_cap = {
+        **nq_stats["candidates_after_cap"],
+        **hotpot_stats["candidates_after_cap"],
+    }
+    structurally_valid = Counter(
+        str(record["category"]) for record in evidence)
+    retrieval_summary = {
+        "source_rows": {
+            "nq": nq_stats["source_rows"],
+            "hotpotqa": hotpot_stats["source_rows"],
+        },
+        "candidates_after_prescreen": candidates_after_prescreen,
+        "candidates_after_cap": candidates_after_cap,
+        "candidates_truncated_by_cap": {
+            category:
+            candidates_after_prescreen[category] -
+            candidates_after_cap[category]
+            for category in CANDIDATE_LIMITS
+        },
+        "candidate_items_queried": len(ordered_ids),
+        "bm25_query_calls": bm25_query_calls,
+        "structurally_valid": {
+            category: structurally_valid[category]
+            for category in CANDIDATE_LIMITS
+        },
+        "evidence_rows": len(evidence),
+        "candidate_order_sha256": order_digest,
+        "evidence_sha256": None,
+        "rejection_counts": dict(sorted(rejection_counts.items())),
+    }
+    shortfalls = {
+        category: {
+            "available": structurally_valid[category],
+            "required": required,
+            "missing": required - structurally_valid[category],
+        }
+        for category, required in RETRIEVAL_TARGETS.items()
+        if structurally_valid[category] < required
+    }
+    if shortfalls:
+        _write_selection_funnel(
+            local_dir,
+            _selection_funnel_payload("failed",
+                                      "retrieve",
+                                      retrieval_summary,
+                                      failure={
+                                          "stage": "retrieve",
+                                          "shortfalls": shortfalls,
+                                      }))
+        details = ", ".join(
+            f"{category}={values['available']}/{values['required']}"
+            for category, values in sorted(shortfalls.items()))
+        raise ValueError(f"Retrieval quota shortfall: {details}")
+
     evidence_path = local_dir / EVIDENCE_FILE
     atomic_write(evidence_path,
                  b"".join(canonical_json_bytes(item) for item in evidence))
     write_digest_sidecar(evidence_path)
-    order_digest = hashlib.sha256("".join(
-        f"{sample_id}\n"
-        for sample_id in ordered_ids).encode("utf-8")).hexdigest()
+    retrieval_summary["evidence_sha256"] = sha256_file(evidence_path)
     ledger = {
         "schema_version": SCHEMA_VERSION,
         "selection_policy": SELECTION_POLICY,
@@ -607,6 +722,10 @@ def retrieve_evidence(local_dir: Path, index_path: Path, corpus_path: Path,
     ledger_path = local_dir / RETRIEVAL_LEDGER_FILE
     atomic_write(ledger_path, canonical_json_bytes(ledger))
     write_digest_sidecar(ledger_path)
+    _write_selection_funnel(
+        local_dir,
+        _selection_funnel_payload("retrieval_complete", "retrieve",
+                                  retrieval_summary))
     return ledger_path
 
 
@@ -1006,33 +1125,41 @@ def _read_excluded_questions(
 
 
 def select_catalog(
-        evidence: Sequence[Mapping[str, Any]], tokenizer: Any,
-        excluded_questions: set[str]
-) -> tuple[list[dict[str, Any]], Counter[str]]:
+    evidence: Sequence[Mapping[str, Any]], tokenizer: Any,
+    excluded_questions: set[str]
+) -> tuple[list[dict[str, Any]], Counter[str], dict[str, Any]]:
     accepted: dict[str, list[tuple[Mapping[str, Any], dict[str, Any]]]] = {
         category: []
         for category in QUOTAS
     }
     rejected: Counter[str] = Counter()
+    evidence_by_category: Counter[str] = Counter()
     seen_source_ids: set[str] = set()
     for record in evidence:
         source_id = str(record.get("source_id"))
         if source_id in seen_source_ids:
             raise ValueError(f"Duplicate evidence source_id: {source_id}")
         seen_source_ids.add(source_id)
+        category = str(record.get("category"))
+        if category not in accepted:
+            raise ValueError(f"Evidence has an unknown category: {category}")
+        evidence_by_category[category] += 1
         question_key = normalize_question(record.get("question"))
         if question_key in excluded_questions:
             rejected["materialize:question_in_existing_eval"] += 1
             continue
         valid, reason, audit = evaluate_evidence(record, tokenizer)
-        category = str(record.get("category"))
         if not valid:
             rejected[f"materialize:{category}:{reason}"] += 1
             continue
         accepted[category].append((record, audit))
 
-    selected: list[dict[str, Any]] = []
     used_questions: set[str] = set(excluded_questions)
+    chosen_by_category: dict[str, list[tuple[Mapping[str, Any],
+                                             dict[str, Any]]]] = {}
+    valid_after_visibility: dict[str, int] = {}
+    unique_available: dict[str, int] = {}
+    shortfalls: dict[str, dict[str, int]] = {}
     for category, split_quotas in QUOTAS.items():
         values = accepted[category]
         values.sort(key=lambda item: (item[1][
@@ -1047,23 +1174,47 @@ def select_catalog(
                 continue
             local_questions.add(question_key)
             unique.append((record, audit))
-            if len(unique) == needed:
-                break
-        if len(unique) != needed:
-            raise ValueError(
-                f"{category} has {len(unique)} valid unique samples; {needed} are required. "
-                f"Rejections: {dict(sorted(rejected.items()))}")
-        unique.sort(
+        valid_after_visibility[category] = len(values)
+        unique_available[category] = len(unique)
+        if len(unique) < needed:
+            shortfalls[category] = {
+                "available": len(unique),
+                "required": needed,
+                "missing": needed - len(unique),
+            }
+        chosen = unique[:needed]
+        chosen_by_category[category] = chosen
+        used_questions.update(
+            normalize_question(record["question"]) for record, _ in chosen)
+
+    stats = {
+        "evidence_by_category": {
+            category: evidence_by_category[category]
+            for category in QUOTAS
+        },
+        "valid_after_visibility": valid_after_visibility,
+        "unique_available": unique_available,
+        "selected_by_category": {
+            category: len(chosen_by_category[category])
+            for category in QUOTAS
+        },
+    }
+    if shortfalls:
+        raise SelectionQuotaError(shortfalls, rejected, stats)
+
+    selected: list[dict[str, Any]] = []
+    for category, split_quotas in QUOTAS.items():
+        chosen = chosen_by_category[category]
+        chosen.sort(
             key=lambda item: stable_key("split", str(item[0]["source_id"])))
         train_count = split_quotas["train"]
         assignments = (["train"] * train_count + ["val"] * split_quotas["val"])
-        for (record, audit), split in zip(unique, assignments):
+        for (record, audit), split in zip(chosen, assignments):
             catalog = _catalog_base(record, audit)
             catalog["output_split"] = split
             catalog["sample_id"] = record["source_id"]
             selected.append(catalog)
-            used_questions.add(normalize_question(record["question"]))
-    return selected, rejected
+    return selected, rejected, stats
 
 
 def make_record(catalog: Mapping[str, Any]) -> dict[str, Any]:
@@ -1175,6 +1326,103 @@ def _load_retrieval_contract(
     return ledger, evidence
 
 
+def _load_selection_funnel(local_dir: Path, ledger: Mapping[str, Any],
+                           expected_status: str) -> Mapping[str, Any]:
+    path = local_dir / SELECTION_FUNNEL_FILE
+    if not path.is_file() or path.is_symlink():
+        raise ValueError("Selection funnel must be a regular file")
+    _verify_sidecar(path)
+    raw = path.read_bytes()
+    funnel = json.loads(raw)
+    expected_keys = {
+        "schema_version", "selection_policy", "seed", "status", "stage",
+        "quotas", "candidate_limits", "retrieval_targets", "retrieval",
+        "materialize", "failure"
+    }
+    fixed = {
+        "schema_version": SCHEMA_VERSION,
+        "selection_policy": SELECTION_POLICY,
+        "seed": SEED,
+        "quotas": QUOTAS,
+        "candidate_limits": CANDIDATE_LIMITS,
+        "retrieval_targets": RETRIEVAL_TARGETS,
+    }
+    if (not isinstance(funnel, Mapping) or set(funnel) != expected_keys
+            or canonical_json_bytes(funnel) != raw
+            or funnel.get("status") != expected_status
+            or any(funnel.get(key) != value for key, value in fixed.items())):
+        raise ValueError("Selection funnel contract mismatch")
+    if expected_status == "retrieval_complete":
+        if (funnel.get("stage") != "retrieve"
+                or funnel.get("materialize") is not None
+                or funnel.get("failure") is not None):
+            raise ValueError("Retrieval selection funnel is not complete")
+    elif expected_status == "complete":
+        if (funnel.get("stage") != "materialize"
+                or not isinstance(funnel.get("materialize"), Mapping)
+                or funnel.get("failure") is not None):
+            raise ValueError("Materialized selection funnel is not complete")
+    else:
+        raise ValueError(
+            f"Unsupported selection funnel status: {expected_status}")
+
+    retrieval = funnel.get("retrieval")
+    retrieval_keys = {
+        "source_rows", "candidates_after_prescreen", "candidates_after_cap",
+        "candidates_truncated_by_cap", "candidate_items_queried",
+        "bm25_query_calls", "structurally_valid", "evidence_rows",
+        "candidate_order_sha256", "evidence_sha256", "rejection_counts"
+    }
+    if not isinstance(retrieval, Mapping) or set(retrieval) != retrieval_keys:
+        raise ValueError("Selection funnel retrieval schema mismatch")
+    category_fields = (
+        "candidates_after_prescreen",
+        "candidates_after_cap",
+        "candidates_truncated_by_cap",
+        "structurally_valid",
+    )
+    if any(not isinstance(retrieval.get(field), Mapping)
+           or set(retrieval[field]) != set(CANDIDATE_LIMITS) or not all(
+               type(value) is int and value >= 0
+               for value in retrieval[field].values())
+           for field in category_fields):
+        raise ValueError("Selection funnel category counts are invalid")
+    for category, limit in CANDIDATE_LIMITS.items():
+        prescreen = retrieval["candidates_after_prescreen"][category]
+        capped = retrieval["candidates_after_cap"][category]
+        truncated = retrieval["candidates_truncated_by_cap"][category]
+        if capped > limit or prescreen - capped != truncated:
+            raise ValueError(
+                "Selection funnel candidate cap counts are invalid")
+    source_rows = retrieval.get("source_rows")
+    counts = retrieval.get("rejection_counts")
+    if (not isinstance(source_rows, Mapping)
+            or set(source_rows) != {"nq", "hotpotqa"} or not all(
+                type(value) is int and value >= 0
+                for value in source_rows.values())
+            or not isinstance(counts, Mapping) or not all(
+                isinstance(key, str) and type(value) is int and value >= 0
+                for key, value in counts.items())):
+        raise ValueError("Selection funnel retrieval counts are invalid")
+    candidate_items = retrieval.get("candidate_items_queried")
+    query_calls = retrieval.get("bm25_query_calls")
+    if (type(candidate_items) is not int or type(query_calls) is not int
+            or query_calls < candidate_items
+            or candidate_items != ledger["candidate_queries"]
+            or retrieval.get("evidence_rows") != ledger["evidence_rows"]
+            or retrieval.get("evidence_sha256") != ledger["evidence_sha256"]
+            or retrieval.get("candidate_order_sha256")
+            != ledger["candidate_order_sha256"]
+            or retrieval.get("rejection_counts") != ledger["rejection_counts"]
+            or sum(retrieval["structurally_valid"].values())
+            != ledger["evidence_rows"]):
+        raise ValueError("Selection funnel disagrees with retrieval ledger")
+    if any(retrieval["structurally_valid"][category] < required
+           for category, required in RETRIEVAL_TARGETS.items()):
+        raise ValueError("Selection funnel does not meet retrieval targets")
+    return funnel
+
+
 def materialize(
     local_dir: Path,
     model_dir: Path,
@@ -1192,12 +1440,33 @@ def materialize(
         verify_source(local_dir, source)
     ledger_path = local_dir / RETRIEVAL_LEDGER_FILE
     evidence_path = local_dir / EVIDENCE_FILE
-    _, evidence = _load_retrieval_contract(local_dir)
+    ledger, evidence = _load_retrieval_contract(local_dir)
+    retrieval_funnel = _load_selection_funnel(local_dir, ledger,
+                                              "retrieval_complete")
     tokenizer = AutoTokenizer.from_pretrained(model_dir, local_files_only=True)
     excluded_questions, exclusions = _read_excluded_questions(
         eval_catalogs, eval_parquets)
-    catalog, rejection_counts = select_catalog(evidence, tokenizer,
-                                               excluded_questions)
+    try:
+        catalog, rejection_counts, selection_stats = select_catalog(
+            evidence, tokenizer, excluded_questions)
+    except SelectionQuotaError as error:
+        materialize_summary = {
+            **error.stats,
+            "evidence_rows": len(evidence),
+            "excluded_question_count": len(excluded_questions),
+            "rejection_counts": dict(sorted(error.rejection_counts.items())),
+        }
+        _write_selection_funnel(
+            local_dir,
+            _selection_funnel_payload("failed",
+                                      "materialize",
+                                      retrieval_funnel["retrieval"],
+                                      materialize=materialize_summary,
+                                      failure={
+                                          "stage": "materialize",
+                                          "shortfalls": error.shortfalls,
+                                      }))
+        raise
     catalog.sort(
         key=lambda item: stable_key("catalog", str(item["source_id"])))
 
@@ -1247,6 +1516,23 @@ def materialize(
             or val_questions & excluded_questions):
         raise ValueError(
             "Selected train/val questions overlap held-out questions")
+    materialize_summary = {
+        **selection_stats,
+        "evidence_rows": len(evidence),
+        "excluded_question_count": len(excluded_questions),
+        "rejection_counts": dict(sorted(rejection_counts.items())),
+    }
+    selection_funnel_path = _write_selection_funnel(
+        local_dir,
+        _selection_funnel_payload("complete",
+                                  "materialize",
+                                  retrieval_funnel["retrieval"],
+                                  materialize=materialize_summary))
+    artifacts["selection_funnel"] = {
+        "file": selection_funnel_path.name,
+        "bytes": selection_funnel_path.stat().st_size,
+        "sha256": sha256_file(selection_funnel_path),
+    }
     manifest = {
         "schema_version": SCHEMA_VERSION,
         "selection_policy": SELECTION_POLICY,
@@ -1370,6 +1656,7 @@ def verify_manifest(
         "exclusions": EXCLUSIONS_FILE,
         "retrieval_evidence": EVIDENCE_FILE,
         "retrieval_ledger": RETRIEVAL_LEDGER_FILE,
+        "selection_funnel": SELECTION_FUNNEL_FILE,
     }
     if (not isinstance(artifacts, Mapping)
             or set(artifacts) != set(expected_artifact_names)):
@@ -1391,7 +1678,8 @@ def verify_manifest(
             raise ValueError(f"Artifact identity mismatch: {path}")
         if "bytes" in artifact and path.stat().st_size != artifact["bytes"]:
             raise ValueError(f"Artifact byte count mismatch: {path}")
-    _, evidence = _load_retrieval_contract(local_dir)
+    ledger, evidence = _load_retrieval_contract(local_dir)
+    funnel = _load_selection_funnel(local_dir, ledger, "complete")
 
     exclusions_path = local_dir / EXCLUSIONS_FILE
     exclusions_raw = exclusions_path.read_bytes()
@@ -1416,8 +1704,8 @@ def verify_manifest(
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(model_dir, local_files_only=True)
-    recomputed, rejection_counts = select_catalog(evidence, tokenizer,
-                                                  set(excluded_list))
+    recomputed, rejection_counts, selection_stats = select_catalog(
+        evidence, tokenizer, set(excluded_list))
     recomputed.sort(
         key=lambda item: stable_key("catalog", str(item["source_id"])))
     catalog = read_canonical_jsonl(local_dir / CATALOG_FILE)
@@ -1426,6 +1714,15 @@ def verify_manifest(
     if manifest.get("materialize_rejection_counts") != dict(
             sorted(rejection_counts.items())):
         raise ValueError("Manifest rejection counts do not match reselection")
+    expected_materialize = {
+        **selection_stats,
+        "evidence_rows": len(evidence),
+        "excluded_question_count": len(excluded_list),
+        "rejection_counts": dict(sorted(rejection_counts.items())),
+    }
+    if funnel.get("materialize") != expected_materialize:
+        raise ValueError(
+            "Selection funnel does not match deterministic reselection")
     counts = Counter(
         (record["category"], record["output_split"]) for record in catalog)
     for category, split_quotas in QUOTAS.items():

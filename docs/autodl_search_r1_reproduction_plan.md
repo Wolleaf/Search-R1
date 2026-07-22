@@ -61,12 +61,14 @@
 
 | split | NQ 一搜充分 | Hotpot comparison | Hotpot bridge | 总数 |
 | --- | ---: | ---: | ---: | ---: |
-| train | 256 | 160 | 96 | 512 |
+| train | 192 | 200 | 120 | 512 |
 | val | 64 | 40 | 24 | 128 |
 
 val 中 64 道 Hotpot 题同时作为训练前及 R-mix 后的 held-out probe，不进入训练。现有 HotpotQA/2Wiki dev-256 继续作为独立最终多跳评测，不参与筛选或训练。
 
-这个配比不是随机拼接：一半 NQ 保留“一次搜索即可回答”的基线，避免模型把所有题都学成固定二搜；另一半 Hotpot 强制提供二搜才首次出现答案的训练机会。多跳部分以较容易探索的 comparison 为主（160），同时保留足够 bridge（96）检验能否从第一轮 observation 生成第二个 query。512 题配合 batch 8 的 60 steps 约等于单次遍历，不扩大数据量或做配比 sweep。
+训练集固定为 37.5% NQ 与 62.5% Hotpot，而不是原方案的 1:1。NQ 仍提供稳定的“一搜后作答”格式奖励，但降到 192 题，避免容易答对的单跳样本再次主导 GRPO；300 道 Hotpot 则明确增加二搜策略的学习机会。comparison:bridge 保持 5:3：comparison 更容易从问题直接构造第二 query，bridge 用来检验能否从第一轮 observation 提取桥接实体。按比例预期 60 steps 会看到约 180 个 NQ prompt（900 条轨迹）与 300 个 Hotpot prompt（1500 条轨迹），足以兼顾动作格式与多搜信号；不进一步降到 25% NQ，以免训练早期出现过多全错 Hotpot group。
+
+训练 DataLoader 使用固定 seed、全局 shuffle、无放回并 `drop_last=True`。`batch 8 × 60 steps = 480`，即实际消费 512 题中前 480 题（93.75%），留下 32 题未见；不为凑满一轮把训练改成 64 steps，也不做配比 sweep。每个 batch 只在期望上约为 3 个 NQ + 5 个 Hotpot，不强行做分层采样。
 
 ### 3.1 一搜充分标准
 
@@ -85,7 +87,9 @@ HotpotQA 候选必须恰好有两个不同 supporting titles，并满足：
 
 oracle query 和 supporting metadata 只进入审计 catalog，绝不写入 prompt。Parquet 每行只保留 `data_source`、`prompt`、`ability`、`reward_model` 和 `extra_info`，防止把 benchmark context 泄漏给模型。
 
-构建器必须输出 `train_512.parquet`、`val_128.parquet`、`probe_multi_64.parquet`、`catalog.jsonl`、筛选 ledger、`manifest.json` 及 SHA-256 sidecar。ledger 记录候选查询顺序摘要和拒绝计数，manifest 绑定源文件、BM25/corpus revision、tokenizer revision、top-k、长度配置及全部产物摘要；verify 从 pinned JSONL 重建 evidence 对应的 source record，并在固定 evidence 上重跑确定性选样，但不宣称离线重放全部未入选查询。最终入选 640 题仍须重放约 960 次 BM25 查询。现有 NQ test-128 与 HotpotQA/2Wiki dev-256 都作为 exclusion 输入，不能进入新 train/val。
+构建器必须输出 `train_512.parquet`、`val_128.parquet`、`probe_multi_64.parquet`、`catalog.jsonl`、筛选 ledger、`selection_funnel.json`、`manifest.json` 及 SHA-256 sidecar。漏斗按 category 固定记录 prescreen 后候选数、cap 后实际查询数、结构检索通过数、tokenizer 可见性通过数、去重后可用数、最终配额及全部拒绝原因；即使 retrieval 或 materialize 配额不足，也要先原子写出带 `status=failed`、失败阶段和差额的 receipt，再返回非零。成功漏斗作为 manifest artifact 固定，不能只留在终端日志。
+
+本轮不允许 comparison/bridge 静默互补，也不放宽单条标准。若 CPU 漏斗显示配额不足，先保留完整失败证据并停止；第一选择是在新 commit 下提高相应 candidate cap 后重建，只有 cap 仍不足时才显式登记新的配比或筛选 policy。manifest 继续绑定源文件、BM25/corpus revision、tokenizer revision、top-k、长度配置及全部产物摘要；verify 从 pinned JSONL 重建 evidence 对应的 source record，并在固定 evidence 上重跑确定性选样，但不宣称离线重放全部未入选查询。最终入选 640 题须重放 1024 次 BM25 查询（256 道 NQ 各一次，384 道 Hotpot 各两次）。现有 NQ test-128 与 HotpotQA/2Wiki dev-256 都作为 exclusion 输入，不能进入新 train/val。
 
 ## 4. 训练前行为探针
 
@@ -94,7 +98,7 @@ oracle query 和 supporting metadata 只进入审计 catalog，绝不写入 prom
 对 held-out Hotpot-64 每题按训练配置随机采样 5 条轨迹，共 320 条；`val_batch_size=8`，每批 40 条 rollout，不反向传播、不保存 checkpoint。有效正确多搜轨迹要求：
 
 - `EM=1`、`n_search>=2`、无截断、无非法动作；
-- 第二 query 与第一 query 不是近重复；
+- 第二 query 与第一 query 不是近重复：规范化 token set Jaccard `<0.8` 才通过，`>=0.8` 或空 query 均拒绝；
 - 第二轮带来新文档，并新增 supporting title 或让答案证据首次可见。
 
 只有同时满足以下条件才进入训练：
@@ -109,7 +113,11 @@ oracle query 和 supporting metadata 只进入审计 catalog，绝不写入 prom
 
 comparison/bridge 分层报告；至少 2 道 bridge 通过作为诊断目标，但首轮不设为硬门槛。probe NO-GO 是有效科学结果：停止长训练，不靠增加步数掩盖缺少探索轨迹的问题。
 
+额外预注册 near-miss，但不改变上述 strict EM 门槛：`EM=0`，其余正确多搜条件全部满足。报告 near-miss 轨迹数、覆盖题数、comparison/bridge 分层、确定性的 cover-EM 及示例轨迹；cover-EM 定义为规范化后 prediction 与任一 gold alias 在 token 边界上双向包含，只用于发现过长或过短答案（如 `writ` 与 `writ of certiorari`），不参与奖励或 GO。若 strict gate 为 NO-GO 且 near-miss `>=16/320`，结论标为“存在检索链，优先诊断答案抽取/格式”；否则标为“正确多搜探索仍缺失”。
+
 实现上只有 `data.eval_group_size=5` 的 probe 会复制样本并设置 `do_sample=True`；默认值 1 继续使用原有贪心评测。每条 probe trace 都带 `group_uid/group_slot/group_size`，并保存完整思考、query、检索文档、答案、截断及非法动作。分析产物固定包含机器可读 summary、逐题与逐轨迹 JSONL；科学 NO-GO 返回正常完成状态，只有 schema、digest 或基数错误才是工程失败。
+
+group size 保持 5。改成 8 会把每 step rollout 从 40 条增至 64 条、成本提高 60%，却不能创造基座原本不存在的二搜能力；当前能力门槛要求至少 8/64 个 learnable group（12.5%），已经高于评审建议的 10% 边界。只有后续实测明确显示“有二搜正确轨迹但组内对比过稀”时，才把 group 8 作为独立实验，而不是本轮默认参数。
 
 ## 5. 能力训练与成本分叉
 
@@ -132,6 +140,10 @@ C-gated-mix:         r = EM * (1 - 0.10 * c)
 
 `correct_only` 使答错轨迹始终为 0，不再出现“搜索后答错比不搜索答错更差”的直接梯度。B/C 除奖励模式外必须共享 parent digest、数据顺序、seed、batch、group、长度、检索器和训练步数。
 
+成本对比的预期来源也固定：NQ 主要学习把多余的 2/3/4 搜降到必要的 1 搜，Hotpot 主要把 3/4 搜降到必要的 2 搜，而不是把必须二搜的 Hotpot 降成一搜。R-mix 后必须记录正确轨迹的搜索次数对构成（`1 vs 2`、`2 vs 3`、`2 vs 4` 等）；若 8/64 cost-contrast 门槛未过，应报告“当前 parent 没有可学习成本信号”，不归因于工程失败，也不启动 B/C。
+
+R-mix 入口实现时必须按 `data_source` 每 step 记录 EM、平均 `n_search`、no-search ratio 和全错 group ratio，并额外输出 10-step rolling 值。Hotpot rolling `n_search<1.5` 只落盘为单搜坍缩预警，不自动提前停止，也不采用“连续 10 步严格单调下降”这种对噪声过敏的规则；完整 60 steps 结束后再结合 Hotpot EM 与全错 group ratio 归因。
+
 成功标准预注册为：C 相对 B 在共同答对题中的平均搜索量下降至少 10%，总体 EM 下降不超过 3 个百分点，统一 utility 提升，且多搜题不发生 no-search collapse。未达到也作为完整负结果保留。
 
 ## 6. 三阶段执行
@@ -147,8 +159,8 @@ C-gated-mix:         r = EM * (1 - 0.10 * c)
 新 commit 和新数据都会使旧 `cpu_handoff.json` 失效。CPU 阶段必须：
 
 1. 验证源文件、旧资产和 checkout identity。
-2. 用 retriever venv 生成 BM25 evidence，再用 train venv 和 Qwen tokenizer 做 384-token 可见性筛选及 Parquet materialize；最后用 retriever venv 重放所有入选查询。
-3. 验证 train/val/既有测试题零重叠、Parquet 无 metadata/context 泄漏、manifest 可重算。
+2. 用 retriever venv 生成 BM25 evidence，并先检查 `selection_funnel.json` 的 retrieval 产量；再用 train venv 和 Qwen tokenizer 做 384-token 可见性筛选及 Parquet materialize，最后用 retriever venv 重放所有入选查询。
+3. 验证固定配额、完整筛选漏斗、train/val/既有测试题零重叠、Parquet 无 metadata/context 泄漏、manifest 可重算。
 4. 组合 1/2 GPU resolved configs，精确断言 response 500、prompt 4096、turns 4、top-k 3。
 5. 运行测试后发布新的自校验 handoff。
 

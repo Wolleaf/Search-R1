@@ -31,6 +31,10 @@ SMALL_QUOTAS = {
         "val": 1
     },
 }
+SMALL_RETRIEVAL_TARGETS = {
+    "comparison": 4,
+    "bridge": 2,
+}
 
 
 class CharacterTokenizer:
@@ -141,6 +145,32 @@ def _small_evidence():
     return evidence
 
 
+def test_registered_mix_uses_hotpot_majority_without_changing_probe():
+    assert search_mix.SCHEMA_VERSION == 2
+    assert search_mix.QUOTAS == {
+        "single": {
+            "train": 192,
+            "val": 64
+        },
+        "comparison": {
+            "train": 200,
+            "val": 40
+        },
+        "bridge": {
+            "train": 120,
+            "val": 24
+        },
+    }
+    assert search_mix.RETRIEVAL_TARGETS == {
+        "comparison": 240,
+        "bridge": 144,
+    }
+    assert sum(category["train"]
+               for category in search_mix.QUOTAS.values()) == 512
+    assert sum(category["val"]
+               for category in search_mix.QUOTAS.values()) == 128
+
+
 def test_candidate_accepts_nq_comparison_and_bridge():
     nq = search_mix._candidate(
         "nq", 7, {
@@ -168,8 +198,31 @@ def test_retrieve_evidence_scans_all_capped_candidates(tmp_path, monkeypatch):
 
     def fake_collect(_rows, source, _limits):
         if source == "nq":
-            return {"single": []}, Counter()
-        return {"comparison": comparison, "bridge": bridge}, Counter()
+            return {
+                "single": []
+            }, Counter(), {
+                "source_rows": 0,
+                "candidates_after_prescreen": {
+                    "single": 0
+                },
+                "candidates_after_cap": {
+                    "single": 0
+                },
+            }
+        return {
+            "comparison": comparison,
+            "bridge": bridge
+        }, Counter(), {
+            "source_rows": len(comparison) + len(bridge),
+            "candidates_after_prescreen": {
+                "comparison": len(comparison),
+                "bridge": len(bridge),
+            },
+            "candidates_after_cap": {
+                "comparison": len(comparison),
+                "bridge": len(bridge),
+            },
+        }
 
     results = {}
     for candidate in comparison + bridge:
@@ -224,6 +277,74 @@ def test_retrieve_evidence_scans_all_capped_candidates(tmp_path, monkeypatch):
     assert {candidate["question"]
             for candidate in comparison}.issubset({call[0]
                                                    for call in calls})
+
+
+def test_retrieval_quota_failure_writes_structured_funnel(
+        tmp_path, monkeypatch):
+
+    def fake_collect(_rows, source, _limits):
+        categories = ["single"] if source == "nq" else ["comparison", "bridge"]
+        return {
+            category: []
+            for category in categories
+        }, Counter(), {
+            "source_rows": 0,
+            "candidates_after_prescreen": {
+                category: 0
+                for category in categories
+            },
+            "candidates_after_cap": {
+                category: 0
+                for category in categories
+            },
+        }
+
+    class FakeRetriever:
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def search(self, *_args, **_kwargs):
+            raise AssertionError("No candidates should trigger retrieval")
+
+    from search_r1.search import bm25_server
+
+    monkeypatch.setattr(search_mix, "JsonlRows", lambda _path: object())
+    monkeypatch.setattr(search_mix, "verify_source",
+                        lambda _local_dir, source: tmp_path / source)
+    monkeypatch.setattr(search_mix, "collect_candidates", fake_collect)
+    monkeypatch.setattr(search_mix, "RETRIEVAL_TARGETS", {
+        "comparison": 1,
+        "bridge": 1,
+    })
+    monkeypatch.setattr(bm25_server, "BM25Retriever", FakeRetriever)
+
+    with pytest.raises(ValueError, match="Retrieval quota shortfall"):
+        search_mix.retrieve_evidence(tmp_path, tmp_path / "index",
+                                     tmp_path / "corpus", tmp_path / "offsets")
+
+    funnel_path = tmp_path / search_mix.SELECTION_FUNNEL_FILE
+    funnel = json.loads(funnel_path.read_bytes())
+    assert funnel["status"] == "failed"
+    assert funnel["stage"] == "retrieve"
+    assert funnel["failure"] == {
+        "stage": "retrieve",
+        "shortfalls": {
+            "bridge": {
+                "available": 0,
+                "required": 1,
+                "missing": 1,
+            },
+            "comparison": {
+                "available": 0,
+                "required": 1,
+                "missing": 1,
+            },
+        },
+    }
+    assert funnel["retrieval"]["candidate_items_queried"] == 0
+    assert not (tmp_path / search_mix.EVIDENCE_FILE).exists()
+    search_mix._verify_sidecar(funnel_path)
 
 
 @pytest.mark.parametrize(
@@ -401,9 +522,8 @@ def test_evaluate_evidence_binds_visible_evidence_to_new_supporting_doc():
 
 def test_quota_split_builds_fixed_multihop_probe(monkeypatch):
     monkeypatch.setattr(search_mix, "QUOTAS", deepcopy(SMALL_QUOTAS))
-    catalog, rejected = search_mix.select_catalog(_small_evidence(),
-                                                  CharacterTokenizer(),
-                                                  excluded_questions=set())
+    catalog, rejected, stats = search_mix.select_catalog(
+        _small_evidence(), CharacterTokenizer(), excluded_questions=set())
 
     counts = Counter(
         (record["category"], record["output_split"]) for record in catalog)
@@ -416,6 +536,10 @@ def test_quota_split_builds_fixed_multihop_probe(monkeypatch):
 
     assert counts == expected
     assert rejected == Counter()
+    assert stats["selected_by_category"] == {
+        category: sum(quotas.values())
+        for category, quotas in SMALL_QUOTAS.items()
+    }
     assert len(probe) == 3
     assert all(record["extra_info"]["split"] == "train" for record in probe)
     expected_probe_indices = {
@@ -430,9 +554,9 @@ def test_quota_split_builds_fixed_multihop_probe(monkeypatch):
 
 def test_output_records_expose_only_five_trainer_fields(monkeypatch):
     monkeypatch.setattr(search_mix, "QUOTAS", deepcopy(SMALL_QUOTAS))
-    catalog, _ = search_mix.select_catalog(_small_evidence(),
-                                           CharacterTokenizer(),
-                                           excluded_questions=set())
+    catalog, _, _ = search_mix.select_catalog(_small_evidence(),
+                                              CharacterTokenizer(),
+                                              excluded_questions=set())
     private_fields = {
         "category",
         "supporting_titles",
@@ -503,6 +627,8 @@ def _write_json_rows(path, rows):
 
 def _build_manifest_fixture(tmp_path, monkeypatch):
     monkeypatch.setattr(search_mix, "QUOTAS", deepcopy(SMALL_QUOTAS))
+    monkeypatch.setattr(search_mix, "RETRIEVAL_TARGETS",
+                        deepcopy(SMALL_RETRIEVAL_TARGETS))
     monkeypatch.setattr(search_mix, "verify_source",
                         lambda local_dir, source: Path(local_dir) / source)
     monkeypatch.setattr(search_mix, "validate_evidence_sources",
@@ -523,7 +649,7 @@ def _build_manifest_fixture(tmp_path, monkeypatch):
     model_dir.mkdir()
 
     evidence = _small_evidence()
-    catalog, rejection_counts = search_mix.select_catalog(
+    catalog, rejection_counts, selection_stats = search_mix.select_catalog(
         evidence, CharacterTokenizer(), excluded_questions=set())
     catalog.sort(
         key=lambda item: search_mix.stable_key("catalog", item["source_id"]))
@@ -552,6 +678,39 @@ def _build_manifest_fixture(tmp_path, monkeypatch):
     ledger_path = tmp_path / search_mix.RETRIEVAL_LEDGER_FILE
     ledger_path.write_bytes(search_mix.canonical_json_bytes(ledger))
     search_mix.write_digest_sidecar(ledger_path)
+
+    retrieval_summary = {
+        "source_rows": {
+            "nq": 3,
+            "hotpotqa": 6,
+        },
+        "candidates_after_prescreen": {
+            "single": 3,
+            "comparison": 4,
+            "bridge": 2,
+        },
+        "candidates_after_cap": {
+            "single": 3,
+            "comparison": 4,
+            "bridge": 2,
+        },
+        "candidates_truncated_by_cap": {
+            "single": 0,
+            "comparison": 0,
+            "bridge": 0,
+        },
+        "candidate_items_queried": len(evidence),
+        "bm25_query_calls": 15,
+        "structurally_valid": {
+            "single": 3,
+            "comparison": 4,
+            "bridge": 2,
+        },
+        "evidence_rows": len(evidence),
+        "candidate_order_sha256": "0" * 64,
+        "evidence_sha256": search_mix.sha256_file(evidence_path),
+        "rejection_counts": {},
+    }
 
     catalog_path = tmp_path / search_mix.CATALOG_FILE
     catalog_path.write_bytes(b"".join(
@@ -591,6 +750,24 @@ def _build_manifest_fixture(tmp_path, monkeypatch):
             "bytes": path.stat().st_size,
             "sha256": search_mix.sha256_file(path),
         }
+
+    funnel_path = search_mix._write_selection_funnel(
+        tmp_path,
+        search_mix._selection_funnel_payload(
+            "complete",
+            "materialize",
+            retrieval_summary,
+            materialize={
+                **selection_stats,
+                "evidence_rows": len(evidence),
+                "excluded_question_count": 0,
+                "rejection_counts": dict(sorted(rejection_counts.items())),
+            }))
+    artifacts["selection_funnel"] = {
+        "file": funnel_path.name,
+        "bytes": funnel_path.stat().st_size,
+        "sha256": search_mix.sha256_file(funnel_path),
+    }
 
     manifest = {
         "schema_version": search_mix.SCHEMA_VERSION,
@@ -638,6 +815,7 @@ def _build_manifest_fixture(tmp_path, monkeypatch):
         "catalog": catalog_path,
         "evidence": evidence_path,
         "ledger": ledger_path,
+        "funnel": funnel_path,
         "model_dir": model_dir,
     }
 
@@ -650,6 +828,44 @@ def _rewrite_manifest_artifact(manifest_path, label, artifact_path):
         manifest["artifacts"][label]["bytes"] = artifact_path.stat().st_size
     manifest_path.write_bytes(search_mix.canonical_json_bytes(manifest))
     search_mix.write_digest_sidecar(manifest_path)
+
+
+def test_materialize_quota_failure_replaces_funnel_with_receipt(
+        tmp_path, monkeypatch):
+    paths = _build_manifest_fixture(tmp_path, monkeypatch)
+    complete_funnel = json.loads(paths["funnel"].read_bytes())
+    impossible_quotas = deepcopy(SMALL_QUOTAS)
+    impossible_quotas["single"]["train"] = 3
+    monkeypatch.setattr(search_mix, "QUOTAS", impossible_quotas)
+    search_mix._write_selection_funnel(
+        tmp_path,
+        search_mix._selection_funnel_payload("retrieval_complete", "retrieve",
+                                             complete_funnel["retrieval"]))
+
+    with pytest.raises(search_mix.SelectionQuotaError,
+                       match="Materialization quota shortfall"):
+        search_mix.materialize(tmp_path, paths["model_dir"])
+
+    failed = json.loads(paths["funnel"].read_bytes())
+    assert failed["status"] == "failed"
+    assert failed["stage"] == "materialize"
+    assert failed["failure"] == {
+        "stage": "materialize",
+        "shortfalls": {
+            "single": {
+                "available": 3,
+                "required": 4,
+                "missing": 1,
+            }
+        },
+    }
+    assert failed["materialize"]["valid_after_visibility"] == {
+        "single": 3,
+        "comparison": 4,
+        "bridge": 2,
+    }
+    assert failed["materialize"]["selected_by_category"]["single"] == 3
+    search_mix._verify_sidecar(paths["funnel"])
 
 
 def _selected_replay_steps(paths):
@@ -828,9 +1044,16 @@ def test_coordinated_evidence_hash_updates_still_fail_reselection(
     paths["ledger"].write_bytes(search_mix.canonical_json_bytes(ledger))
     search_mix.write_digest_sidecar(paths["ledger"])
 
+    funnel = json.loads(paths["funnel"].read_bytes())
+    funnel["retrieval"]["evidence_sha256"] = search_mix.sha256_file(
+        paths["evidence"])
+    paths["funnel"].write_bytes(search_mix.canonical_json_bytes(funnel))
+    search_mix.write_digest_sidecar(paths["funnel"])
+
     manifest = json.loads(paths["manifest"].read_bytes())
     for label, path in (("retrieval_evidence", paths["evidence"]),
-                        ("retrieval_ledger", paths["ledger"])):
+                        ("retrieval_ledger", paths["ledger"]),
+                        ("selection_funnel", paths["funnel"])):
         manifest["artifacts"][label]["sha256"] = search_mix.sha256_file(path)
         manifest["artifacts"][label]["bytes"] = path.stat().st_size
     manifest["retrieval"]["ledger_sha256"] = search_mix.sha256_file(
