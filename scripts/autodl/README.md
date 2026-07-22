@@ -39,6 +39,15 @@ bash /root/autodl-tmp/search-r1/checkout/scripts/autodl/02_cpu_prepare.sh
 
 该路径先校验旧 handoff 的全部 digest、两个 Python 环境 freeze、Java、模型/数据/索引/语料，再运行新增测试与配置组合，最后按新 commit 发布 handoff。任何旧证据或资产不一致都会失败关闭；不要退回联网重建来掩盖不一致。
 
+搜索机会门首次加入 HotpotQA/2Wiki 数据时，不需要重装环境或重下模型、语料和索引。使用联网的无卡实例运行专用增量模式：
+
+```bash
+AUTODL_SEARCH_GATE_INCREMENTAL=1 \
+bash /root/autodl-tmp/search-r1/checkout/scripts/autodl/02_cpu_prepare.sh
+```
+
+它先验证旧 handoff，然后只下载固定 revision 的两个 dev JSONL（不下载 train），逐文件校验固定字节数与 SHA-256，各抽取 128 题并生成一个 256 行评测文件；verify 会从原始 JSONL 按固定 seed 重算选择并逐题核对 catalog。下载完成后立即恢复离线模式，运行测试、组合配置并按新 commit 重封 handoff。`supporting title` 数量只作为多跳证据代理，不代表题目理论上需要几次搜索。
+
 ### 3. GPU 离线训练
 
 当前两卡实例的正常命令为：
@@ -68,6 +77,21 @@ bash /root/autodl-tmp/search-r1/checkout/scripts/autodl/05_gpu_cost_aware_gated.
 该入口校验旧 `runs/comparison/lineage.tsv` 及 R/B/C-old checkpoint digest；从同一 R60 运行 2-step C-gated 日志 gate，成功后删除 gate 权重；再从 R60 全新训练固定 C-gated20。B 和 C-old 只做 trace-only test-128 推理，不更新权重；最后评测 C-gated，严格校验 `80/800/128` 轨迹行数和 manifest，并生成三路逐题配对、答对/答错清单、搜索转移、独立训练 CSV/SVG 曲线。旧 `runs/comparison`、`manifests/gpu.ok` 和历史 C-old 证据不会被覆盖。
 
 follow-up 的分项硬上限是 gate 8 元、正式训练 25 元、三路评测各 5 元，合计 48 元。它只限制失控运行，不代表预计支出；不做 val EM 科学早停，只有工程错误或证据校验失败才停止。
+
+### 多跳搜索机会门（只评测）
+
+在决定是否再训练新的成本分支前，先只评测已保存的 B/control20：
+
+```bash
+GPU_COUNT=2 AUTODL_PRICE_PER_HOUR=5.76 \
+bash /root/autodl-tmp/search-r1/checkout/scripts/autodl/06_gpu_search_opportunity_gate.sh
+```
+
+该入口不训练、不改 checkpoint，也不重复评测 R/C。它只加载一次 B，在 HotpotQA dev-128 与 2WikiMultiHopQA dev-128 上连续推理，保留 256 条完整轨迹，并按数据集、题型、难度和 supporting-title-count 分层统计 EM、搜索 0/1/2/3/4 次分布、`E[S|correct]`、截断和非法动作。离线分析还会列出重复 query、无新增文档或答案早已出现的“冗余候选”；这些是可观察代理，不是删除某次搜索后的反事实证明。
+
+默认只有同时满足以下条件才建议继续花钱训练：B 至少答对 20 题；答对题中至少 8 题且至少 20% 使用两次以上搜索；全体至少 10 题使用三次以上搜索；至少 5 个 strong/medium 冗余候选且占三搜题 30%；截断率和非法动作率均不超过 5%。结果写入 `runs/search-opportunity-gate/attempts/<gpu-attempt>/`。GO/NO-GO 都是成功完成的科学结果，不会因 NO-GO 自动重试。单次评测硬上限为 10 元；按 5.76 元/小时计算约 104 分钟，只是防失控上限，不是预计耗时或支出。
+
+GO 只表示值得进入下一阶段，不能直接在 NQ 上只重训一个 C。后续若继续，必须从未见过的 HotpotQA/2Wiki train split 固定小训练集，并从同一 parent 对称训练原奖励 `B-multihop` 与成本奖励 `C-multihop`，最后仍在本次固定 dev-256 上比较，以隔离奖励函数而不是数据暴露差异。
 
 ## 固定配置与回退
 
@@ -101,7 +125,7 @@ bash /root/autodl-tmp/search-r1/checkout/scripts/autodl/04_watch_and_shutdown.sh
 tail -f "$attempt/shutdown-watchdog.log"
 ```
 
-watchdog 同时支持成功和失败终态，但只有在 commit/checkout、持久盘、exact attempt、phase lock、原始 exit code、唯一终态 marker 和日志 sentinel 全部重新验证后才会调用 AutoDL 的 `/usr/bin/shutdown`（无参数）。旧流程成功时校验 `comparison.sha256`、results、`gpu.ok` 和 attempt digest；C-gated follow-up 则校验独立 result root 的全部 `evidence.sha256` 条目、新 marker 和 attempt digest，不借用或改写旧 `gpu.ok`。锁冲突、状态不完整、校验失败或 dry-run 会保持开机并记录 `shutdown-skipped`；test mode 只记录模拟状态，绝不调用真实 backend。`shutdown-requested` 表示即将调用 backend，`shutdown-dispatched` 只表示 backend 已返回 0，两者都不能证明 AutoDL 控制平面已停止。无论 watchdog 结果如何，仍须在 AutoDL 控制台确认实例已停止且不再计费；SSH 断开本身不能证明停止计费。
+watchdog 同时支持成功和失败终态，但只有在 commit/checkout、持久盘、exact attempt、phase lock、原始 exit code、唯一终态 marker 和日志 sentinel 全部重新验证后才会调用 AutoDL 的 `/usr/bin/shutdown`（无参数）。旧流程成功时校验 `comparison.sha256`、results、`gpu.ok` 和 attempt digest；C-gated follow-up 与搜索机会门分别校验各自独立 result root 的全部 `evidence.sha256` 条目、新 marker 和 attempt digest，不借用或改写旧 `gpu.ok`。锁冲突、状态不完整、校验失败或 dry-run 会保持开机并记录 `shutdown-skipped`；test mode 只记录模拟状态，绝不调用真实 backend。`shutdown-requested` 表示即将调用 backend，`shutdown-dispatched` 只表示 backend 已返回 0，两者都不能证明 AutoDL 控制平面已停止。无论 watchdog 结果如何，仍须在 AutoDL 控制台确认实例已停止且不再计费；SSH 断开本身不能证明停止计费。
 
 ## CPU 后处理
 

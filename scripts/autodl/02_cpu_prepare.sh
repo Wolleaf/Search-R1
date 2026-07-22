@@ -17,6 +17,7 @@ RETRIEVER_ENV="$PROJECT_ROOT/envs/retriever"
 CACHE_ROOT="$PROJECT_ROOT/cache"
 DATA_ROOT="$PROJECT_ROOT/data"
 SMALL_DATA_DIR="$DATA_ROOT/nq_small"
+SEARCH_GATE_DATA_DIR="$DATA_ROOT/search_opportunity_gate"
 BM25_ROOT="$DATA_ROOT/wiki-18-bm25-index"
 CORPUS_SOURCE_ROOT="$DATA_ROOT/wiki-18-corpus-source"
 CORPUS_ROOT="$DATA_ROOT/wiki-18-corpus"
@@ -85,7 +86,23 @@ cpu_action() {
     rm -f -- "$MANIFEST_DIR/cpu.ok"
     sync_path "$MANIFEST_DIR"
 
-    if [[ "${AUTODL_RESEAL_ONLY:-0}" == 1 ]]; then
+    [[ "${AUTODL_RESEAL_ONLY:-0}" == 0 || "${AUTODL_RESEAL_ONLY:-0}" == 1 ]] || {
+        printf 'AUTODL_RESEAL_ONLY must be 0 or 1.\n' >&2
+        return 64
+    }
+    [[ "${AUTODL_SEARCH_GATE_INCREMENTAL:-0}" == 0 ||
+        "${AUTODL_SEARCH_GATE_INCREMENTAL:-0}" == 1 ]] || {
+        printf 'AUTODL_SEARCH_GATE_INCREMENTAL must be 0 or 1.\n' >&2
+        return 64
+    }
+    if [[ "${AUTODL_RESEAL_ONLY:-0}" == 1 &&
+          "${AUTODL_SEARCH_GATE_INCREMENTAL:-0}" == 1 ]]; then
+        printf 'Choose either offline reseal or search-gate incremental preparation, not both.\n' >&2
+        return 64
+    fi
+
+    if [[ "${AUTODL_RESEAL_ONLY:-0}" == 1 ||
+          "${AUTODL_SEARCH_GATE_INCREMENTAL:-0}" == 1 ]]; then
         export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1 PIP_NO_INDEX=1
         train_python="$TRAIN_ENV/bin/python"
         retriever_python="$RETRIEVER_ENV/bin/python"
@@ -128,6 +145,12 @@ PY
             printf 'OpenJDK 21 is required by Pyserini 1.1.\n' >&2
             return 1
         }
+        if [[ "${AUTODL_SEARCH_GATE_INCREMENTAL:-0}" == 1 ]]; then
+            unset HF_HUB_OFFLINE TRANSFORMERS_OFFLINE HF_DATASETS_OFFLINE
+            "$train_python" "$CHECKOUT_DIR/scripts/data_process/multihop_search_gate.py" build \
+                --local-dir "$SEARCH_GATE_DATA_DIR"
+            export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1
+        fi
     elif [[ "${AUTODL_RESEAL_ONLY:-0}" == 0 ]]; then
         base_python="$(resolve_llmdevelop_python)"
         [[ -x "$base_python" ]] || {
@@ -211,9 +234,8 @@ PY
         --train-size 512 \
         --val-size 64 \
         --test-size 128
-    else
-        printf 'AUTODL_RESEAL_ONLY must be 0 or 1.\n' >&2
-        return 64
+        "$train_python" "$CHECKOUT_DIR/scripts/data_process/multihop_search_gate.py" build \
+            --local-dir "$SEARCH_GATE_DATA_DIR"
     fi
 
     "$train_python" - "$MODEL_DIR" "$SMALL_DATA_DIR" <<'PY'
@@ -237,6 +259,8 @@ manifest = json.loads((data_dir / "manifest.json").read_text())
 if not manifest["overlap_checks"]["passed"]:
     raise SystemExit("NQ split overlap validation failed")
 PY
+    "$train_python" "$CHECKOUT_DIR/scripts/data_process/multihop_search_gate.py" verify \
+        --manifest "$SEARCH_GATE_DATA_DIR/manifest.json"
 
     PYTHONPATH="$CHECKOUT_DIR" "$retriever_python" - \
         "$BM25_ROOT/bm25" "$CORPUS_JSONL" "$CORPUS_OFFSETS" <<'PY'
@@ -258,9 +282,11 @@ PY
     PYTHON_BIN="$train_python" bash "$CHECKOUT_DIR/scripts/autodl/tests/test_runtime.sh"
     bash "$CHECKOUT_DIR/scripts/autodl/tests/test_gated_config.sh"
     bash "$CHECKOUT_DIR/scripts/autodl/tests/test_gated_followup.sh"
+    bash "$CHECKOUT_DIR/scripts/autodl/tests/test_search_opportunity_pipeline.sh"
     bash "$CHECKOUT_DIR/scripts/autodl/tests/test_shutdown_watchdog.sh"
     "$train_python" "$CHECKOUT_DIR/scripts/autodl/tests/test_results.py"
     "$train_python" "$CHECKOUT_DIR/scripts/autodl/tests/test_paired_eval.py"
+    "$train_python" "$CHECKOUT_DIR/scripts/autodl/tests/test_search_opportunity_gate.py"
     "$train_python" "$CHECKOUT_DIR/scripts/autodl/tests/test_export_gated_training.py"
     "$train_python" - "$CHECKOUT_DIR" <<'PY'
 from pathlib import Path
@@ -288,7 +314,8 @@ PY
             "eval|reproduced||$parent_placeholder" \
             "eval|control||$parent_placeholder" \
             "eval|cost_aware||$parent_placeholder" \
-            "eval|cost_aware_gated||$parent_placeholder"; do
+            "eval|cost_aware_gated||$parent_placeholder" \
+            "eval|search_opportunity||$parent_placeholder"; do
             IFS='|' read -r mode variant steps model_path <<<"$spec"
             command_args=("$mode" "$variant")
             case "$mode:$variant" in
@@ -306,7 +333,8 @@ PY
             trace_stage=''
             trace_checkpoint_digest=''
             trace_parent_digest=''
-            if [[ "$variant" == cost_aware_gated ]]; then
+            eval_data_file=''
+            if [[ "$variant" == cost_aware_gated || "$variant" == search_opportunity ]]; then
                 trace_output="$trace_placeholder"
                 trace_stage="$variant"
                 if [[ "$mode" == eval ]]; then
@@ -315,10 +343,14 @@ PY
                     trace_parent_digest="$trace_digest_placeholder"
                 fi
             fi
+            if [[ "$variant" == search_opportunity ]]; then
+                eval_data_file="$SEARCH_GATE_DATA_DIR/eval_256.parquet"
+            fi
             AUTODL_CONFIG_ONLY=1 \
                 AUTODL_ROOT="$PROJECT_ROOT" \
                 GPU_COUNT="$gpu_count" \
                 OUTPUT_DIR="$config_output_dir" \
+                EVAL_DATA_FILE="$eval_data_file" \
                 TRACE_OUTPUT_DIR="$trace_output" \
                 TRACE_STAGE="$trace_stage" \
                 TRACE_RUN_ID=config-compose \
@@ -358,16 +390,22 @@ PY
         "$MANIFEST_DIR" \
         "$MODEL_DIR" \
         "$parent_placeholder" \
-        "$trace_placeholder" <<'PY'
+        "$trace_placeholder" \
+        "$SEARCH_GATE_DATA_DIR/eval_256.parquet" <<'PY'
 from copy import deepcopy
 from pathlib import Path
 import sys
 
 from omegaconf import OmegaConf
 
-manifest_dir, model_dir, parent_placeholder, trace_placeholder = map(Path, sys.argv[1:])
+manifest_dir, model_dir, parent_placeholder, trace_placeholder, search_gate_data = map(
+    Path, sys.argv[1:]
+)
 train_variants = ("smoke", "reproduce", "control", "cost_aware", "cost_aware_gated")
-eval_variants = ("base", "reproduced", "control", "cost_aware", "cost_aware_gated")
+eval_variants = (
+    "base", "reproduced", "control", "cost_aware", "cost_aware_gated",
+    "search_opportunity",
+)
 
 for gpu_count in (1, 2):
     configs = {}
@@ -377,7 +415,7 @@ for gpu_count in (1, 2):
             config = OmegaConf.load(path)
             configs[(mode, variant)] = config
             trace_output = config.trainer.get("trace_output_dir", None)
-            if variant == "cost_aware_gated":
+            if variant in ("cost_aware_gated", "search_opportunity"):
                 if Path(trace_output) != trace_placeholder:
                     raise SystemExit(f"trace output placeholder mismatch in {path}")
             elif trace_output:
@@ -510,6 +548,11 @@ for gpu_count in (1, 2):
                 or config.algorithm.cost_reward_mode != "linear"
                 or not config.trainer.val_only):
             raise SystemExit(f"evaluation contract mismatch for {variant}")
+        expected_val = search_gate_data if variant == "search_opportunity" else Path(
+            configs[("eval", "control")].data.val_files
+        )
+        if Path(config.data.val_files) != expected_val:
+            raise SystemExit(f"evaluation data path mismatch for {variant}")
 PY
 
     "$train_python" -m pip freeze --all >"$MANIFEST_DIR/train-freeze.txt"
@@ -555,6 +598,14 @@ PY
         --extra-file "$MANIFEST_DIR/config-2gpu-cost_aware_gated-eval.yaml" \
         --extra-file "$MANIFEST_DIR/config-2gpu-control-trace-eval.yaml" \
         --extra-file "$MANIFEST_DIR/config-2gpu-cost_aware-trace-eval.yaml" \
+        --extra-file "$SEARCH_GATE_DATA_DIR/eval_256.parquet" \
+        --extra-file "$SEARCH_GATE_DATA_DIR/catalog.jsonl" \
+        --extra-file "$SEARCH_GATE_DATA_DIR/manifest.json" \
+        --extra-file "$SEARCH_GATE_DATA_DIR/manifest.json.sha256" \
+        --extra-file "$SEARCH_GATE_DATA_DIR/sources/hotpotqa/dev.jsonl" \
+        --extra-file "$SEARCH_GATE_DATA_DIR/sources/2wikimultihopqa/dev.jsonl" \
+        --extra-file "$MANIFEST_DIR/config-1gpu-search_opportunity-eval.yaml" \
+        --extra-file "$MANIFEST_DIR/config-2gpu-search_opportunity-eval.yaml" \
         --python-version "$python_version" \
         --torch-version "$torch_version" \
         --output "$HANDOFF"

@@ -8,6 +8,7 @@ trap 'rm -rf -- "$ROOT"' EXIT
 
 mkdir -p "$ROOT/envs/train/bin" "$ROOT/models/Qwen3.5-2B" "$ROOT/data/nq_small" \
     "$ROOT/parent-checkpoint" "$ROOT/output" "$ROOT/traces"
+printf 'parquet-placeholder\n' >"$ROOT/data/search-opportunity.parquet"
 ln -s "$CHECKOUT" "$ROOT/checkout"
 cat >"$ROOT/envs/train/bin/python" <<'SH'
 #!/usr/bin/env bash
@@ -43,6 +44,31 @@ env "${COMMON[@]}" \
 grep -Fxq -- '++algorithm.cost_reward_mode=linear' "$CAPTURE"
 grep -Fxq -- "++trainer.trace_checkpoint_digest=$DIGEST" "$CAPTURE"
 
+env "${COMMON[@]}" \
+    EVAL_DATA_FILE="$ROOT/data/search-opportunity.parquet" \
+    TRACE_OUTPUT_DIR="$ROOT/traces" \
+    TRACE_STAGE=search_opportunity TRACE_RUN_ID=search-gate-eval \
+    TRACE_CHECKPOINT_DIGEST="$DIGEST" \
+    bash "$AUTODL_DIR/train_small_grpo.sh" \
+    eval search_opportunity "$ROOT/parent-checkpoint"
+grep -Fxq -- "data.val_files=$ROOT/data/search-opportunity.parquet" "$CAPTURE"
+grep -Fxq -- 'max_turns=4' "$CAPTURE"
+
+if env "${COMMON[@]}" \
+    EVAL_DATA_FILE="$ROOT/data/search-opportunity.parquet" \
+    bash "$AUTODL_DIR/train_small_grpo.sh" \
+    eval control "$ROOT/parent-checkpoint" >/dev/null 2>&1; then
+    printf 'Legacy evaluation accepted the search-opportunity data override.\n' >&2
+    exit 1
+fi
+
+if env "${COMMON[@]}" \
+    bash "$AUTODL_DIR/train_small_grpo.sh" \
+    eval search_opportunity "$ROOT/parent-checkpoint" >/dev/null 2>&1; then
+    printf 'Search-opportunity evaluation accepted a missing data file.\n' >&2
+    exit 1
+fi
+
 if env "${COMMON[@]}" \
     TRACE_OUTPUT_DIR="$ROOT/traces" TRACE_STAGE=control TRACE_RUN_ID=missing-digest \
     bash "$AUTODL_DIR/train_small_grpo.sh" \
@@ -57,4 +83,4 @@ env "${COMMON[@]}" \
 grep -Fxq -- '++algorithm.cost_reward_mode=linear' "$CAPTURE"
 ! grep -Fq -- 'trainer.trace_output_dir' "$CAPTURE"
 
-printf 'C-gated config tests passed.\n'
+printf 'Gated and search-opportunity config tests passed.\n'

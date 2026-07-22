@@ -8,6 +8,7 @@ CHECKOUT_DIR="$PROJECT_ROOT/checkout"
 TRAIN_PYTHON="$PROJECT_ROOT/envs/train/bin/python"
 MODEL_DIR="$PROJECT_ROOT/models/Qwen3.5-2B"
 DATA_DIR="$PROJECT_ROOT/data/nq_small"
+EVAL_DATA_FILE="${EVAL_DATA_FILE:-}"
 GPU_COUNT="${GPU_COUNT:?Set GPU_COUNT explicitly to 1 or 2}"
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-8}"
 MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-256}"
@@ -101,7 +102,7 @@ case "$MODE:$VARIANT" in
         VAL_BEFORE_TRAIN=false
         USE_KL_LOSS=true
         ;;
-    eval:base|eval:reproduced|eval:control|eval:cost_aware|eval:cost_aware_gated)
+    eval:base|eval:reproduced|eval:control|eval:cost_aware|eval:cost_aware_gated|eval:search_opportunity)
         [[ $# == 3 ]] || {
             printf 'Pass exactly one model/checkpoint path for evaluation.\n' >&2
             exit 64
@@ -112,7 +113,29 @@ case "$MODE:$VARIANT" in
         SAVE_FREQ=-1
         TEST_FREQ=-1
         MODEL_PATH="${3:?Pass the selected checkpoint for evaluation}"
-        VAL_FILE="$DATA_DIR/test_128.parquet"
+        if [[ "$VARIANT" == search_opportunity ]]; then
+            [[ -n "$EVAL_DATA_FILE" ]] || {
+                printf 'EVAL_DATA_FILE is required for search-opportunity evaluation.\n' >&2
+                exit 64
+            }
+            eval_data_canonical="$(readlink -f -- "$EVAL_DATA_FILE")" || {
+                printf 'Cannot resolve EVAL_DATA_FILE: %s\n' "$EVAL_DATA_FILE" >&2
+                exit 1
+            }
+            project_canonical="$(readlink -f -- "$PROJECT_ROOT")"
+            [[ -f "$eval_data_canonical" && ! -L "$EVAL_DATA_FILE" &&
+                "$eval_data_canonical" == "$project_canonical/"* ]] || {
+                printf 'EVAL_DATA_FILE must be a regular file under %s.\n' "$PROJECT_ROOT" >&2
+                exit 64
+            }
+            VAL_FILE="$eval_data_canonical"
+        else
+            [[ -z "$EVAL_DATA_FILE" ]] || {
+                printf 'EVAL_DATA_FILE is only valid for search-opportunity evaluation.\n' >&2
+                exit 64
+            }
+            VAL_FILE="$DATA_DIR/test_128.parquet"
+        fi
         VAL_ONLY=true
         VAL_BEFORE_TRAIN=true
         USE_KL_LOSS=false
@@ -122,9 +145,15 @@ case "$MODE:$VARIANT" in
         printf '   or: %s train reproduce [STEPS]\n' "$0" >&2
         printf '   or: %s train {control|cost_aware|cost_aware_gated} [STEPS] REPRODUCED_CHECKPOINT\n' "$0" >&2
         printf '   or: %s eval {base|reproduced|control|cost_aware|cost_aware_gated} MODEL_PATH\n' "$0" >&2
+        printf '   or: EVAL_DATA_FILE=<parquet> %s eval search_opportunity MODEL_PATH\n' "$0" >&2
         exit 64
         ;;
 esac
+
+if [[ "$MODE:$VARIANT" != eval:search_opportunity && -n "$EVAL_DATA_FILE" ]]; then
+    printf 'EVAL_DATA_FILE is only valid for search-opportunity evaluation.\n' >&2
+    exit 64
+fi
 
 [[ "$TOTAL_STEPS" =~ ^[1-9][0-9]*$ ]] || { printf 'steps must be a positive integer.\n' >&2; exit 64; }
 [[ -d "$MODEL_PATH" ]] || { printf 'Model/checkpoint path is missing: %s\n' "$MODEL_PATH" >&2; exit 1; }

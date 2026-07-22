@@ -17,6 +17,8 @@ RESULTS_DIR="$RUNS_ROOT/comparison"
 GPU_COUNT="${GPU_COUNT:-}"
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-8}"
 MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-256}"
+EVAL_DATA_FILE="${EVAL_DATA_FILE:-}"
+EVAL_EXPECTED_ROWS="${EVAL_EXPECTED_ROWS:-128}"
 PRICE_PER_HOUR="${AUTODL_PRICE_PER_HOUR:-}"
 ALLOCATOR_CONFIG="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 RUN_BUDGET_PROFILE="${AUTODL_RUN_BUDGET_PROFILE:-legacy}"
@@ -56,6 +58,10 @@ validate_gpu_inputs() {
         printf 'AUTODL_RUN_BUDGET_PROFILE must be legacy or gated_followup.\n' >&2
         return 64
     }
+    [[ "$EVAL_EXPECTED_ROWS" =~ ^[1-9][0-9]*$ ]] || {
+        printf 'EVAL_EXPECTED_ROWS must be a positive integer.\n' >&2
+        return 64
+    }
 }
 
 file_sha256() {
@@ -93,11 +99,14 @@ finish_run_record() {
     local job_mode="$7" variant="$8" requested_steps="$9" input_model="${10}"
     local trace_output_dir="${11:-}"
     local finished_epoch elapsed state marker timed_out=false
-    local resolved_config_sha256=unavailable
+    local resolved_config_sha256=unavailable eval_data_sha256=unavailable
     finished_epoch="$(date +%s)"
     elapsed=$((finished_epoch - started_epoch))
     if [[ -f "$run_dir/resolved-config.yaml" && ! -L "$run_dir/resolved-config.yaml" ]]; then
         resolved_config_sha256="$(file_sha256 "$run_dir/resolved-config.yaml")"
+    fi
+    if [[ -n "$EVAL_DATA_FILE" && -f "$EVAL_DATA_FILE" && ! -L "$EVAL_DATA_FILE" ]]; then
+        eval_data_sha256="$(file_sha256 "$EVAL_DATA_FILE")"
     fi
     if ((rc == 0)); then
         state=success
@@ -121,6 +130,9 @@ finish_run_record() {
 "train_batch_size=$TRAIN_BATCH_SIZE"$'\n'\
 "max_response_length=$MAX_RESPONSE_LENGTH"$'\n'\
 "input_model=$input_model"$'\n'\
+"eval_data_file=$EVAL_DATA_FILE"$'\n'\
+"eval_data_sha256=$eval_data_sha256"$'\n'\
+"eval_expected_rows=$EVAL_EXPECTED_ROWS"$'\n'\
 "trace_output_dir=$trace_output_dir"$'\n'\
 "resolved_config_sha256=$resolved_config_sha256"$'\n'\
 "pytorch_cuda_alloc_conf=$ALLOCATOR_CONFIG"$'\n'\
@@ -190,6 +202,9 @@ run_job() {
                 return 64
             fi
             ;;
+        eval:search_opportunity)
+            budget_rmb=10
+            ;;
         eval:base|eval:reproduced|eval:control|eval:cost_aware|eval:cost_aware_gated)
             if [[ "$RUN_BUDGET_PROFILE" == gated_followup ]]; then
                 budget_rmb=5
@@ -231,6 +246,16 @@ run_job() {
         return 64
     }
     if [[ "$mode" == eval ]]; then
+        if [[ "$variant" == search_opportunity ]]; then
+            [[ -n "$EVAL_DATA_FILE" && -f "$EVAL_DATA_FILE" &&
+                "$EVAL_EXPECTED_ROWS" == 256 ]] || {
+                printf 'Search-opportunity evaluation requires EVAL_DATA_FILE and EVAL_EXPECTED_ROWS=256.\n' >&2
+                return 64
+            }
+        elif [[ -n "$EVAL_DATA_FILE" ]]; then
+            printf 'EVAL_DATA_FILE is reserved for search-opportunity evaluation.\n' >&2
+            return 64
+        fi
         parent="$RUNS_ROOT/eval/$variant"
     else
         parent="$RUNS_ROOT/$variant"
@@ -263,6 +288,7 @@ run_job() {
         GPU_COUNT="$GPU_COUNT" \
         TRAIN_BATCH_SIZE="$TRAIN_BATCH_SIZE" \
         MAX_RESPONSE_LENGTH="$MAX_RESPONSE_LENGTH" \
+        EVAL_DATA_FILE="$EVAL_DATA_FILE" \
         TRACE_OUTPUT_DIR="$trace_output_dir" \
         TRACE_STAGE="$trace_stage" \
         TRACE_RUN_ID="$(basename -- "$run_dir")" \
@@ -278,6 +304,7 @@ run_job() {
         GPU_COUNT="$GPU_COUNT" \
         TRAIN_BATCH_SIZE="$TRAIN_BATCH_SIZE" \
         MAX_RESPONSE_LENGTH="$MAX_RESPONSE_LENGTH" \
+        EVAL_DATA_FILE="$EVAL_DATA_FILE" \
         TRACE_OUTPUT_DIR="$trace_output_dir" \
         TRACE_STAGE="$trace_stage" \
         TRACE_RUN_ID="$(basename -- "$run_dir")" \
@@ -295,7 +322,11 @@ run_job() {
             expected_trace_rows=$((requested_steps * TRAIN_BATCH_SIZE * 5))
         else
             trace_manifest="$run_dir/traces/eval_predictions.manifest.json"
-            expected_trace_rows=128
+            if [[ "$variant" == search_opportunity ]]; then
+                expected_trace_rows="$EVAL_EXPECTED_ROWS"
+            else
+                expected_trace_rows=128
+            fi
         fi
         PYTHONPATH="$CHECKOUT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
         "$TRAIN_ENV/bin/python" -m search_r1.trajectory_trace verify \
@@ -595,6 +626,16 @@ PY
             return 1
         }
         cost_aware_gated_pipeline "$_attempt" "$commit" "$recorded_digest" \
+            "$base_model" "$base_model_digest"
+        cleanup_retriever
+        trap - EXIT
+        return 0
+    elif [[ "${AUTODL_GPU_PIPELINE:-legacy}" == search_opportunity_gate ]]; then
+        declare -F search_opportunity_gate_pipeline >/dev/null || {
+            printf 'The search-opportunity pipeline callback is unavailable.\n' >&2
+            return 1
+        }
+        search_opportunity_gate_pipeline "$_attempt" "$commit" "$recorded_digest" \
             "$base_model" "$base_model_digest"
         cleanup_retriever
         trap - EXIT

@@ -66,6 +66,18 @@
           ]
         }
       ]
+    },
+    {
+      "id": "gpu-search-opportunity-gate",
+      "path": "scripts/autodl/06_gpu_search_opportunity_gate.sh",
+      "documentation": [
+        {
+          "path": "scripts/autodl/README.md",
+          "required_literals": [
+            "/root/autodl-tmp/search-r1/checkout/scripts/autodl/06_gpu_search_opportunity_gate.sh"
+          ]
+        }
+      ]
     }
   ],
   "shutdown": {

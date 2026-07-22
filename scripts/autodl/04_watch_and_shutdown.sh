@@ -369,12 +369,9 @@ validate_followup_success_artifacts() {
     local project="${CAP[project_root]}" attempt="${CAP[attempt]}" expected_uid
     local contract_file result_root_file marker_file digest_file results expected_results_parent
     local marker expected_marker evidence expected_digest recorded_digest line relative path previous=''
+    local contract results_relative_parent marker_relative_parent
     local entry_count=0 file
-    local -a required=(
-        paired_results.csv correct_questions.csv wrong_questions.csv search_transition.csv
-        summary.json summary.md lineage.tsv run-index.tsv
-        gated_training_metrics.csv gated_training_curves.svg
-    )
+    local -a required=()
     declare -A seen=()
     if [[ "${CAP[mode]}" == production ]]; then expected_uid=0; else expected_uid="$(id -u)"; fi
     contract_file="$attempt/result-contract"
@@ -386,17 +383,38 @@ validate_followup_success_artifacts() {
         (( $(wc -l <"$file") == 1 )) || return 1
         (( $(stat -c '%s' -- "$file") <= 4096 )) || return 1
     done
-    [[ "$(tr -d '\r\n' <"$contract_file")" == cost-aware-gated-v1 ]] || return 1
+    contract="$(tr -d '\r\n' <"$contract_file")"
+    case "$contract" in
+        cost-aware-gated-v1)
+            results_relative_parent='runs/cost-aware-gated/attempts'
+            marker_relative_parent='manifests/cost-aware-gated'
+            required=(
+                paired_results.csv correct_questions.csv wrong_questions.csv search_transition.csv
+                summary.json summary.md lineage.tsv run-index.tsv
+                gated_training_metrics.csv gated_training_curves.svg
+            )
+            ;;
+        search-opportunity-gate-v1)
+            results_relative_parent='runs/search-opportunity-gate/attempts'
+            marker_relative_parent='manifests/search-opportunity-gate'
+            required=(
+                summary.json summary.md go_no_go.json per_question.jsonl
+                correct_questions.csv wrong_questions.csv two_plus_search.csv
+                redundant_search_candidates.csv strata.csv lineage.tsv run-index.tsv
+            )
+            ;;
+        *) return 1 ;;
+    esac
 
     results="$(canonical_existing "$(tr -d '\r\n' <"$result_root_file")")" || return 1
-    expected_results_parent="$project/runs/cost-aware-gated/attempts"
+    expected_results_parent="$project/$results_relative_parent"
     [[ -d "$expected_results_parent" && ! -L "$expected_results_parent" ]] || return 1
     [[ "$(canonical_existing "$(dirname -- "$results")")" == "$expected_results_parent" ]] || return 1
     [[ "$(basename -- "$results")" == "$(basename -- "$attempt")" &&
         -d "$results" && ! -L "$results" ]] || return 1
 
     marker="$(canonical_existing "$(tr -d '\r\n' <"$marker_file")")" || return 1
-    expected_marker="$project/manifests/cost-aware-gated/$(basename -- "$attempt").ok"
+    expected_marker="$project/$marker_relative_parent/$(basename -- "$attempt").ok"
     [[ "$marker" == "$expected_marker" ]] || return 1
     validate_protected_regular "$marker" "$expected_uid" || return 1
     evidence="$results/evidence.sha256"
@@ -419,7 +437,7 @@ validate_followup_success_artifacts() {
     done <"$evidence"
     ((entry_count >= 8)) || return 1
     for file in "${required[@]}"; do
-        [[ ${seen["runs/cost-aware-gated/attempts/$(basename -- "$attempt")/$file"]+present} ]] || return 1
+        [[ ${seen["$results_relative_parent/$(basename -- "$attempt")/$file"]+present} ]] || return 1
     done
 
     RESULTS_DIGEST="$(file_sha256 "$evidence")" || return 1
