@@ -9,6 +9,7 @@ trap 'rm -rf -- "$ROOT"' EXIT
 mkdir -p "$ROOT/envs/train/bin" "$ROOT/models/Qwen3.5-2B" "$ROOT/data/nq_small" \
     "$ROOT/parent-checkpoint" "$ROOT/output" "$ROOT/traces"
 printf 'parquet-placeholder\n' >"$ROOT/data/search-opportunity.parquet"
+printf 'parquet-placeholder\n' >"$ROOT/data/group-probe.parquet"
 ln -s "$CHECKOUT" "$ROOT/checkout"
 cat >"$ROOT/envs/train/bin/python" <<'SH'
 #!/usr/bin/env bash
@@ -23,6 +24,23 @@ COMMON=(
     OUTPUT_DIR="$ROOT/output" CAPTURE_LOG="$CAPTURE"
 )
 
+# The archived 03 workflow stays on its original response budget; 07 overrides it explicitly.
+(
+    unset MAX_RESPONSE_LENGTH
+    AUTODL_ROOT="$ROOT"
+    GPU_COUNT=2
+    AUTODL_PRICE_PER_HOUR=5.76
+    source "$AUTODL_DIR/03_gpu_run.sh"
+    [[ "$MAX_RESPONSE_LENGTH" == 256 ]]
+    MAX_RESPONSE_LENGTH=500
+    if validate_gpu_inputs >/dev/null 2>&1; then
+        printf 'Legacy 03 accepted the grouped-probe response length.\n' >&2
+        exit 1
+    fi
+    MAX_RESPONSE_LENGTH=192
+    validate_gpu_inputs
+)
+
 env "${COMMON[@]}" \
     TRACE_OUTPUT_DIR="$ROOT/traces" \
     TRACE_STAGE=cost_aware_gated TRACE_RUN_ID=test-run \
@@ -33,7 +51,28 @@ grep -Fxq -- 'algorithm.cost_lambda=0.10' "$CAPTURE"
 grep -Fxq -- '++algorithm.cost_reward_mode=correct_only' "$CAPTURE"
 grep -Fxq -- 'actor_rollout_ref.rollout.n_agent=5' "$CAPTURE"
 grep -Fxq -- 'data.train_batch_size=8' "$CAPTURE"
+grep -Fxq -- 'data.max_response_length=500' "$CAPTURE"
+grep -Fxq -- 'data.max_prompt_length=4096' "$CAPTURE"
 grep -Fxq -- "++trainer.trace_parent_checkpoint_digest=$DIGEST" "$CAPTURE"
+
+env "${COMMON[@]}" MAX_RESPONSE_LENGTH=384 \
+    bash "$AUTODL_DIR/train_small_grpo.sh" \
+    train control 20 "$ROOT/parent-checkpoint"
+grep -Fxq -- 'data.max_response_length=384' "$CAPTURE"
+grep -Fxq -- 'data.max_prompt_length=4096' "$CAPTURE"
+
+env "${COMMON[@]}" MAX_RESPONSE_LENGTH=256 \
+    bash "$AUTODL_DIR/train_small_grpo.sh" \
+    train control 20 "$ROOT/parent-checkpoint"
+grep -Fxq -- 'data.max_response_length=256' "$CAPTURE"
+grep -Fxq -- 'data.max_prompt_length=3584' "$CAPTURE"
+
+if env "${COMMON[@]}" MAX_RESPONSE_LENGTH=499 \
+    bash "$AUTODL_DIR/train_small_grpo.sh" \
+    train control 20 "$ROOT/parent-checkpoint" >/dev/null 2>&1; then
+    printf 'Training accepted an unsupported response length.\n' >&2
+    exit 1
+fi
 
 env "${COMMON[@]}" \
     TRACE_OUTPUT_DIR="$ROOT/traces" \
@@ -43,6 +82,8 @@ env "${COMMON[@]}" \
     eval control "$ROOT/parent-checkpoint"
 grep -Fxq -- '++algorithm.cost_reward_mode=linear' "$CAPTURE"
 grep -Fxq -- "++trainer.trace_checkpoint_digest=$DIGEST" "$CAPTURE"
+grep -Fxq -- 'data.eval_group_size=1' "$CAPTURE"
+grep -Fxq -- 'data.val_batch_size=64' "$CAPTURE"
 
 env "${COMMON[@]}" \
     EVAL_DATA_FILE="$ROOT/data/search-opportunity.parquet" \
@@ -53,6 +94,28 @@ env "${COMMON[@]}" \
     eval search_opportunity "$ROOT/parent-checkpoint"
 grep -Fxq -- "data.val_files=$ROOT/data/search-opportunity.parquet" "$CAPTURE"
 grep -Fxq -- 'max_turns=4' "$CAPTURE"
+
+env "${COMMON[@]}" \
+    EVAL_DATA_FILE="$ROOT/data/group-probe.parquet" \
+    EVAL_GROUP_SIZE=5 \
+    TRACE_OUTPUT_DIR="$ROOT/traces" \
+    TRACE_STAGE=group_probe TRACE_RUN_ID=group-probe-eval \
+    TRACE_CHECKPOINT_DIGEST="$DIGEST" \
+    bash "$AUTODL_DIR/train_small_grpo.sh" \
+    eval group_probe "$ROOT/models/Qwen3.5-2B"
+grep -Fxq -- "data.val_files=$ROOT/data/group-probe.parquet" "$CAPTURE"
+grep -Fxq -- 'data.eval_group_size=5' "$CAPTURE"
+grep -Fxq -- 'data.val_batch_size=8' "$CAPTURE"
+grep -Fxq -- 'data.max_response_length=500' "$CAPTURE"
+grep -Fxq -- 'data.max_prompt_length=4096' "$CAPTURE"
+
+if env "${COMMON[@]}" \
+    EVAL_DATA_FILE="$ROOT/data/group-probe.parquet" \
+    bash "$AUTODL_DIR/train_small_grpo.sh" \
+    eval group_probe "$ROOT/models/Qwen3.5-2B" >/dev/null 2>&1; then
+    printf 'Group probe accepted EVAL_GROUP_SIZE other than 5.\n' >&2
+    exit 1
+fi
 
 if env "${COMMON[@]}" \
     EVAL_DATA_FILE="$ROOT/data/search-opportunity.parquet" \

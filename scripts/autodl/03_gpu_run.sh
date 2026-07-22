@@ -19,6 +19,7 @@ TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-8}"
 MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-256}"
 EVAL_DATA_FILE="${EVAL_DATA_FILE:-}"
 EVAL_EXPECTED_ROWS="${EVAL_EXPECTED_ROWS:-128}"
+EVAL_GROUP_SIZE="${EVAL_GROUP_SIZE:-1}"
 PRICE_PER_HOUR="${AUTODL_PRICE_PER_HOUR:-}"
 ALLOCATOR_CONFIG="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 RUN_BUDGET_PROFILE="${AUTODL_RUN_BUDGET_PROFILE:-legacy}"
@@ -37,10 +38,24 @@ validate_gpu_inputs() {
         printf 'TRAIN_BATCH_SIZE must be 8 or the documented OOM fallback 4.\n' >&2
         return 64
     }
-    [[ "$MAX_RESPONSE_LENGTH" == 256 || "$MAX_RESPONSE_LENGTH" == 192 ]] || {
-        printf 'MAX_RESPONSE_LENGTH must be 256 or the documented OOM fallback 192.\n' >&2
-        return 64
-    }
+    case "${AUTODL_GPU_PIPELINE:-legacy}" in
+        group_probe)
+            [[ "$MAX_RESPONSE_LENGTH" == 500 ]] || {
+                printf 'The grouped probe requires MAX_RESPONSE_LENGTH=500.\n' >&2
+                return 64
+            }
+            ;;
+        legacy|cost_aware_gated|search_opportunity_gate)
+            [[ "$MAX_RESPONSE_LENGTH" == 256 || "$MAX_RESPONSE_LENGTH" == 192 ]] || {
+                printf 'Historical GPU pipelines permit MAX_RESPONSE_LENGTH=256 or 192 only.\n' >&2
+                return 64
+            }
+            ;;
+        *)
+            printf 'Unknown GPU pipeline: %s\n' "$AUTODL_GPU_PIPELINE" >&2
+            return 64
+            ;;
+    esac
     [[ "$ALLOCATOR_CONFIG" == expandable_segments:True ]] || {
         printf 'PYTORCH_CUDA_ALLOC_CONF must be expandable_segments:True.\n' >&2
         return 64
@@ -60,6 +75,10 @@ validate_gpu_inputs() {
     }
     [[ "$EVAL_EXPECTED_ROWS" =~ ^[1-9][0-9]*$ ]] || {
         printf 'EVAL_EXPECTED_ROWS must be a positive integer.\n' >&2
+        return 64
+    }
+    [[ "$EVAL_GROUP_SIZE" == 1 || "$EVAL_GROUP_SIZE" == 5 ]] || {
+        printf 'EVAL_GROUP_SIZE must be 1 or 5.\n' >&2
         return 64
     }
 }
@@ -133,6 +152,7 @@ finish_run_record() {
 "eval_data_file=$EVAL_DATA_FILE"$'\n'\
 "eval_data_sha256=$eval_data_sha256"$'\n'\
 "eval_expected_rows=$EVAL_EXPECTED_ROWS"$'\n'\
+"eval_group_size=$EVAL_GROUP_SIZE"$'\n'\
 "trace_output_dir=$trace_output_dir"$'\n'\
 "resolved_config_sha256=$resolved_config_sha256"$'\n'\
 "pytorch_cuda_alloc_conf=$ALLOCATOR_CONFIG"$'\n'\
@@ -205,6 +225,9 @@ run_job() {
         eval:search_opportunity)
             budget_rmb=10
             ;;
+        eval:group_probe)
+            budget_rmb=10
+            ;;
         eval:base|eval:reproduced|eval:control|eval:cost_aware|eval:cost_aware_gated)
             if [[ "$RUN_BUDGET_PROFILE" == gated_followup ]]; then
                 budget_rmb=5
@@ -248,12 +271,21 @@ run_job() {
     if [[ "$mode" == eval ]]; then
         if [[ "$variant" == search_opportunity ]]; then
             [[ -n "$EVAL_DATA_FILE" && -f "$EVAL_DATA_FILE" &&
-                "$EVAL_EXPECTED_ROWS" == 256 ]] || {
-                printf 'Search-opportunity evaluation requires EVAL_DATA_FILE and EVAL_EXPECTED_ROWS=256.\n' >&2
+                "$EVAL_EXPECTED_ROWS" == 256 && "$EVAL_GROUP_SIZE" == 1 ]] || {
+                printf 'Search-opportunity evaluation requires 256 rows and EVAL_GROUP_SIZE=1.\n' >&2
+                return 64
+            }
+        elif [[ "$variant" == group_probe ]]; then
+            [[ -n "$EVAL_DATA_FILE" && -f "$EVAL_DATA_FILE" &&
+                "$EVAL_EXPECTED_ROWS" == 64 && "$EVAL_GROUP_SIZE" == 5 ]] || {
+                printf 'Group probe evaluation requires 64 rows and EVAL_GROUP_SIZE=5.\n' >&2
                 return 64
             }
         elif [[ -n "$EVAL_DATA_FILE" ]]; then
-            printf 'EVAL_DATA_FILE is reserved for search-opportunity evaluation.\n' >&2
+            printf 'EVAL_DATA_FILE is reserved for a registered custom evaluation.\n' >&2
+            return 64
+        elif [[ "$EVAL_GROUP_SIZE" != 1 ]]; then
+            printf 'Only group probe evaluation may use EVAL_GROUP_SIZE=5.\n' >&2
             return 64
         fi
         parent="$RUNS_ROOT/eval/$variant"
@@ -289,6 +321,7 @@ run_job() {
         TRAIN_BATCH_SIZE="$TRAIN_BATCH_SIZE" \
         MAX_RESPONSE_LENGTH="$MAX_RESPONSE_LENGTH" \
         EVAL_DATA_FILE="$EVAL_DATA_FILE" \
+        EVAL_GROUP_SIZE="$EVAL_GROUP_SIZE" \
         TRACE_OUTPUT_DIR="$trace_output_dir" \
         TRACE_STAGE="$trace_stage" \
         TRACE_RUN_ID="$(basename -- "$run_dir")" \
@@ -305,6 +338,7 @@ run_job() {
         TRAIN_BATCH_SIZE="$TRAIN_BATCH_SIZE" \
         MAX_RESPONSE_LENGTH="$MAX_RESPONSE_LENGTH" \
         EVAL_DATA_FILE="$EVAL_DATA_FILE" \
+        EVAL_GROUP_SIZE="$EVAL_GROUP_SIZE" \
         TRACE_OUTPUT_DIR="$trace_output_dir" \
         TRACE_STAGE="$trace_stage" \
         TRACE_RUN_ID="$(basename -- "$run_dir")" \
@@ -324,6 +358,8 @@ run_job() {
             trace_manifest="$run_dir/traces/eval_predictions.manifest.json"
             if [[ "$variant" == search_opportunity ]]; then
                 expected_trace_rows="$EVAL_EXPECTED_ROWS"
+            elif [[ "$variant" == group_probe ]]; then
+                expected_trace_rows=$((EVAL_EXPECTED_ROWS * EVAL_GROUP_SIZE))
             else
                 expected_trace_rows=128
             fi
@@ -636,6 +672,16 @@ PY
             return 1
         }
         search_opportunity_gate_pipeline "$_attempt" "$commit" "$recorded_digest" \
+            "$base_model" "$base_model_digest"
+        cleanup_retriever
+        trap - EXIT
+        return 0
+    elif [[ "${AUTODL_GPU_PIPELINE:-legacy}" == group_probe ]]; then
+        declare -F group_probe_pipeline >/dev/null || {
+            printf 'The group-probe pipeline callback is unavailable.\n' >&2
+            return 1
+        }
+        group_probe_pipeline "$_attempt" "$commit" "$recorded_digest" \
             "$base_model" "$base_model_digest"
         cleanup_retriever
         trap - EXIT

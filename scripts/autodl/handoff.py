@@ -81,7 +81,7 @@ def contained_relative(root: Path, path: Path) -> str:
 def create(args: argparse.Namespace) -> None:
     root = args.root.resolve()
     artifacts = []
-    paths = iter_artifacts([args.model, args.bm25, args.corpus, args.data],
+    paths = iter_artifacts([args.model, args.bm25, args.corpus, *args.data],
                            [args.requirements, *args.extra_file])
     for path in paths:
         artifacts.append({
@@ -179,7 +179,7 @@ def parser() -> argparse.ArgumentParser:
     create_parser.add_argument("--model", type=Path, required=True)
     create_parser.add_argument("--bm25", type=Path, required=True)
     create_parser.add_argument("--corpus", type=Path, required=True)
-    create_parser.add_argument("--data", type=Path, required=True)
+    create_parser.add_argument("--data", type=Path, action="append", required=True)
     create_parser.add_argument("--requirements", type=Path, required=True)
     create_parser.add_argument("--extra-file", type=Path, action="append", default=[])
     create_parser.add_argument("--python-version", required=True)

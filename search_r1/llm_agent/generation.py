@@ -75,7 +75,8 @@ class LLMGenerationManager:
         responses = self._batch_tokenize(responses_str)
         return responses, responses_str
 
-    def _process_next_obs(self, next_obs: List[str]) -> torch.Tensor:
+    def _process_next_obs(
+            self, next_obs: List[str]) -> Tuple[torch.Tensor, List[str]]:
         """Process next observations from environment."""
         
         next_obs_ids = self.tokenizer(
@@ -89,7 +90,11 @@ class LLMGenerationManager:
             print(f"[WARNING] OBSERVATION TOO LONG, CONSIDER CHANGING YOUR CONFIG, {next_obs_ids.shape[1]} & {self.config.max_obs_length}")            
             next_obs_ids = next_obs_ids[:, :self.config.max_obs_length]
 
-        return next_obs_ids
+        visible_observations = self.tokenizer.batch_decode(
+            next_obs_ids, skip_special_tokens=True)
+        if len(visible_observations) != len(next_obs):
+            raise ValueError('decoded observations are not batch-aligned')
+        return next_obs_ids, visible_observations
 
     def _update_rolling_state(self, rollings: DataProto, cur_responses: torch.Tensor, 
                             next_obs_ids: torch.Tensor) -> Dict:
@@ -277,11 +282,6 @@ class LLMGenerationManager:
                         'done': bool(dones[index]),
                         'executed_search': bool(executed_search[index]),
                     })
-            for index, event in enumerate(self._last_execution_retrieval_events):
-                if event is not None:
-                    event['turn'] = step
-                    retrieval_events[index].append(event)
-            
             curr_active_mask = torch.tensor([not done for done in dones], dtype=torch.bool)
             active_mask = active_mask * curr_active_mask
             active_num_list.append(active_mask.sum().item())
@@ -289,7 +289,14 @@ class LLMGenerationManager:
             valid_action_stats += torch.tensor(valid_action, dtype=torch.int)
             executed_search_count += torch.tensor(executed_search, dtype=torch.long)
 
-            next_obs_ids = self._process_next_obs(next_obs)
+            next_obs_ids, visible_observations = self._process_next_obs(
+                next_obs)
+            for index, event in enumerate(
+                    self._last_execution_retrieval_events):
+                if event is not None:
+                    event['turn'] = step
+                    event['visible_observation'] = visible_observations[index]
+                    retrieval_events[index].append(event)
             
             # Update states
             rollings = self._update_rolling_state(

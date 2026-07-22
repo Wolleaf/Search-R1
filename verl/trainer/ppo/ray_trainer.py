@@ -16,6 +16,7 @@ FSDP PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
 
+import hashlib
 import os
 import uuid
 from contextlib import contextmanager
@@ -76,6 +77,54 @@ def _json_list(value):
     if isinstance(value, (list, tuple)):
         return list(value)
     return [value]
+
+
+def _get_eval_group_size(config):
+    group_size = config.data.get('eval_group_size', 1)
+    if (isinstance(group_size, bool)
+            or not isinstance(group_size, (int, np.integer))
+            or group_size < 1):
+        raise ValueError('data.eval_group_size must be a positive integer')
+    return int(group_size)
+
+
+def _prepare_validation_batch(batch, group_size):
+    """Repeat validation prompts only for an explicitly grouped evaluation."""
+    if group_size == 1:
+        return batch
+    prompt_batch_size = len(batch)
+    repeated = batch.repeat(repeat_times=group_size, interleave=True)
+    repeated.non_tensor_batch['group_slot'] = np.tile(
+        np.arange(group_size, dtype=object), prompt_batch_size)
+    repeated.non_tensor_batch['group_size'] = np.full(
+        len(repeated), group_size, dtype=object)
+    return repeated
+
+
+def _validation_meta_info(tokenizer, group_size):
+    return {
+        'eos_token_id': tokenizer.eos_token_id,
+        'pad_token_id': tokenizer.pad_token_id,
+        'recompute_log_prob': False,
+        'do_sample': group_size > 1,
+        'validate': True,
+    }
+
+
+def _grouped_eval_record_id(stage, group_uid, group_slot):
+    identity = json.dumps(
+        {
+            'record_type': 'eval',
+            'stage': stage,
+            'group_uid': group_uid,
+            'group_slot': group_slot,
+        },
+        sort_keys=True,
+        separators=(',', ':'),
+        ensure_ascii=True,
+    )
+    digest = hashlib.sha256(identity.encode('ascii')).hexdigest()
+    return f'trace:{digest[:24]}'
 
 
 def _event_aligned_trace_turns(generation_events, retrieval_events,
@@ -181,7 +230,7 @@ def _event_aligned_trace_turns(generation_events, retrieval_events,
             environment_action['retrieved_docs'] = retrieval_event.get(
                 'documents', [])
             environment_action['observation'] = retrieval_event.get(
-                'observation')
+                'visible_observation', retrieval_event.get('observation'))
             environment_action['retrieval_executed'] = True
 
         for turn in event_turns:
@@ -621,8 +670,9 @@ class RayPPOTrainer(object):
             if not checkpoint_digest:
                 raise ValueError(
                     'trainer.trace_checkpoint_digest is required for evaluation traces')
-            expected_rows = len(self.val_dataloader) * int(
-                self.config.data.val_batch_size)
+            expected_rows = (len(self.val_dataloader) * int(
+                self.config.data.val_batch_size) * _get_eval_group_size(
+                    self.config))
             self.eval_trace_writer = TraceJsonlWriter(
                 output_dir / 'eval_predictions.jsonl',
                 record_type='eval',
@@ -745,7 +795,25 @@ class RayPPOTrainer(object):
             return
         checkpoint_digest = str(
             self.config.trainer.trace_checkpoint_digest)
-        for record in self._common_trace_records(batch):
+        group_size = _get_eval_group_size(self.config)
+        records = self._common_trace_records(batch)
+        for index, record in enumerate(records):
+            if group_size > 1:
+                group_slot = int(
+                    batch.non_tensor_batch['group_slot'][index])
+                recorded_group_size = int(
+                    batch.non_tensor_batch['group_size'][index])
+                if recorded_group_size != group_size:
+                    raise ValueError(
+                        'eval trace group_size does not match configuration')
+                group_uid = record['sample_id']
+                record.update({
+                    'group_uid': group_uid,
+                    'group_slot': group_slot,
+                    'group_size': group_size,
+                    'record_id': _grouped_eval_record_id(
+                        self.eval_trace_writer.stage, group_uid, group_slot),
+                })
             record['checkpoint_digest'] = checkpoint_digest
             self.eval_trace_writer.append(record)
 
@@ -872,6 +940,7 @@ class RayPPOTrainer(object):
         search_count_lst = []
         utility_lst = []
         data_source_lst = []
+        eval_group_size = _get_eval_group_size(self.config)
 
         gen_config = GenerationConfig(
             max_turns=self.config.max_turns,
@@ -896,19 +965,16 @@ class RayPPOTrainer(object):
         if not self.config.do_search:
             for test_data in self.val_dataloader:
                 test_batch = DataProto.from_single_dict(test_data)
+                test_batch = _prepare_validation_batch(
+                    test_batch, eval_group_size)
 
                 # we only do validation on rule-based rm
                 if self.config.reward_model.enable and test_batch[0].non_tensor_batch['reward_model']['style'] == 'model':
                     return {}
 
                 test_gen_batch = test_batch.pop(['input_ids', 'attention_mask', 'position_ids'])
-                test_gen_batch.meta_info = {
-                    'eos_token_id': self.tokenizer.eos_token_id,
-                    'pad_token_id': self.tokenizer.pad_token_id,
-                    'recompute_log_prob': False,
-                    'do_sample': False,
-                    'validate': True,
-                }
+                test_gen_batch.meta_info = _validation_meta_info(
+                    self.tokenizer, eval_group_size)
 
                 # pad to be divisible by dp_size
                 test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, self.actor_rollout_wg.world_size)
@@ -935,16 +1001,12 @@ class RayPPOTrainer(object):
             for batch_dict in self.val_dataloader:
                 timing_raw = {}
                 test_batch: DataProto = DataProto.from_single_dict(batch_dict)
-                # test_batch = test_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n_agent, interleave=True)
+                test_batch = _prepare_validation_batch(
+                    test_batch, eval_group_size)
                 
                 test_gen_batch = test_batch.pop(batch_keys=['input_ids', 'attention_mask', 'position_ids'])
-                test_gen_batch.meta_info = {
-                    'eos_token_id': self.tokenizer.eos_token_id,
-                    'pad_token_id': self.tokenizer.pad_token_id,
-                    'recompute_log_prob': False,
-                    'do_sample': False,
-                    'validate': True,
-                }
+                test_gen_batch.meta_info = _validation_meta_info(
+                    self.tokenizer, eval_group_size)
                 with _timer('step', timing_raw):
                     first_input_ids = test_gen_batch.batch['input_ids'][:, -gen_config.max_start_length:].clone()
                     with _timer('gen', timing_raw):

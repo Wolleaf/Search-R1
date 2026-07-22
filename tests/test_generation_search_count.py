@@ -121,6 +121,107 @@ def test_retrieval_metadata_stays_aligned_after_batch_reorder():
     ]
 
 
+def test_retrieval_trace_records_post_truncation_visible_observation():
+
+    class WordTokenizer:
+
+        pad_token_id = 0
+        pad_token = '<pad>'
+
+        def __init__(self):
+            self._token_ids = {}
+            self._tokens = {}
+
+        def _id(self, token):
+            if token not in self._token_ids:
+                token_id = len(self._token_ids) + 100
+                self._token_ids[token] = token_id
+                self._tokens[token_id] = token
+            return self._token_ids[token]
+
+        def __call__(self, values, **_kwargs):
+            rows = [[self._id(token) for token in value.split()]
+                    for value in values]
+            width = max(map(len, rows))
+            return {
+                'input_ids':
+                torch.tensor([
+                    row + [self.pad_token_id] * (width - len(row))
+                    for row in rows
+                ])
+            }
+
+        def batch_decode(self, rows, skip_special_tokens=True):
+            assert skip_special_tokens
+            return [
+                ' '.join(self._tokens[int(token)] for token in row
+                         if int(token) != self.pad_token_id) for row in rows
+            ]
+
+    manager = object.__new__(LLMGenerationManager)
+    manager.tokenizer = WordTokenizer()
+    manager.config = SimpleNamespace(num_gpus=1,
+                                     max_turns=1,
+                                     max_start_length=8,
+                                     max_prompt_length=512,
+                                     max_response_length=8,
+                                     max_obs_length=384)
+    manager.tensor_fn = TensorHelper(
+        TensorConfig(pad_token_id=0,
+                     max_prompt_length=512,
+                     max_obs_length=384,
+                     max_start_length=8))
+
+    class WorkerGroup:
+
+        def __init__(self):
+            self.calls = 0
+
+        def generate_sequences(self, batch):
+            self.calls += 1
+            token = 11 if self.calls == 1 else 12
+            return DataProto.from_dict(
+                {'responses': torch.full((len(batch), 1), token)},
+                meta_info=batch.meta_info.copy())
+
+    manager.actor_rollout_wg = WorkerGroup()
+    manager._postprocess_responses = lambda responses: (responses, [
+        '<search>topic</search>'
+        if int(responses[0, 0]) == 11 else '<answer>done</answer>'
+    ])
+    full_observation = ' '.join(['visible'] * 384 + ['HIDDEN'])
+    documents = [{
+        'document_id': '42',
+        'document': {
+            'contents': 'Visible title\nEvidence'
+        },
+    }]
+
+    def batch_search(queries):
+        manager._last_batch_search_metadata = [documents for _ in queries]
+        return [full_observation for _ in queries]
+
+    manager.batch_search = batch_search
+    gen_batch = DataProto.from_dict(
+        {
+            'input_ids': torch.tensor([[1, 2]]),
+            'attention_mask': torch.ones(1, 2, dtype=torch.long),
+            'position_ids': torch.tensor([[0, 1]]),
+        },
+        meta_info={
+            'do_sample': True,
+            'validate': True
+        })
+
+    output = manager.run_llm_loop(gen_batch,
+                                  gen_batch.batch['input_ids'].clone())
+    event = output.non_tensor_batch['retrieval_events'][0][0]
+
+    assert 'HIDDEN' in event['observation']
+    assert 'HIDDEN' not in event['visible_observation']
+    assert len(event['visible_observation'].split()) == 384
+
+
 def test_odd_active_validation_batch_keeps_deterministic_sampling_metadata():
     manager = _manager()
     manager.tokenizer.pad_token = '<pad>'

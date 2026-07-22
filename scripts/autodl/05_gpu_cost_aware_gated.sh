@@ -3,7 +3,9 @@ set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 export AUTODL_RUN_BUDGET_PROFILE=gated_followup
+export MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-256}"
 AUTODL_GPU_PIPELINE=cost_aware_gated
+# This archived follow-up remains pinned to the historical 256-token comparison.
 # Reuse the already-tested GPU admission, BM25 lifecycle, run records, and checkpoint validators.
 # shellcheck source=03_gpu_run.sh
 source "$SCRIPT_DIR/03_gpu_run.sh"

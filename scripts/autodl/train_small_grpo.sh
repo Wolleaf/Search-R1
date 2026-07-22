@@ -9,9 +9,10 @@ TRAIN_PYTHON="$PROJECT_ROOT/envs/train/bin/python"
 MODEL_DIR="$PROJECT_ROOT/models/Qwen3.5-2B"
 DATA_DIR="$PROJECT_ROOT/data/nq_small"
 EVAL_DATA_FILE="${EVAL_DATA_FILE:-}"
+EVAL_GROUP_SIZE="${EVAL_GROUP_SIZE:-1}"
 GPU_COUNT="${GPU_COUNT:?Set GPU_COUNT explicitly to 1 or 2}"
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-8}"
-MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-256}"
+MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-500}"
 OUTPUT_DIR="${OUTPUT_DIR:?Set OUTPUT_DIR to the run checkpoint directory}"
 TRACE_OUTPUT_DIR="${TRACE_OUTPUT_DIR:-}"
 TRACE_STAGE="${TRACE_STAGE:-}"
@@ -31,11 +32,23 @@ readonly SMOKE_STEPS=2
     printf 'TRAIN_BATCH_SIZE must be 8 (default) or the documented OOM fallback 4.\n' >&2
     exit 64
 }
-[[ "$MAX_RESPONSE_LENGTH" == 256 || "$MAX_RESPONSE_LENGTH" == 192 ]] || {
-    printf 'MAX_RESPONSE_LENGTH must be 256 (default) or the documented OOM fallback 192.\n' >&2
+[[ "$EVAL_GROUP_SIZE" == 1 || "$EVAL_GROUP_SIZE" == 5 ]] || {
+    printf 'EVAL_GROUP_SIZE must be 1 (normal evaluation) or 5 (group probe).\n' >&2
     exit 64
 }
-readonly MAX_PROMPT_LENGTH=$((MAX_START_LENGTH + MAX_TURNS * (MAX_RESPONSE_LENGTH + MAX_OBS_LENGTH)))
+case "$MAX_RESPONSE_LENGTH" in
+    500|384)
+        readonly MAX_PROMPT_LENGTH=4096
+        ;;
+    256|192)
+        # Preserve the archived experiment entrypoints without changing their configs.
+        readonly MAX_PROMPT_LENGTH=$((MAX_START_LENGTH + MAX_TURNS * (MAX_RESPONSE_LENGTH + MAX_OBS_LENGTH)))
+        ;;
+    *)
+        printf 'MAX_RESPONSE_LENGTH must be 500 (default), 384 (OOM fallback), or a legacy value 256/192.\n' >&2
+        exit 64
+        ;;
+esac
 [[ -x "$TRAIN_PYTHON" && -d "$MODEL_DIR" && -d "$DATA_DIR" ]] || {
     printf 'CPU preparation is incomplete under %s.\n' "$PROJECT_ROOT" >&2
     exit 1
@@ -102,7 +115,7 @@ case "$MODE:$VARIANT" in
         VAL_BEFORE_TRAIN=false
         USE_KL_LOSS=true
         ;;
-    eval:base|eval:reproduced|eval:control|eval:cost_aware|eval:cost_aware_gated|eval:search_opportunity)
+    eval:base|eval:reproduced|eval:control|eval:cost_aware|eval:cost_aware_gated|eval:search_opportunity|eval:group_probe)
         [[ $# == 3 ]] || {
             printf 'Pass exactly one model/checkpoint path for evaluation.\n' >&2
             exit 64
@@ -113,9 +126,9 @@ case "$MODE:$VARIANT" in
         SAVE_FREQ=-1
         TEST_FREQ=-1
         MODEL_PATH="${3:?Pass the selected checkpoint for evaluation}"
-        if [[ "$VARIANT" == search_opportunity ]]; then
+        if [[ "$VARIANT" == search_opportunity || "$VARIANT" == group_probe ]]; then
             [[ -n "$EVAL_DATA_FILE" ]] || {
-                printf 'EVAL_DATA_FILE is required for search-opportunity evaluation.\n' >&2
+                printf 'EVAL_DATA_FILE is required for %s evaluation.\n' "$VARIANT" >&2
                 exit 64
             }
             eval_data_canonical="$(readlink -f -- "$EVAL_DATA_FILE")" || {
@@ -131,7 +144,7 @@ case "$MODE:$VARIANT" in
             VAL_FILE="$eval_data_canonical"
         else
             [[ -z "$EVAL_DATA_FILE" ]] || {
-                printf 'EVAL_DATA_FILE is only valid for search-opportunity evaluation.\n' >&2
+                printf 'EVAL_DATA_FILE is only valid for a registered custom evaluation.\n' >&2
                 exit 64
             }
             VAL_FILE="$DATA_DIR/test_128.parquet"
@@ -146,13 +159,28 @@ case "$MODE:$VARIANT" in
         printf '   or: %s train {control|cost_aware|cost_aware_gated} [STEPS] REPRODUCED_CHECKPOINT\n' "$0" >&2
         printf '   or: %s eval {base|reproduced|control|cost_aware|cost_aware_gated} MODEL_PATH\n' "$0" >&2
         printf '   or: EVAL_DATA_FILE=<parquet> %s eval search_opportunity MODEL_PATH\n' "$0" >&2
+        printf '   or: EVAL_DATA_FILE=<parquet> EVAL_GROUP_SIZE=5 %s eval group_probe MODEL_PATH\n' "$0" >&2
         exit 64
         ;;
 esac
 
-if [[ "$MODE:$VARIANT" != eval:search_opportunity && -n "$EVAL_DATA_FILE" ]]; then
-    printf 'EVAL_DATA_FILE is only valid for search-opportunity evaluation.\n' >&2
+if [[ "$MODE:$VARIANT" != eval:search_opportunity &&
+      "$MODE:$VARIANT" != eval:group_probe && -n "$EVAL_DATA_FILE" ]]; then
+    printf 'EVAL_DATA_FILE is only valid for a registered custom evaluation.\n' >&2
     exit 64
+fi
+if [[ "$MODE:$VARIANT" == eval:group_probe ]]; then
+    [[ "$EVAL_GROUP_SIZE" == 5 ]] || {
+        printf 'Group probe evaluation requires EVAL_GROUP_SIZE=5.\n' >&2
+        exit 64
+    }
+    VAL_BATCH_SIZE=8
+else
+    [[ "$EVAL_GROUP_SIZE" == 1 ]] || {
+        printf 'Only group probe evaluation may use EVAL_GROUP_SIZE=5.\n' >&2
+        exit 64
+    }
+    VAL_BATCH_SIZE=64
 fi
 
 [[ "$TOTAL_STEPS" =~ ^[1-9][0-9]*$ ]] || { printf 'steps must be a positive integer.\n' >&2; exit 64; }
@@ -207,7 +235,8 @@ HYDRA_ARGS=(
     data.train_data_num=null
     data.val_data_num=null
     "data.train_batch_size=$TRAIN_BATCH_SIZE"
-    data.val_batch_size=64
+    "data.val_batch_size=$VAL_BATCH_SIZE"
+    "data.eval_group_size=$EVAL_GROUP_SIZE"
     "data.max_prompt_length=$MAX_PROMPT_LENGTH"
     "data.max_response_length=$MAX_RESPONSE_LENGTH"
     "data.max_start_length=$MAX_START_LENGTH"

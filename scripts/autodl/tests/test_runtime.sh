@@ -84,12 +84,14 @@ wait_for_terminal "$attempt"
 
 mkdir -p "$TEST_ROOT/handoff/model" "$TEST_ROOT/handoff/bm25" \
     "$TEST_ROOT/handoff/corpus" "$TEST_ROOT/handoff/data" \
+    "$TEST_ROOT/handoff/data-extra" \
     "$TEST_ROOT/handoff/manifests"
 printf 'model\n' >"$TEST_ROOT/handoff/model/config.json"
 printf 'index\n' >"$TEST_ROOT/handoff/bm25/segments_1"
 printf 'corpus\n' >"$TEST_ROOT/handoff/corpus/wiki-18.jsonl"
 printf 'source\n' >"$TEST_ROOT/handoff/corpus-source.gz"
 printf 'data\n' >"$TEST_ROOT/handoff/data/train.parquet"
+printf 'extra-data\n' >"$TEST_ROOT/handoff/data-extra/probe.parquet"
 printf 'lock\n' >"$TEST_ROOT/handoff/requirements.lock"
 "$PYTHON_BIN" "$AUTODL_DIR/handoff.py" create \
     --root "$TEST_ROOT/handoff" \
@@ -98,6 +100,7 @@ printf 'lock\n' >"$TEST_ROOT/handoff/requirements.lock"
     --bm25 "$TEST_ROOT/handoff/bm25" \
     --corpus "$TEST_ROOT/handoff/corpus" \
     --data "$TEST_ROOT/handoff/data" \
+    --data "$TEST_ROOT/handoff/data-extra" \
     --requirements "$TEST_ROOT/handoff/requirements.lock" \
     --extra-file "$TEST_ROOT/handoff/corpus-source.gz" \
     --python-version 3.12.0 \

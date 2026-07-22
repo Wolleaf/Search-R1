@@ -78,6 +78,18 @@
           ]
         }
       ]
+    },
+    {
+      "id": "gpu-group-probe",
+      "path": "scripts/autodl/07_gpu_group_probe.sh",
+      "documentation": [
+        {
+          "path": "scripts/autodl/README.md",
+          "required_literals": [
+            "/root/autodl-tmp/search-r1/checkout/scripts/autodl/07_gpu_group_probe.sh"
+          ]
+        }
+      ]
     }
   ],
   "shutdown": {

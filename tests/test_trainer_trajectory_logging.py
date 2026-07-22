@@ -178,6 +178,30 @@ def test_trace_turns_respect_generation_boundaries_for_unclosed_tags():
     assert executed_turns[0]['retrieved_docs'] == [{'document_id': '7'}]
 
 
+def test_trace_turns_use_the_post_truncation_visible_observation():
+    generation_events = [{
+        'turn': 0,
+        'text': '<search>France capital</search>',
+        'valid_action': True,
+        'executed_search': True,
+    }]
+    retrieval_events = [{
+        'turn': 0,
+        'query': 'France capital',
+        'documents': [{
+            'document_id': '7'
+        }],
+        'observation': 'visible text followed by hidden evidence',
+        'visible_observation': 'visible text',
+    }]
+
+    turns = _event_aligned_trace_turns(generation_events, retrieval_events, 1)
+    executed_turn = next(turn for turn in turns
+                         if turn['retrieval_executed'])
+
+    assert executed_turn['observation'] == 'visible text'
+
+
 def test_trace_turns_reject_generation_retrieval_turn_mismatch():
     generation_events = [{
         'turn': 0,

@@ -4,9 +4,11 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 SEARCH_GATE_PROJECT_ROOT="${AUTODL_ROOT:-/root/autodl-tmp/search-r1}"
 export AUTODL_RUN_BUDGET_PROFILE=gated_followup
+export MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-256}"
 export EVAL_DATA_FILE="$SEARCH_GATE_PROJECT_ROOT/data/search_opportunity_gate/eval_256.parquet"
 export EVAL_EXPECTED_ROWS=256
 AUTODL_GPU_PIPELINE=search_opportunity_gate
+# This archived opportunity gate remains pinned to its historical 256-token config.
 # Reuse the validated GPU admission, detached worker, BM25 lifecycle, and run records.
 # shellcheck source=03_gpu_run.sh
 source "$SCRIPT_DIR/03_gpu_run.sh"

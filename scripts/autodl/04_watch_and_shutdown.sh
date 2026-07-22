@@ -403,6 +403,14 @@ validate_followup_success_artifacts() {
                 redundant_search_candidates.csv strata.csv lineage.tsv run-index.tsv
             )
             ;;
+        group-probe-v1)
+            results_relative_parent='runs/group-probe/attempts'
+            marker_relative_parent='manifests/group-probe'
+            required=(
+                summary.json summary.md go_no_go.json per_trajectory.jsonl
+                per_question.jsonl lineage.tsv run-index.tsv
+            )
+            ;;
         *) return 1 ;;
     esac
 

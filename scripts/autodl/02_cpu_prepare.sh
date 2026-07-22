@@ -18,6 +18,7 @@ CACHE_ROOT="$PROJECT_ROOT/cache"
 DATA_ROOT="$PROJECT_ROOT/data"
 SMALL_DATA_DIR="$DATA_ROOT/nq_small"
 SEARCH_GATE_DATA_DIR="$DATA_ROOT/search_opportunity_gate"
+SEARCH_MIX_DATA_DIR="$DATA_ROOT/search_mix"
 BM25_ROOT="$DATA_ROOT/wiki-18-bm25-index"
 CORPUS_SOURCE_ROOT="$DATA_ROOT/wiki-18-corpus-source"
 CORPUS_ROOT="$DATA_ROOT/wiki-18-corpus"
@@ -73,10 +74,11 @@ resolve_llmdevelop_python() {
 cpu_action() {
     local _attempt="$1"
     local commit base_python train_python retriever_python python_version torch_version handoff_digest gpu_count
-    local previous_commit previous_python previous_torch
+    local previous_commit previous_python previous_torch build_search_mix=0 seal_search_mix=0
     local spec mode variant steps model_path config_output_dir parent_placeholder trace_placeholder
+    local config_response_length eval_group_size
     local trace_digest_placeholder trace_checkpoint_digest trace_parent_digest trace_output trace_stage
-    local -a command_args
+    local -a command_args search_mix_handoff_args
     commit="$(expected_commit)"
     verify_checkout "$commit"
     [[ -f "$CHECKOUT_DIR/requirements-autodl.lock" ]] || {
@@ -95,14 +97,20 @@ cpu_action() {
         printf 'AUTODL_SEARCH_GATE_INCREMENTAL must be 0 or 1.\n' >&2
         return 64
     }
-    if [[ "${AUTODL_RESEAL_ONLY:-0}" == 1 &&
-          "${AUTODL_SEARCH_GATE_INCREMENTAL:-0}" == 1 ]]; then
-        printf 'Choose either offline reseal or search-gate incremental preparation, not both.\n' >&2
+    [[ "${AUTODL_SEARCH_MIX_INCREMENTAL:-0}" == 0 ||
+        "${AUTODL_SEARCH_MIX_INCREMENTAL:-0}" == 1 ]] || {
+        printf 'AUTODL_SEARCH_MIX_INCREMENTAL must be 0 or 1.\n' >&2
+        return 64
+    }
+    if (( ${AUTODL_RESEAL_ONLY:-0} + ${AUTODL_SEARCH_GATE_INCREMENTAL:-0} +
+          ${AUTODL_SEARCH_MIX_INCREMENTAL:-0} > 1 )); then
+        printf 'Choose only one incremental or offline reseal mode.\n' >&2
         return 64
     fi
 
     if [[ "${AUTODL_RESEAL_ONLY:-0}" == 1 ||
-          "${AUTODL_SEARCH_GATE_INCREMENTAL:-0}" == 1 ]]; then
+          "${AUTODL_SEARCH_GATE_INCREMENTAL:-0}" == 1 ||
+          "${AUTODL_SEARCH_MIX_INCREMENTAL:-0}" == 1 ]]; then
         export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1 PIP_NO_INDEX=1
         train_python="$TRAIN_ENV/bin/python"
         retriever_python="$RETRIEVER_ENV/bin/python"
@@ -150,6 +158,13 @@ PY
             "$train_python" "$CHECKOUT_DIR/scripts/data_process/multihop_search_gate.py" build \
                 --local-dir "$SEARCH_GATE_DATA_DIR"
             export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1
+        fi
+        if [[ "${AUTODL_SEARCH_MIX_INCREMENTAL:-0}" == 1 ]]; then
+            unset HF_HUB_OFFLINE TRANSFORMERS_OFFLINE HF_DATASETS_OFFLINE PIP_NO_INDEX
+            "$train_python" "$CHECKOUT_DIR/scripts/data_process/search_mix.py" download \
+                --local-dir "$SEARCH_MIX_DATA_DIR"
+            export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1 PIP_NO_INDEX=1
+            build_search_mix=1
         fi
     elif [[ "${AUTODL_RESEAL_ONLY:-0}" == 0 ]]; then
         base_python="$(resolve_llmdevelop_python)"
@@ -236,6 +251,46 @@ PY
         --test-size 128
         "$train_python" "$CHECKOUT_DIR/scripts/data_process/multihop_search_gate.py" build \
             --local-dir "$SEARCH_GATE_DATA_DIR"
+        "$train_python" "$CHECKOUT_DIR/scripts/data_process/search_mix.py" download \
+            --local-dir "$SEARCH_MIX_DATA_DIR"
+        export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1 PIP_NO_INDEX=1
+        build_search_mix=1
+    fi
+
+    if [[ "$build_search_mix" == 1 ]]; then
+        PYTHONPATH="$CHECKOUT_DIR" "$retriever_python" \
+            "$CHECKOUT_DIR/scripts/data_process/search_mix.py" retrieve \
+            --local-dir "$SEARCH_MIX_DATA_DIR" \
+            --index-path "$BM25_ROOT/bm25" \
+            --corpus-path "$CORPUS_JSONL" \
+            --offsets-path "$CORPUS_OFFSETS"
+        "$train_python" "$CHECKOUT_DIR/scripts/data_process/search_mix.py" materialize \
+            --local-dir "$SEARCH_MIX_DATA_DIR" \
+            --model-dir "$MODEL_DIR" \
+            --eval-catalog "$SEARCH_GATE_DATA_DIR/catalog.jsonl" \
+            --eval-parquet "$SMALL_DATA_DIR/test_128.parquet"
+        seal_search_mix=1
+    elif [[ -f "$SEARCH_MIX_DATA_DIR/manifest.json" &&
+            ! -L "$SEARCH_MIX_DATA_DIR/manifest.json" ]]; then
+        # Legacy reseals may include an already-complete mix, but do not require one.
+        seal_search_mix=1
+    elif [[ -e "$SEARCH_MIX_DATA_DIR/manifest.json" ||
+            -L "$SEARCH_MIX_DATA_DIR/manifest.json" ]]; then
+        printf 'Search-mix manifest exists but is not a regular non-symlink file.\n' >&2
+        return 1
+    fi
+    if [[ "$seal_search_mix" == 1 ]]; then
+        "$train_python" "$CHECKOUT_DIR/scripts/data_process/search_mix.py" verify \
+            --manifest "$SEARCH_MIX_DATA_DIR/manifest.json" \
+            --model-dir "$MODEL_DIR" \
+            --eval-catalog "$SEARCH_GATE_DATA_DIR/catalog.jsonl" \
+            --eval-parquet "$SMALL_DATA_DIR/test_128.parquet"
+        PYTHONPATH="$CHECKOUT_DIR" "$retriever_python" \
+            "$CHECKOUT_DIR/scripts/data_process/search_mix.py" replay \
+            --manifest "$SEARCH_MIX_DATA_DIR/manifest.json" \
+            --index-path "$BM25_ROOT/bm25" \
+            --corpus-path "$CORPUS_JSONL" \
+            --offsets-path "$CORPUS_OFFSETS"
     fi
 
     "$train_python" - "$MODEL_DIR" "$SMALL_DATA_DIR" <<'PY'
@@ -283,6 +338,7 @@ PY
     bash "$CHECKOUT_DIR/scripts/autodl/tests/test_gated_config.sh"
     bash "$CHECKOUT_DIR/scripts/autodl/tests/test_gated_followup.sh"
     bash "$CHECKOUT_DIR/scripts/autodl/tests/test_search_opportunity_pipeline.sh"
+    bash "$CHECKOUT_DIR/scripts/autodl/tests/test_group_probe_pipeline.sh"
     bash "$CHECKOUT_DIR/scripts/autodl/tests/test_shutdown_watchdog.sh"
     "$train_python" "$CHECKOUT_DIR/scripts/autodl/tests/test_results.py"
     "$train_python" "$CHECKOUT_DIR/scripts/autodl/tests/test_paired_eval.py"
@@ -315,8 +371,12 @@ PY
             "eval|control||$parent_placeholder" \
             "eval|cost_aware||$parent_placeholder" \
             "eval|cost_aware_gated||$parent_placeholder" \
-            "eval|search_opportunity||$parent_placeholder"; do
+            "eval|search_opportunity||$parent_placeholder" \
+            "eval|group_probe||$MODEL_DIR"; do
             IFS='|' read -r mode variant steps model_path <<<"$spec"
+            if [[ "$variant" == group_probe && "$seal_search_mix" != 1 ]]; then
+                continue
+            fi
             command_args=("$mode" "$variant")
             case "$mode:$variant" in
                 train:smoke|train:reproduce)
@@ -329,12 +389,18 @@ PY
                     command_args+=("$model_path")
                     ;;
             esac
+            config_response_length=256
             trace_output=''
             trace_stage=''
             trace_checkpoint_digest=''
             trace_parent_digest=''
             eval_data_file=''
-            if [[ "$variant" == cost_aware_gated || "$variant" == search_opportunity ]]; then
+            eval_group_size=1
+            if [[ "$variant" == group_probe ]]; then
+                config_response_length=500
+            fi
+            if [[ "$variant" == cost_aware_gated || "$variant" == search_opportunity ||
+                  "$variant" == group_probe ]]; then
                 trace_output="$trace_placeholder"
                 trace_stage="$variant"
                 if [[ "$mode" == eval ]]; then
@@ -345,12 +411,17 @@ PY
             fi
             if [[ "$variant" == search_opportunity ]]; then
                 eval_data_file="$SEARCH_GATE_DATA_DIR/eval_256.parquet"
+            elif [[ "$variant" == group_probe ]]; then
+                eval_data_file="$SEARCH_MIX_DATA_DIR/probe_multi_64.parquet"
+                eval_group_size=5
             fi
             AUTODL_CONFIG_ONLY=1 \
                 AUTODL_ROOT="$PROJECT_ROOT" \
                 GPU_COUNT="$gpu_count" \
+                MAX_RESPONSE_LENGTH="$config_response_length" \
                 OUTPUT_DIR="$config_output_dir" \
                 EVAL_DATA_FILE="$eval_data_file" \
+                EVAL_GROUP_SIZE="$eval_group_size" \
                 TRACE_OUTPUT_DIR="$trace_output" \
                 TRACE_STAGE="$trace_stage" \
                 TRACE_RUN_ID=config-compose \
@@ -363,6 +434,7 @@ PY
         AUTODL_CONFIG_ONLY=1 \
             AUTODL_ROOT="$PROJECT_ROOT" \
             GPU_COUNT="$gpu_count" \
+            MAX_RESPONSE_LENGTH=256 \
             OUTPUT_DIR="$config_output_dir" \
             TRACE_OUTPUT_DIR="$trace_placeholder" \
             TRACE_STAGE=cost_aware_gated_gate \
@@ -375,6 +447,7 @@ PY
             AUTODL_CONFIG_ONLY=1 \
                 AUTODL_ROOT="$PROJECT_ROOT" \
                 GPU_COUNT="$gpu_count" \
+                MAX_RESPONSE_LENGTH=256 \
                 OUTPUT_DIR="$config_output_dir" \
                 TRACE_OUTPUT_DIR="$trace_placeholder" \
                 TRACE_STAGE="$variant" \
@@ -391,21 +464,24 @@ PY
         "$MODEL_DIR" \
         "$parent_placeholder" \
         "$trace_placeholder" \
-        "$SEARCH_GATE_DATA_DIR/eval_256.parquet" <<'PY'
+        "$SEARCH_GATE_DATA_DIR/eval_256.parquet" \
+        "$SEARCH_MIX_DATA_DIR/probe_multi_64.parquet" \
+        "$seal_search_mix" <<'PY'
 from copy import deepcopy
 from pathlib import Path
 import sys
 
 from omegaconf import OmegaConf
 
-manifest_dir, model_dir, parent_placeholder, trace_placeholder, search_gate_data = map(
-    Path, sys.argv[1:]
+manifest_dir, model_dir, parent_placeholder, trace_placeholder, search_gate_data, group_probe_data = map(
+    Path, sys.argv[1:7]
 )
+seal_search_mix = sys.argv[7] == "1"
 train_variants = ("smoke", "reproduce", "control", "cost_aware", "cost_aware_gated")
 eval_variants = (
     "base", "reproduced", "control", "cost_aware", "cost_aware_gated",
     "search_opportunity",
-)
+) + (("group_probe",) if seal_search_mix else ())
 
 for gpu_count in (1, 2):
     configs = {}
@@ -415,7 +491,7 @@ for gpu_count in (1, 2):
             config = OmegaConf.load(path)
             configs[(mode, variant)] = config
             trace_output = config.trainer.get("trace_output_dir", None)
-            if variant in ("cost_aware_gated", "search_opportunity"):
+            if variant in ("cost_aware_gated", "search_opportunity", "group_probe"):
                 if Path(trace_output) != trace_placeholder:
                     raise SystemExit(f"trace output placeholder mismatch in {path}")
             elif trace_output:
@@ -427,6 +503,11 @@ for gpu_count in (1, 2):
                 raise SystemExit(f"GRPO group or actor mini-batch mismatch in {path}")
             if config.data.train_batch_size != 8:
                 raise SystemExit(f"default train batch size must be 8 in {path}")
+            expected_eval_group_size = 5 if variant == "group_probe" else 1
+            expected_val_batch_size = 8 if variant == "group_probe" else 64
+            if (config.data.eval_group_size != expected_eval_group_size
+                    or config.data.val_batch_size != expected_val_batch_size):
+                raise SystemExit(f"evaluation grouping mismatch in {path}")
             if config.actor_rollout_ref.actor.optim.lr_warmup_steps_ratio != 0.285:
                 raise SystemExit(f"actor warmup ratio must be 0.285 in {path}")
             if config.actor_rollout_ref.rollout.top_p != 1.0:
@@ -439,17 +520,14 @@ for gpu_count in (1, 2):
                 raise SystemExit(f"retriever top-k must be 3 in {path}")
             if config.data.max_start_length != 1024:
                 raise SystemExit(f"max_start_length must be 1024 in {path}")
-            if config.data.max_response_length != 256:
-                raise SystemExit(f"max_response_length must be 256 in {path}")
+            expected_response_length = 500 if variant == "group_probe" else 256
+            expected_prompt_length = 4096 if variant == "group_probe" else 3584
+            if config.data.max_response_length != expected_response_length:
+                raise SystemExit(f"max_response_length mismatch in {path}")
             if config.data.max_obs_length != 384:
                 raise SystemExit(f"max_obs_length must be 384 in {path}")
-            expected_max_prompt_length = (
-                config.data.max_start_length
-                + config.max_turns
-                * (config.data.max_response_length + config.data.max_obs_length)
-            )
-            if config.data.max_prompt_length != expected_max_prompt_length:
-                raise SystemExit(f"max_prompt_length does not match the search-loop formula in {path}")
+            if config.data.max_prompt_length != expected_prompt_length:
+                raise SystemExit(f"max_prompt_length mismatch in {path}")
             expected_wrap_classes = ["Qwen3_5DecoderLayer"]
             actor_wrap_classes = list(
                 config.actor_rollout_ref.actor.fsdp_config.wrap_policy.transformer_layer_cls_to_wrap
@@ -469,6 +547,9 @@ for gpu_count in (1, 2):
     gated_gate = OmegaConf.load(gated_gate_path)
     if Path(gated_gate.trainer.trace_output_dir) != trace_placeholder:
         raise SystemExit(f"trace output placeholder mismatch in {gated_gate_path}")
+    if (gated_gate.data.max_response_length != 256
+            or gated_gate.data.max_prompt_length != 3584):
+        raise SystemExit(f"historical response lengths mismatch in {gated_gate_path}")
     trace_eval_configs = {}
     for variant in ("control", "cost_aware"):
         path = manifest_dir / f"config-{gpu_count}gpu-{variant}-trace-eval.yaml"
@@ -477,7 +558,9 @@ for gpu_count in (1, 2):
         if (Path(trace_config.trainer.trace_output_dir) != trace_placeholder
                 or trace_config.trainer.trace_stage != variant
                 or trace_config.trainer.trace_checkpoint_digest != "a" * 64
-                or not trace_config.trainer.val_only):
+                or not trace_config.trainer.val_only
+                or trace_config.data.max_response_length != 256
+                or trace_config.data.max_prompt_length != 3584):
             raise SystemExit(f"trace-only evaluation contract mismatch in {path}")
     expected_steps = (
         (smoke, 2), (reproduced, 60), (control, 20), (cost_aware, 20),
@@ -514,8 +597,7 @@ for gpu_count in (1, 2):
 
     normalized_control = deepcopy(OmegaConf.to_container(control, resolve=True))
     normalized_cost = deepcopy(OmegaConf.to_container(cost_aware, resolve=True))
-    normalized_gated = deepcopy(OmegaConf.to_container(cost_aware_gated, resolve=True))
-    for normalized in (normalized_control, normalized_cost, normalized_gated):
+    for normalized in (normalized_control, normalized_cost):
         normalized["algorithm"]["cost_lambda"] = None
         normalized["algorithm"]["cost_reward_mode"] = None
         normalized["trainer"]["experiment_name"] = None
@@ -524,8 +606,8 @@ for gpu_count in (1, 2):
         normalized["trainer"]["trace_run_id"] = None
         normalized["trainer"]["trace_checkpoint_digest"] = None
         normalized["trainer"]["trace_parent_checkpoint_digest"] = None
-    if not (normalized_control == normalized_cost == normalized_gated):
-        raise SystemExit("stage-2 configs differ beyond reward settings and variant")
+    if normalized_control != normalized_cost:
+        raise SystemExit("current stage-2 configs differ beyond reward settings and variant")
 
     for variant, trace_config in trace_eval_configs.items():
         plain = deepcopy(OmegaConf.to_container(configs[("eval", variant)], resolve=True))
@@ -536,21 +618,27 @@ for gpu_count in (1, 2):
                 "trace_checkpoint_digest", "trace_parent_checkpoint_digest",
             ):
                 normalized["trainer"][key] = None
+        for key in ("max_response_length", "max_prompt_length"):
+            plain["data"][key] = None
+            traced["data"][key] = None
         if plain != traced:
             raise SystemExit(f"trace-only evaluation changes scientific config for {variant}")
 
     for variant in eval_variants:
         config = configs[("eval", variant)]
-        expected_path = model_dir if variant == "base" else parent_placeholder
+        expected_path = model_dir if variant in ("base", "group_probe") else parent_placeholder
         if Path(config.actor_rollout_ref.model.path) != expected_path:
             raise SystemExit(f"evaluation model placeholder mismatch for {variant}")
         if (config.algorithm.cost_lambda != 0.10
                 or config.algorithm.cost_reward_mode != "linear"
                 or not config.trainer.val_only):
             raise SystemExit(f"evaluation contract mismatch for {variant}")
-        expected_val = search_gate_data if variant == "search_opportunity" else Path(
-            configs[("eval", "control")].data.val_files
-        )
+        if variant == "search_opportunity":
+            expected_val = search_gate_data
+        elif variant == "group_probe":
+            expected_val = group_probe_data
+        else:
+            expected_val = Path(configs[("eval", "control")].data.val_files)
         if Path(config.data.val_files) != expected_val:
             raise SystemExit(f"evaluation data path mismatch for {variant}")
 PY
@@ -560,6 +648,15 @@ PY
     python_version="$($train_python -c 'import sys; print(".".join(map(str, sys.version_info[:3])))')"
     torch_version="$($train_python -c 'import torch; print(torch.__version__)')"
 
+    search_mix_handoff_args=()
+    if [[ "$seal_search_mix" == 1 ]]; then
+        search_mix_handoff_args+=(
+            --data "$SEARCH_MIX_DATA_DIR"
+            --extra-file "$MANIFEST_DIR/config-1gpu-group_probe-eval.yaml"
+            --extra-file "$MANIFEST_DIR/config-2gpu-group_probe-eval.yaml"
+        )
+    fi
+
     "$train_python" "$CHECKOUT_DIR/scripts/autodl/handoff.py" create \
         --root "$PROJECT_ROOT" \
         --commit "$commit" \
@@ -567,6 +664,7 @@ PY
         --bm25 "$BM25_ROOT/bm25" \
         --corpus "$CORPUS_ROOT" \
         --data "$SMALL_DATA_DIR" \
+        "${search_mix_handoff_args[@]}" \
         --requirements "$CHECKOUT_DIR/requirements-autodl.lock" \
         --extra-file "$CORPUS_GZIP" \
         --extra-file "$MANIFEST_DIR/train-freeze.txt" \

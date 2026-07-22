@@ -131,6 +131,32 @@ replace_with_search_gate_results() {
     printf '%s\n' "$digest" >"$ATTEMPT/evidence-digest"
 }
 
+replace_with_group_probe_results() {
+    local result_dir marker relative digest
+    local -a files=(
+        summary.json summary.md go_no_go.json per_trajectory.jsonl
+        per_question.jsonl lineage.tsv run-index.tsv raw-trace.jsonl
+    )
+    result_dir="$PROJECT_ROOT/runs/group-probe/attempts/$(basename -- "$ATTEMPT")"
+    marker="$PROJECT_ROOT/manifests/group-probe/$(basename -- "$ATTEMPT").ok"
+    mkdir -p "$result_dir" "$(dirname -- "$marker")"
+    for relative in "${files[@]}"; do printf 'evidence:%s\n' "$relative" >"$result_dir/$relative"; done
+    printf '{"decision":"NO-GO"}\n' >"$result_dir/go_no_go.json"
+    (
+        cd "$PROJECT_ROOT"
+        for relative in "${files[@]}"; do
+            printf 'runs/group-probe/attempts/%s/%s\n' \
+                "$(basename -- "$ATTEMPT")" "$relative"
+        done | LC_ALL=C sort | while IFS= read -r relative; do sha256sum "$relative"; done
+    ) >"$result_dir/evidence.sha256"
+    digest="$(sha256sum "$result_dir/evidence.sha256" | cut -d' ' -f1)"
+    printf '%s\n' "$digest" >"$marker"
+    printf 'group-probe-v1\n' >"$ATTEMPT/result-contract"
+    printf '%s\n' "$result_dir" >"$ATTEMPT/result-root"
+    printf '%s\n' "$marker" >"$ATTEMPT/evidence-marker"
+    printf '%s\n' "$digest" >"$ATTEMPT/evidence-digest"
+}
+
 run_watchdog() {
     local backend_rc="$1" mode="$2"
     SEARCH_R1_AUTODL_TEST_MODE=1 \
@@ -240,6 +266,21 @@ assert_order
 new_case search-gate-tampered 0 success
 replace_with_search_gate_results
 printf 'tampered\n' >>"$(cat "$ATTEMPT/result-root")/summary.json"
+run_watchdog 0 --test-foreground
+[[ -f "$ATTEMPT/shutdown-skipped" && ! -e "$ATTEMPT/shutdown-safe" ]]
+grep -Fq 'reason=authorization-revalidation-failed' "$ATTEMPT/shutdown-skipped"
+assert_no_backend_event
+
+# A grouped-probe NO-GO is complete scientific evidence under its own contract.
+new_case group-probe-no-go 0 success
+replace_with_group_probe_results
+run_watchdog 0 --test-foreground
+[[ -f "$ATTEMPT/shutdown-safe" && -f "$ATTEMPT/shutdown-dispatched" ]]
+assert_order
+
+new_case group-probe-tampered 0 success
+replace_with_group_probe_results
+printf 'tampered\n' >>"$(cat "$ATTEMPT/result-root")/per_trajectory.jsonl"
 run_watchdog 0 --test-foreground
 [[ -f "$ATTEMPT/shutdown-skipped" && ! -e "$ATTEMPT/shutdown-safe" ]]
 grep -Fq 'reason=authorization-revalidation-failed' "$ATTEMPT/shutdown-skipped"

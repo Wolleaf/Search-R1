@@ -1,228 +1,181 @@
 # Search-R1 小规模成本感知复现完整方案（AutoDL）
 
-> 本文件合并并取代《实验流程改进》和《最大搜索次数》中的执行决策，是后续实现与云端运行的唯一规划依据。两份来源笔记暂时保留，不作为配置真相。用户已批准按本方案完成最小实现；云端重训仍须从新 commit 的 Git 与 CPU 阶段重新开始。
+> 本文件是后续实现和云端运行的唯一规划依据。旧实验的配置、日志和负结果继续原样保留在 `docs/results/` 及结果分析文档中，不用新参数覆盖或改写。
 
-## 1. 项目目标与结论边界
+## 1. 目标、现状与边界
 
-目标是复现 Search-R1 的核心闭环：Qwen3.5 在推理中自主生成 `<search>`，读取 BM25 检索结果后继续推理，再通过 GRPO 和最终答案 EM 奖励学习搜索策略。在公共复现 checkpoint 上，只改变奖励函数是否包含检索成本，形成公平的 B/C 对照。
+目标是用 Qwen3.5-2B 复现 Search-R1 的核心闭环：模型生成 `<search>`，读取 BM25 检索结果后继续推理，再通过 GRPO 和答案 EM 学习搜索策略；在模型已具备正确多搜能力后，比较原奖励与成本感知奖励。
 
-本项目定位为面向 Agent 算法岗位的 **Search-R1-small 方法复现**，不是论文数值复刻。论文使用 8 张 H100、500 steps、NQ + HotpotQA、dense retriever 和更大 batch；本方案固定为两张 5090 级 GPU、Qwen3.5-2B、NQ 小数据、CPU BM25 和单 seed。可以展示 Agent loop、检索调用、RL 奖励设计、受控实验和成本权衡，但不能宣称完整复现论文多跳能力或统计显著性。
+此前 NQ-only、response 256 实验已经完整跑通工程链路，但多跳机会门禁得到 61/256 EM、248 题只搜一次；仅有的 8 条二搜全部截断且答错，多数重复 query。因此旧结果作为失败经验保留，不能继续从“几乎只搜一次”的策略直接优化成本。
 
-明确不做：PPO、7 个数据集全量评测、dense E5 大索引、模型或 lambda sweep、多 seed 自动化、按 test 选 checkpoint、优化器精确续训、自动硬件探测，以及通用实验 DAG。HotpotQA 小规模混合可作为未来工作，不进入本轮最小实现。
+本轮只解决两个已观测问题：
 
-## 2. 最大搜索预算固定为 4
+1. 将单次生成上限从 256 调为论文使用的 500，消除 11.72% 轨迹发生截断的干扰。
+2. 用实际 Wiki-18 BM25 top-3 结果筛选一搜充分题和可执行的二搜证据链，再以训练前探针决定是否值得重训。
 
-论文 v5 第 16 页明确写道：`The maximum action budget B is set to 4, and we retrieve the top 3 passages by default.` 仓库原始多机 recipe 也使用 `max_turns=4`。此前的 `max_turns=2` 是为 NQ-only 和低成本运行做的人为缩小，并非论文配置。它能运行，但缩窄了 Agent 的查询修正空间，也使成本感知的可比较区间过小，因此本轮废弃该选择。
+本项目仍是面向 Agent 算法岗位的缩小复现，不宣称复刻论文数值。固定两张 32 GiB 5090 级 GPU、单 seed、CPU BM25 和全参数微调；不做 PPO、dense retriever、模型/超参数 sweep、多 seed 或通用实验平台。
 
-为避免与 `B / Control` 的模型名称混淆，本文用 `T_max=4` 表示论文中的 action budget：
+## 2. 固定搜索与长度配置
 
-- 最多执行 4 个允许 `<search>` 的交互轮次，每次返回 top-3 passages。
-- 若第 4 轮后轨迹仍未结束，代码再执行 1 次 `do_search=False` 的最终回答生成。
-- 因而每条轨迹的真实检索次数 `n_search` 属于 `[0, 4]`，但最坏情况下共有 5 次模型生成。
-- `T_max` 是防止无限调用的硬约束；成本奖励是在合法范围内鼓励少而有效搜索的软目标，两者不重复。
+论文最大 action budget 为 4，默认返回 top-3 passages。本项目保持：
 
-不能只把 turn 数改成 4 而保留旧的 2048 rolling prompt 上限。按实际张量拼接，进入最终回答前的最坏上下文为：
+- 最多 4 个允许 `<search>` 的交互轮次；第 4 轮后仍未结束时，再生成一次禁止搜索的最终回答。
+- `n_search` 只统计真正发给检索服务的请求，范围为 `[0, 4]`。
+- `max_response_length=500` 是每次生成的上限，不是整条轨迹的总长度。
+- `max_prompt_length=4096` 固定为论文/上游 recipe 的配置，不再按最坏生成长度派生为 4560。
 
-```text
-max_prompt_length = 1024 + 4 * (256 + 384) = 3584
-```
-
-其中 1024 是初始 prompt 上限，256 是每次生成上限，384 是每次 observation 上限。默认固定为 3584；若人工启用 `MAX_RESPONSE_LENGTH=192` 的 OOM 回退，则联动计算为 3328。这样不会把名义上的四轮实现成会静默截断第四轮历史的两轮配置。四个搜索轮次后的最终回答会再使用一次独立生成预算：默认最多 256 tokens，OOM 回退时为 192 tokens。
-
-## 3. 固定实验设计
+四次 response、四段 observation 和最终回答的右侧理论上限为：
 
 ```text
-A / Base：固定 Qwen3.5-2B
-└── R / Reproduced：原始 EM 奖励训练 60 steps
-    ├── B / Control：从同一 R60，以原始 EM 奖励训练 20 steps
-    └── C / Cost-aware：从同一 R60，以成本感知奖励训练 20 steps
+4 * (500 + 384) + 500 = 4036 <= 4096
 ```
 
-| 项目 | 固定选择 |
-| --- | --- |
-| 模型 | `Qwen/Qwen3.5-2B` post-trained，revision `15852e8c16360a2fea060d615a32b45270f8a8fc` |
-| 算法 | GRPO，group size 5 |
-| 数据 | NQ train-512、val-64、test-128，seed 42 |
-| 检索 | Wikipedia 2018 CPU BM25，top-k=3，`T_max=4` |
-| 硬件 | `GPU_COUNT=2`，两张 5090 级 GPU；不自动检测或改参 |
-| 正式终点 | R=`global_step_60`，B/C=`global_step_20` |
-| 统一评测 | A/R/B/C 均使用 test-128、`T_max=4`、评测 `lambda=0.10` |
-| 总硬预算 | 300 元，其中 GPU 分项上限合计 250 元 |
+因此训练输出侧可以完整保留。只有四轮都异常生成满 500 token 时，rolling context 才会裁掉最老的最多 464 token；正常 `<search>` action 远短于 500。当前固定参数为：
 
-每个训练 step 使用 8 个 prompts，每个 prompt 采样 5 条轨迹，即 40 条 agent trajectories 和 1 次 actor update。R/B/C 合计 100 次更新、4000 条训练轨迹。相较旧的 batch 4、group 8 配置，每步轨迹数从 32 增至 40，理论工作量增加 25%，因此不能宣称新配置训练更快。R、B、C 只在固定终点保存正式权重；val-64 只作终点记录，不用于选择 checkpoint。
-
-B/C 必须读取同一个 R60 路径及 digest，使用相同数据、shuffle、seed、batch、group size、学习率、warmup、KL、搜索预算、检索器、token 上限和硬件。唯一科学变量是训练奖励：B 的 `cost_lambda=0`，C 的 `cost_lambda=0.10`。两条分支都从 R 的模型权重创建新的 Adam、warmup 和数据加载状态，因此应称为 **stage-2 受控分叉/二阶段微调**，不是 optimizer 精确断点续训。
-
-## 4. 奖励函数与公平评测
-
-设最终答案精确匹配为 `r_em in {0, 1}`，真实执行检索次数为 `n_search`：
-
-```text
-R/B 原奖励：       r = r_em
-C 成本感知奖励：   r = r_em - 0.10 * n_search / 4
-统一评测 utility： u = EM - 0.10 * avg_searches / 4
-```
-
-| 实际检索次数 | C 中检索成本 | 答对时奖励 |
-| ---: | ---: | ---: |
-| 0 | 0.000 | 1.000 |
-| 1 | 0.025 | 0.975 |
-| 2 | 0.050 | 0.950 |
-| 3 | 0.075 | 0.925 |
-| 4 | 0.100 | 0.900 |
-
-搜索后答对的最低奖励仍为 0.90，显著高于不搜索但答错的 0，因此目标不是禁止搜索，而是减少无收益调用。代码只统计真正发给检索服务的请求，并用随 batch 重排的 `executed_search_count` tensor 计算成本；无效格式、未执行请求和最后一次禁止搜索的生成都不增加计数。
-
-训练期 R/B 的 reward 只反映 EM，C 的 reward 已包含成本。为了公平，最终 A/R/B/C 一律重新按同一个 `/4` 公式报告 EM、平均检索次数、no-search ratio 和 utility，不能直接横向比较不同定义的训练 reward。
-
-## 5. Qwen3.5 与两卡最小配置
-
-仓库原依赖不能直接支持 Qwen3.5 与 RTX 5090，保留现有最小兼容策略：
-
-1. 使用 AutoDL PyTorch 2.8.0 / Python 3.12 / CUDA 12.8 镜像，Conda 环境名沿用 `llmdevelop`，在持久盘创建隔离 venv。
-2. 使用 HF rollout 而不是旧版 vLLM 适配层；PyTorch SDPA、bf16、temperature 1.0、top-p 1.0。
-3. 关闭 `flash_attention_2` 和 `use_remove_padding`，保留 retrieved-token loss masking、FSDP、gradient checkpointing 和 CPU offload。
-4. 默认 batch=8、group=5、actor mini-batch=40；actor/log-prob micro-batch 在两卡时为 2，rollout micro-batch=1。
-
-保持全参数微调，不切换 LoRA。实测 step 1 成功而 step 2 OOM 的主要新增量不是模型参数或 batch 本身，而是第一次 `optimizer.step()` 后才创建的 Adam `m/v` 状态：旧实现会在下一次 forward/backward 前把全部状态回载到 GPU，使其与长序列激活和大词表 logits 重叠。最小修复是让 optimizer state 在反向期间继续驻留 CPU，只在每次 `optimizer.step()` 前回载，并在 step 后立即卸载；损失函数、梯度、Adam 更新公式和所有科学参数均不变。
-
-| 参数 | 默认值 |
+| 参数 | 值 |
 | --- | ---: |
 | `max_start_length` | 1024 |
-| 每次 `max_response_length` | 256 |
-| 每次 `max_obs_length` | 384 |
-| `max_turns` | 4 |
-| `max_prompt_length` | 3584（由上述参数计算） |
-| learning rate / warmup | `1e-6` / 28.5% |
-| KL coefficient | `0.001` |
-| `PYTORCH_CUDA_ALLOC_CONF` | `expandable_segments:True` |
+| `max_response_length` | 500 |
+| `max_obs_length` | 384 |
+| `max_prompt_length` | 4096 |
+| `max_turns` / retriever top-k | 4 / 3 |
+| train batch / GRPO group | 8 / 5 |
+| temperature / top-p | 1.0 / 1.0 |
+| learning rate / warmup | `1e-6` / 0.285 |
+| KL coefficient | 0.001 |
 
-不先试单卡，不在运行中自动改参数。只有修复后的两卡 2-step gate 仍明确 OOM，才由用户决定是否先保持 batch=8、group=5 并将 response 回退到 192（prompt 自动派生为 3328）；仍 OOM 时再让 R/B/C 与全部评测共同回退到 batch=4。`T_max=4`、group size=5 和固定步数不降级。
+保持 HF rollout、SDPA、bf16、retrieved-token loss masking、gradient checkpointing，以及 parameter/gradient/optimizer CPU offload。两卡下 actor、rollout 和 reference 的实际每卡 micro-batch 已为 1，不预先降低 batch 或 group。
 
-## 6. 三阶段执行与旧实验迁移
+若 `4096/500` 的两步 smoke 在第二次 backward 明确 OOM，第一回退是 response 384，prompt 仍为 4096。batch 4 只用于确认是批次级驻留而非单条长序列导致的 OOM，不作为首选回退。历史 `05/06` 入口继续显式锁定 256，仅用于解释已归档实验。
 
-所有环境、资产、状态和产物放在持久盘 `/root/autodl-tmp/search-r1/`，严格按 **Git -> CPU -> GPU** 执行。
+## 3. 检索验证混合数据
 
-### 阶段一：Git 固定新实现
+源数据固定为 `RUC-NLPIR/FlashRAG_datasets@bcafb8dd07d453be3cbeeeb3f78be1841bddf92c`：
 
-用户批准本方案后才修改代码、运行测试、提交和 push。云端 checkout 必须固定到新的 40 位 commit、detached HEAD 且工作区干净。GitHub 直连失败时继续使用完整 Git bundle，不用不可信的临时源码副本。
+| 文件 | bytes | SHA-256 |
+| --- | ---: | --- |
+| `nq/train.jsonl` | 9,960,189 | `572685d3f384d9c37479b1fb14232984c85ff13b58923c0c9442232bd5d5647b` |
+| `hotpotqa/train.jsonl` | 569,520,788 | `a81274abafa899ec0ee073102edbe6bb694a8a1174201b4e43e2bc6c98964d1a` |
 
-旧的两轮 GPU attempt `20260719T135124Z-1441-19817` 已按用户要求 TERM，外层终态为 `failed/143`。它的 1-step gate 日志和 R 的已完成 step 只保留为 B=2 工程诊断证据；没有 `global_step_60`，不得作为新实验的 R，也不得进入最终 A/R/B/C 表。
+固定组成：
 
-四轮配置的 GPU attempt `20260720T014406Z-1468-5995` 中，R run `20260720T022258Z-1500-22251` 在 step 1 完成后、step 2 的 `loss.backward()` 发生 CUDA OOM，外层已持久化为 `failed/1`，且没有可采用的正式 checkpoint。这个现象正好暴露了 Adam 状态首次创建后的驻留时序；因此不能用旧的 1-step gate 宣称配置稳定，也不能把它简单归因于 batch=8。
+| split | NQ 一搜充分 | Hotpot comparison | Hotpot bridge | 总数 |
+| --- | ---: | ---: | ---: | ---: |
+| train | 256 | 160 | 96 | 512 |
+| val | 64 | 40 | 24 | 128 |
+
+val 中 64 道 Hotpot 题同时作为训练前及 R-mix 后的 held-out probe，不进入训练。现有 HotpotQA/2Wiki dev-256 继续作为独立最终多跳评测，不参与筛选或训练。
+
+这个配比不是随机拼接：一半 NQ 保留“一次搜索即可回答”的基线，避免模型把所有题都学成固定二搜；另一半 Hotpot 强制提供二搜才首次出现答案的训练机会。多跳部分以较容易探索的 comparison 为主（160），同时保留足够 bridge（96）检验能否从第一轮 observation 生成第二个 query。512 题配合 batch 8 的 60 steps 约等于单次遍历，不扩大数据量或做配比 sweep。
+
+### 3.1 一搜充分标准
+
+NQ 候选用原问题查询相同 Wiki-18 BM25 top-3。模型实际可见的 384-token observation 中必须出现至少一个规范化 gold alias；优先选择 top-1 即命中的样本。排除答案已在问题中、空答案、`yes/no`、过短歧义答案以及跨 split 重复问题。
+
+### 3.2 多搜证据链标准
+
+HotpotQA 候选必须恰好有两个不同 supporting titles，并满足：
+
+1. 原问题的第一次 top-3 只覆盖其中一个 supporting title，不能已经覆盖两个。
+2. 第二个 oracle query 是缺失 title；它必须返回新文档并命中第二个 supporting title。
+3. comparison 的两个实体应能从问题中获得；bridge 的缺失 title 必须出现在第一次实际可见的 observation 中。
+4. 每个 title 的全部 annotated supporting facts 必须在对应 observation 中可见；第二个 title 的事实不得在第一轮泄漏。
+5. gold 不得出现在问题或第一轮 observation 中，且必须在第二轮 observation 中首次可见，排除“题目里二选一即可猜中”的奖励捷径。
+6. 排除重复文档、无新增证据、非法或空字段、`yes/no` 以及 source/question 重复。
+
+oracle query 和 supporting metadata 只进入审计 catalog，绝不写入 prompt。Parquet 每行只保留 `data_source`、`prompt`、`ability`、`reward_model` 和 `extra_info`，防止把 benchmark context 泄漏给模型。
+
+构建器必须输出 `train_512.parquet`、`val_128.parquet`、`probe_multi_64.parquet`、`catalog.jsonl`、筛选 ledger、`manifest.json` 及 SHA-256 sidecar。ledger 记录候选查询顺序摘要和拒绝计数，manifest 绑定源文件、BM25/corpus revision、tokenizer revision、top-k、长度配置及全部产物摘要；verify 从 pinned JSONL 重建 evidence 对应的 source record，并在固定 evidence 上重跑确定性选样，但不宣称离线重放全部未入选查询。最终入选 640 题仍须重放约 960 次 BM25 查询。现有 NQ test-128 与 HotpotQA/2Wiki dev-256 都作为 exclusion 输入，不能进入新 train/val。
+
+## 4. 训练前行为探针
+
+探针必须使用下一阶段真实 parent。本轮 `R-mix60` 从原始 Qwen3.5-2B 开始，因此 probe 也使用该基座，不使用已经偏向单搜的 B/control20。
+
+对 held-out Hotpot-64 每题按训练配置随机采样 5 条轨迹，共 320 条；`val_batch_size=8`，每批 40 条 rollout，不反向传播、不保存 checkpoint。有效正确多搜轨迹要求：
+
+- `EM=1`、`n_search>=2`、无截断、无非法动作；
+- 第二 query 与第一 query 不是近重复；
+- 第二轮带来新文档，并新增 supporting title 或让答案证据首次可见。
+
+只有同时满足以下条件才进入训练：
+
+| 门槛 | 要求 |
+| --- | ---: |
+| 有效正确多搜轨迹 | 至少 16/320 |
+| 覆盖问题 | 至少 8/64 |
+| 可学习 group | 至少 8 个 group 同时含正确多搜与错误轨迹 |
+| 全局 clipped rate | 不高于 5% |
+| 全局 invalid-action rate | 不高于 5% |
+
+comparison/bridge 分层报告；至少 2 道 bridge 通过作为诊断目标，但首轮不设为硬门槛。probe NO-GO 是有效科学结果：停止长训练，不靠增加步数掩盖缺少探索轨迹的问题。
+
+实现上只有 `data.eval_group_size=5` 的 probe 会复制样本并设置 `do_sample=True`；默认值 1 继续使用原有贪心评测。每条 probe trace 都带 `group_uid/group_slot/group_size`，并保存完整思考、query、检索文档、答案、截断及非法动作。分析产物固定包含机器可读 summary、逐题与逐轨迹 JSONL；科学 NO-GO 返回正常完成状态，只有 schema、digest 或基数错误才是工程失败。
+
+## 5. 能力训练与成本分叉
+
+```text
+A / Base Qwen3.5-2B
+└── R-mix / 原始 EM 奖励，混合 train-512，60 steps
+    ├── B-mix / 原始 EM 奖励，20 steps
+    └── C-gated-mix / correct-only 成本奖励，20 steps
+```
+
+先只训练 `R-mix60`。完成后在同一 held-out probe-64 上重新采样，除第 4 节能力门槛外，还要至少有 8/64 个 group 出现“两条以上都正确但搜索次数不同”的 cost-contrast 信号。只有此时才从完全相同的 R-mix60 checkpoint 对称训练 B 与 C。
+
+设 `c=n_search/4`，训练奖励为：
+
+```text
+R-mix / B-mix:       r = EM
+C-gated-mix:         r = EM * (1 - 0.10 * c)
+统一评测 utility:    u = EM - 0.10 * c
+```
+
+`correct_only` 使答错轨迹始终为 0，不再出现“搜索后答错比不搜索答错更差”的直接梯度。B/C 除奖励模式外必须共享 parent digest、数据顺序、seed、batch、group、长度、检索器和训练步数。
+
+成功标准预注册为：C 相对 B 在共同答对题中的平均搜索量下降至少 10%，总体 EM 下降不超过 3 个百分点，统一 utility 提升，且多搜题不发生 no-search collapse。未达到也作为完整负结果保留。
+
+## 6. 三阶段执行
+
+### 阶段一：Git
+
+本地完成实现、测试、commit 和 push。云端只接受固定 40 位 commit、detached HEAD 和干净 checkout；GitHub 失败时使用绑定 SHA-256 的 Git bundle，不使用未固定源码。
 
 ### 阶段二：CPU 无卡准备
 
-新 commit 会使旧 `cpu_handoff.json` 失效，必须重新封存。模型、语料、索引、环境和 NQ 数据可在 hash 校验后复用，不重复下载或重建大文件。CPU 阶段不运行 `nvidia-smi`，不根据无卡时的机器规格调整训练参数。
+复用现有模型、环境、Wiki corpus 和 BM25 索引，只新增固定的 NQ/Hotpot train 源文件、检索 evidence、混合 Parquet 和 manifest。CPU 阶段不运行 `nvidia-smi`，也不依据无卡实例规格调参。
 
-CPU 阶段需要重新完成：
+新 commit 和新数据都会使旧 `cpu_handoff.json` 失效。CPU 阶段必须：
 
-1. 校验 commit、依赖锁、Qwen 模型、BM25 索引、wiki corpus 和 NQ 数据。
-2. 组合 1/2 GPU 下 smoke、R、B、C 与 A/R/B/C eval 的 16 份 Hydra 配置。
-3. 显式断言所有配置均为 `max_turns=4`、top-k=3，并满足 prompt-length 派生公式。
-4. 去除 lambda 与实验名后，全量比较 B/C resolved config，确保没有第二个科学变量。
-5. 运行 tokenizer、真实 BM25、奖励、结果汇总和运行时测试，再发布自校验 handoff。
+1. 验证源文件、旧资产和 checkout identity。
+2. 用 retriever venv 生成 BM25 evidence，再用 train venv 和 Qwen tokenizer 做 384-token 可见性筛选及 Parquet materialize；最后用 retriever venv 重放所有入选查询。
+3. 验证 train/val/既有测试题零重叠、Parquet 无 metadata/context 泄漏、manifest 可重算。
+4. 组合 1/2 GPU resolved configs，精确断言 response 500、prompt 4096、turns 4、top-k 3。
+5. 运行测试后发布新的自校验 handoff。
 
-### 阶段三：两卡 GPU 离线运行
+### 阶段三：两卡 GPU
 
-GPU phase 只接受与新 commit 匹配的 handoff，然后严格串行执行：
+当前实现切片只运行训练前 probe：
 
-1. 启动本机 CPU BM25 服务并通过 health check。
-2. Gate 1：A -> smoke 2 steps，验证四轮 rollout、检索、奖励、连续两次反向以及 `global_step_2` 保存；第 2 步必须在 Adam 状态已经初始化后成功。
-3. Gate 2：从 Gate 1 的 `global_step_2` -> control 1 step，验证 actor/ref 子 checkpoint 重载并保存 `global_step_1`。
-4. 两个 gate 成功后分别精确删除 `smoke/global_step_2` 与 `control/global_step_1`，保留日志、终态和清理证据。
-5. A -> R60；验证并只保留 `global_step_60`。
-6. 同一 R60 -> B20 与 C20；分别只保留 `global_step_20`。
-7. 依次评测 A、R、B、C，并生成结果、lineage 和 checksum。
+1. 启动 CPU BM25 服务并 health check。
+2. 运行 Base × held-out Hotpot-64 × group-5 行为探针；NO-GO 则归档并停止。
+3. 只有 GO 后才进入下一实现切片：接通混合训练入口，运行 `4096/500` 的 2-step smoke，再训练 R-mix60 并复测 probe。
+4. 只有 R-mix 同时通过能力及 cost-contrast 门槛，才实现并训练对称的 B-mix20/C-gated-mix20。
 
-任一 gate、正式训练或评测失败都停止流水线，不自动重试、不复用部分 checkpoint、不缩短步数、不切换模型，也不因科学负结果重跑。
-
-## 7. 用户批准后的最小实现清单
-
-在已经完成的四轮与成本奖励实现上，本轮只增加与实测 step-2 OOM 和付费停机直接相关的最小改动：
-
-- `verl/workers/actor/dp_actor.py`、`verl/workers/fsdp_workers.py`：把 Adam 状态回载移动到梯度裁剪之后、`optimizer.step()` 之前，并在 step 的 `finally` 中立即卸载；不改变全参数训练数学语义。
-- `tests/test_optimizer_state_offload_order.py`：断言累积 backward 期间不回载状态，以及每次更新严格执行 `backward -> load -> step -> offload`。
-- `scripts/autodl/train_small_grpo.sh`、`02_cpu_prepare.sh`、`03_gpu_run.sh`：基础 gate 固定为 2 steps，checkpoint-load gate 保持 1 step，并分别校验和清理精确终点。
-- `scripts/autodl/lib/runtime.sh`：先向 phase log 写入并同步唯一 terminal sentinel，再原子发布终态，供外部 watchdog 验证。
-- `scripts/autodl/04_watch_and_shutdown.sh` 及负向测试：仅对显式给出的 exact GPU attempt 授权；完整终态和成功产物校验后才调用绑定且重新校验的 `/usr/bin/shutdown`。
-- `scripts/autodl/README.md`、本规划与静态审计策略：同步 gate、OOM 诊断、回退顺序、watchdog 命令及控制台计费确认要求。
-
-核心 `RewardManager`、agent generation loop、loss、学习率、batch=8、group=5、response=256、`T_max=4`、R/B/C 步数和预算都不改，也不引入 LoRA、自动调参、恢复 DAG 或额外实验分支。根目录通用 `train_ppo.sh`/`train_grpo.sh` 不属于本 AutoDL 入口，继续不改。
-
-## 8. 验证与重新准入
-
-实现后先本地运行：
+当前 GPU 命令唯一为：
 
 ```bash
-python -m pytest -q
-python -m unittest -v scripts.autodl.tests.test_results
-bash scripts/autodl/tests/test_runtime.sh
-bash scripts/autodl/tests/test_shutdown_watchdog.sh
-bash -n scripts/autodl/*.sh scripts/autodl/**/*.sh
-python -m compileall scripts/autodl verl/workers
-yapf --diff verl/workers/actor/dp_actor.py verl/workers/fsdp_workers.py tests/test_optimizer_state_offload_order.py
+GPU_COUNT=2 AUTODL_PRICE_PER_HOUR=5.76 \
+bash /root/autodl-tmp/search-r1/checkout/scripts/autodl/07_gpu_group_probe.sh
 ```
 
-还要运行 AutoDL 静态审计、`git diff --check`，检查 shell 执行位，并确认 canonical 文档和生产入口中不存在旧的 `max_turns=2`、utility `/2`、每次扣 0.05 或“两个 gate 都是 1 step”等残留。新 commit push 后，云端必须依次重跑 Git seal 和 CPU handoff；旧 commit 的 gate 成功不能替代新 2-step gate。
+历史 `03/05/06` 不用于本轮 probe。这样若 Base 本身没有足够的正确二搜探索，最多只支付一次评测成本，不会先写或启动没有学习信号的长训练。
 
-GPU 准入以两级 gate 为准：必须同时证明四轮配置成功组合、无 OOM/Traceback、真实检索可用、Adam 已初始化后的第 2 次反向完成、checkpoint 能保存并重载。gate 只验证工程可运行，不作为科学结果。
+任一工程 gate 失败都停止，不自动改参或采用不完整 checkpoint。科学 NO-GO 不自动重试。终态、原始 exit code、日志和摘要全部落盘后，才允许已绑定 exact attempt 的 watchdog 请求关机；用户仍需在 AutoDL 控制台确认停止计费。
 
-## 9. 训练资料与面试证据
+## 7. 证据、预算与面试口径
 
-每个 attempt 必须在持久盘保留：
+每个 attempt 保存 resolved config、run.env、完整 train/eval log、WandB offline history、逐轨迹 JSONL、trace manifest、checkpoint/parent digest、terminal 和 exit code。最终导出 loss/KL/entropy/grad norm、EM、搜索次数、截断率、非法动作率、query 变化、新文档覆盖、按 comparison/bridge 分层的成功轨迹及典型完整思考过程。
 
-- `train.log`：每个完成 step 的聚合指标。
-- WandB offline run：原精度 history 和 config，不依赖联网账号。
-- `resolved-config.yaml`、`run.env`、terminal、exit code、commit 与 handoff digest。
-- R/B/C checkpoint digest 与父子 lineage。
-- 最终 `results.csv`、`results.md`、`lineage.tsv` 和 `comparison.sha256`。
+两卡单价按 5.76 元/小时记录。当前 probe 的硬上限为 10 元；response 500 只在输出实际变长时增加耗时。后续训练仍以 300 元为总硬上限，但只有 probe GO 后才启用训练预算。100 GB 数据盘足够：新增 Hotpot train 原文件约 0.57 GB，检索 ledger 和混合 Parquet 远小于 checkpoint。
 
-可恢复的训练曲线至少包括 `actor/pg_loss`、`actor/kl_loss`、entropy、grad norm、learning rate、reward/EM、平均检索次数、no-search ratio、派生 utility、step time、GPU-hours 和人民币。GRPO 的 policy loss 来自新的 on-policy 小批次与组内标准化优势，可能围绕 0 正负波动，不应在面试中声称它必须单调下降；主科学证据应是 B/C 的 EM、search count 和统一 utility，以及 A/R 的 sanity check。
-
-GPU 完成并关机后，再在不挂 GPU 的 CPU 阶段从原始日志导出 CSV 和曲线图，不让绘图延长付费 GPU 时间。当前保存的是 per-step 聚合指标，不是每条 trajectory 的完整原始 token；报告中应如实说明这一证据粒度。
-
-## 10. 评测与成功标准
-
-最终表固定为四行：
-
-| Model | 作用 | Test EM | Avg Searches | No-search Ratio | Utility (`lambda=0.10`, `/4`) |
-| --- | --- | ---: | ---: | ---: | ---: |
-| A / Base | 原始模型 | ... | ... | ... | ... |
-| R / Reproduced | Search-R1-small 复现点 | ... | ... | ... | ... |
-| B / Control | 原奖励二阶段控制组 | ... | ... | ... | ... |
-| C / Cost-aware | 成本奖励实验组 | ... | ... | ... | ... |
-
-工程成功要求：R60、B20、C20 三个固定终点存在且 digest/lineage 正确；四路 test-128 完成；比较文件 hash 全部通过。科学解释分两层：A vs R 仅检查缩小版 RL 是否改变搜索/回答行为，主结论来自 B vs C 是否在尽量保留 EM 的同时降低搜索并提高统一 utility。
-
-若 R 没有优于 A、B 本身几乎不搜索、C 降低搜索但同时明显损害 EM，或 C 的 utility 不提升，都作为有效负结果如实报告；不追加单边训练、lambda sweep 或 checkpoint 挑选来美化结论。
-
-## 11. 预算、存储与安全停机
-
-| 付费项 | 硬上限（元） |
-| --- | ---: |
-| Base 2-step gate | 15 |
-| checkpoint-load 1-step gate | 15 |
-| R：60 steps | 100 |
-| B：20 steps | 40 |
-| C：20 steps | 40 |
-| A/R/B/C 四次评测 | 10 x 4 = 40 |
-| **GPU 分项合计** | **250** |
-| CPU、100 GB 存储和阶段开销预留 | 50 |
-| **项目总硬上限** | **300** |
-
-四轮最坏生成次数从 3 次增至 5 次，旧 B=2 的 ETA 不能直接复用。默认 batch 8、group 5 每步 40 条轨迹，比旧 batch 4、group 8 的 32 条多 25% 工作量，不能据此承诺更快。按两卡 5.76 元/小时粗略规划为 15-25 小时、约 86-144 元；最终只以新 gate 和正式 step 的实测为准。现有分项 timeout 已留有远大于该区间的硬余量，因此暂不扩到 350 元。预算是 fail-closed 上限：超时则失败，不自动降 turns、改 batch 或加钱。
-
-`T_max=4` 不改变模型参数量或 checkpoint 大小，只增加计算与少量日志。100 GB 盘仍预计使用 55-70 GB：固定环境、模型、语料和索引约 30-35 GB，R/B/C 权重约 12-18 GB，其余留给日志、Ray/WandB 和状态；无需再次扩容。
-
-GPU phase 本身不做无条件关机。每次 GPU attempt 单独显式安装绑定 exact attempt、commit、checkout tree、持久盘、phase lock 和 `/usr/bin/shutdown` digest 的 watchdog。它必须等待完整 terminal、原始 exit code、唯一匹配 marker、日志 sentinel 和 durable sync；成功时还要执行 `sha256sum -c comparison.sha256`，并验证 `gpu.ok == attempt/comparison-digest == sha256(comparison.sha256)`，从而拒绝属于其他 attempt 的全局结果包。失败或人工 TERM 时也只有在终态完整后才请求 guest shutdown。锁冲突、状态不完整、成功产物校验失败或 dry-run 一律保持开机并记录原因；test mode 只模拟状态流转，不执行真实关机。`shutdown-requested` 表示 backend 即将被调用，`shutdown-dispatched` 仅表示 backend 返回 0，最终仍由用户在 AutoDL 控制台确认实例停止且不再计费。
-
-## 12. 批准后的执行顺序
-
-1. 用户审阅并批准本文件，明确接受 `T_max=4`、batch 8、group size 5、默认 prompt=3584、NQ-only 边界和 300 元硬上限。
-2. 实现第 7 节的最小改动与测试，不触碰无关上游代码。
-3. 提交并 push 新 commit，记录完整 SHA；不提交本地论文 PDF 和来源笔记，除非用户另行要求。
-4. 用户以无 GPU 模式开机后，通过 SSH 更新固定 checkout 并重跑 CPU handoff；复用已校验的大资产。
-5. CPU 成功且关机后，用户挂载两张 GPU 再开机；运行两级 B=4 gate 和完整 R/B/C/评测流程。
-6. 终态持久化后由 watchdog 请求关机；用户在控制台确认停止计费。
-7. 以后续 CPU 会话导出训练曲线、整理实验表和简历/面试说明。
+面试中应如实表述：256 是局部截断干扰，但不是缺少多搜的唯一原因；真正的改进是把“多跳数据集标签”转化为由相同检索器验证的可执行二搜证据链，并用 group-level 探针在训练前检查稀疏奖励是否存在可学习信号。
