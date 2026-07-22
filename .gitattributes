@@ -4,3 +4,9 @@ docs/results/search-r1-small-20260720/lineage.tsv text eol=lf
 docs/results/search-r1-small-20260720/comparison.sha256 text eol=lf
 docs/results/search-r1-small-20260720/training_metrics.csv -text -diff
 docs/results/search-r1-small-20260720/generated.sha256 text eol=lf
+docs/results/search-opportunity-gate-20260722/README.md text eol=lf
+docs/results/search-opportunity-gate-20260722/analysis_zh.md text eol=lf
+docs/results/search-opportunity-gate-20260722/archive.sha256 text eol=lf
+docs/results/search-opportunity-gate-20260722/results/** -text -diff
+docs/results/search-opportunity-gate-20260722/eval/** -text -diff
+docs/results/search-opportunity-gate-20260722/phase/** -text -diff

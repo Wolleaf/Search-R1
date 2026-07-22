@@ -1,0 +1,62 @@
+{
+  "criteria": {
+    "all_with_three_plus_searches_count": {
+      "comparison": ">=",
+      "observed": 0,
+      "pass": false,
+      "reason": "questions with S>=3: 0 < 10",
+      "threshold": 10
+    },
+    "candidate_ratio_among_three_plus": {
+      "comparison": ">=",
+      "observed": null,
+      "pass": false,
+      "reason": "candidate share among S>=3: denominator unavailable",
+      "threshold": 0.3
+    },
+    "clipped_ratio": {
+      "comparison": "<=",
+      "observed": 0.1171875,
+      "pass": false,
+      "reason": "response-clipped question ratio: 0.117188 > 0.05",
+      "threshold": 0.05
+    },
+    "correct_with_two_plus_searches_count": {
+      "comparison": ">=",
+      "observed": 0,
+      "pass": false,
+      "reason": "correct answers with S>=2: 0 < 8",
+      "threshold": 8
+    },
+    "correct_with_two_plus_searches_ratio": {
+      "comparison": ">=",
+      "observed": 0.0,
+      "pass": false,
+      "reason": "share of correct answers with S>=2: 0 < 0.2",
+      "threshold": 0.2
+    },
+    "invalid_action_ratio": {
+      "comparison": "<=",
+      "observed": 0.1171875,
+      "pass": false,
+      "reason": "questions with invalid actions: 0.117188 > 0.05",
+      "threshold": 0.05
+    },
+    "redundancy_candidate_count": {
+      "comparison": ">=",
+      "observed": 0,
+      "pass": false,
+      "reason": "strong+medium redundancy candidates: 0 < 5",
+      "threshold": 5
+    },
+    "total_correct": {
+      "comparison": ">=",
+      "observed": 61,
+      "pass": true,
+      "reason": "correct answers: 61 >= 20",
+      "threshold": 20
+    }
+  },
+  "decision": "NO-GO",
+  "note": "GO means the fixed baseline exposes enough observable search opportunity to justify the pre-registered cost-aware follow-up; redundancy labels are heuristic candidates, not proof that a search was unnecessary."
+}

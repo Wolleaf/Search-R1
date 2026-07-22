@@ -1,0 +1,2 @@
+stage	mode	run_dir	trace
+B-multihop	eval	/root/autodl-tmp/search-r1/runs/eval/search_opportunity/attempts/20260722T031434Z-1714-18467	/root/autodl-tmp/search-r1/runs/eval/search_opportunity/attempts/20260722T031434Z-1714-18467/traces/eval_predictions.jsonl
