@@ -10,3 +10,4 @@ docs/results/search-opportunity-gate-20260722/archive.sha256 text eol=lf
 docs/results/search-opportunity-gate-20260722/results/** -text -diff
 docs/results/search-opportunity-gate-20260722/eval/** -text -diff
 docs/results/search-opportunity-gate-20260722/phase/** -text -diff
+docs/*.pdf -text -diff
