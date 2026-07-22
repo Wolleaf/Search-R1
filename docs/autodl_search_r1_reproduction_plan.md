@@ -61,12 +61,12 @@
 
 | split | NQ 一搜充分 | Hotpot comparison | Hotpot bridge | 总数 |
 | --- | ---: | ---: | ---: | ---: |
-| train | 192 | 200 | 120 | 512 |
-| val | 64 | 40 | 24 | 128 |
+| train | 192 | 56 | 264 | 512 |
+| val | 64 | 16 | 48 | 128 |
 
 val 中 64 道 Hotpot 题同时作为训练前及 R-mix 后的 held-out probe，不进入训练。现有 HotpotQA/2Wiki dev-256 继续作为独立最终多跳评测，不参与筛选或训练。
 
-训练集固定为 37.5% NQ 与 62.5% Hotpot，而不是原方案的 1:1。NQ 仍提供稳定的“一搜后作答”格式奖励，但降到 192 题，避免容易答对的单跳样本再次主导 GRPO；300 道 Hotpot 则明确增加二搜策略的学习机会。comparison:bridge 保持 5:3：comparison 更容易从问题直接构造第二 query，bridge 用来检验能否从第一轮 observation 提取桥接实体。按比例预期 60 steps 会看到约 180 个 NQ prompt（900 条轨迹）与 300 个 Hotpot prompt（1500 条轨迹），足以兼顾动作格式与多搜信号；不进一步降到 25% NQ，以免训练早期出现过多全错 Hotpot group。
+训练集固定为 37.5% NQ 与 62.5% Hotpot，而不是原方案的 1:1。NQ 仍提供稳定的“一搜后作答”格式奖励，但降到 192 题，避免容易答对的单跳样本再次主导 GRPO；320 道 Hotpot 则明确增加二搜策略的学习机会。首轮完整 CPU 漏斗中，comparison 的 4,159 个 prescreen 候选已全部查询，2,012 个通过结构检查，但在实际 384-token observation 中同时满足两跳 supporting fact 和“第一跳无答案、第二跳有答案”的只有 74 题；bridge 在同样严格规则下有 766 题。因为 comparison 没有被 candidate cap 截断，提高 cap 无效；本轮不放宽证据可见性，而是在成功构建前显式重登记为 train `56/264`、val `16/48`，使用 72/74 个严格合格 comparison，并由更能训练“从第一轮 observation 提取第二 query”的 bridge 承担缺口。按总比例预期 60 steps 会看到约 180 个 NQ prompt（900 条轨迹）与 300 个 Hotpot prompt（1500 条轨迹），足以兼顾动作格式与多搜信号；不进一步降到 25% NQ，以免训练早期出现过多全错 Hotpot group。
 
 训练 DataLoader 使用固定 seed、全局 shuffle、无放回并 `drop_last=True`。`batch 8 × 60 steps = 480`，即实际消费 512 题中前 480 题（93.75%），留下 32 题未见；不为凑满一轮把训练改成 64 steps，也不做配比 sweep。每个 batch 只在期望上约为 3 个 NQ + 5 个 Hotpot，不强行做分层采样。
 

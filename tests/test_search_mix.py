@@ -145,7 +145,7 @@ def _small_evidence():
     return evidence
 
 
-def test_registered_mix_uses_hotpot_majority_without_changing_probe():
+def test_registered_mix_uses_hotpot_majority_with_bridge_weighting():
     assert search_mix.SCHEMA_VERSION == 2
     assert search_mix.QUOTAS == {
         "single": {
@@ -153,12 +153,12 @@ def test_registered_mix_uses_hotpot_majority_without_changing_probe():
             "val": 64
         },
         "comparison": {
-            "train": 200,
-            "val": 40
+            "train": 56,
+            "val": 16
         },
         "bridge": {
-            "train": 120,
-            "val": 24
+            "train": 264,
+            "val": 48
         },
     }
     assert search_mix.RETRIEVAL_TARGETS == {

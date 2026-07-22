@@ -33,7 +33,7 @@ MIN_MULTI_SEARCHES = 2
 MAX_QUERY_TOKEN_JACCARD = 0.8
 NEAR_MISS_DIAGNOSTIC_THRESHOLD = 16
 NEAR_MISS_EXAMPLE_LIMIT = 5
-CATEGORY_GROUPS = {"comparison": 40, "bridge": 24}
+CATEGORY_GROUPS = {"comparison": 16, "bridge": 48}
 THRESHOLDS = {
     "valid_correct_multi_search_count": 16,
     "covered_question_count": 8,

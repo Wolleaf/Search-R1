@@ -137,7 +137,7 @@ def _record(sample_index: int,
 def _catalog() -> list[dict[str, object]]:
     records = []
     for sample_index in range(64):
-        category = "comparison" if sample_index < 40 else "bridge"
+        category = "comparison" if sample_index < 16 else "bridge"
         records.append({
             "sample_id":
             f"hotpotqa:train:{sample_index}",
@@ -243,8 +243,8 @@ def test_go_outputs_strict_metrics_and_traceable_artifacts(
         "supporting_title": 0,
         "answer_and_supporting_title": 16,
     }
-    assert summary["by_category"]["comparison"]["question_count"] == 40
-    assert summary["by_category"]["bridge"]["question_count"] == 24
+    assert summary["by_category"]["comparison"]["question_count"] == 16
+    assert summary["by_category"]["bridge"]["question_count"] == 48
     assert {path.name for path in output.iterdir()} == PROBE.OUTPUT_FILES
     assert len((output / "per_trajectory.jsonl").read_text(
         encoding="utf-8").splitlines()) == 320

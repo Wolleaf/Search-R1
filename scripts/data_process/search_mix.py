@@ -68,12 +68,12 @@ QUOTAS = {
         "val": 64
     },
     "comparison": {
-        "train": 200,
-        "val": 40
+        "train": 56,
+        "val": 16
     },
     "bridge": {
-        "train": 120,
-        "val": 24
+        "train": 264,
+        "val": 48
     },
 }
 
