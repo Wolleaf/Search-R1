@@ -1567,10 +1567,6 @@ def materialize(
     manifest_path = local_dir / MANIFEST_FILE
     atomic_write(manifest_path, canonical_json_bytes(manifest))
     write_digest_sidecar(manifest_path)
-    verify_manifest(manifest_path,
-                    model_dir=model_dir,
-                    eval_catalogs=eval_catalogs,
-                    eval_parquets=eval_parquets)
     return manifest_path
 
 

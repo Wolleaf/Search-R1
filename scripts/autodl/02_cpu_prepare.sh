@@ -280,6 +280,7 @@ PY
         return 1
     fi
     if [[ "$seal_search_mix" == 1 ]]; then
+        # Use a fresh process so the large parsed evidence pool is not held twice.
         "$train_python" "$CHECKOUT_DIR/scripts/data_process/search_mix.py" verify \
             --manifest "$SEARCH_MIX_DATA_DIR/manifest.json" \
             --model-dir "$MODEL_DIR" \
