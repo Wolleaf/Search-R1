@@ -339,7 +339,7 @@ PY
     bash "$CHECKOUT_DIR/scripts/autodl/tests/test_gated_config.sh"
     bash "$CHECKOUT_DIR/scripts/autodl/tests/test_gated_followup.sh"
     bash "$CHECKOUT_DIR/scripts/autodl/tests/test_search_opportunity_pipeline.sh"
-    bash "$CHECKOUT_DIR/scripts/autodl/tests/test_group_probe_pipeline.sh"
+    PYTHON_BIN="$train_python" bash "$CHECKOUT_DIR/scripts/autodl/tests/test_group_probe_pipeline.sh"
     bash "$CHECKOUT_DIR/scripts/autodl/tests/test_shutdown_watchdog.sh"
     "$train_python" "$CHECKOUT_DIR/scripts/autodl/tests/test_results.py"
     "$train_python" "$CHECKOUT_DIR/scripts/autodl/tests/test_paired_eval.py"

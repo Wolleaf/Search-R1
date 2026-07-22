@@ -16,7 +16,7 @@ if [[ -n "${CAPTURE_LOG:-}" ]]; then
     printf '%s\n' "$@" >"$CAPTURE_LOG"
     exit 0
 fi
-exec /usr/bin/python3 "$@"
+exec "${PYTHON_BIN:-python3}" "$@"
 SH
 chmod +x "$ROOT/envs/train/bin/python"
 
