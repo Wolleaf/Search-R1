@@ -12,6 +12,7 @@ docs/results/search-opportunity-gate-20260722/eval/** -text -diff
 docs/results/search-opportunity-gate-20260722/phase/** -text -diff
 docs/results/grouped-probe-20260723/README.md text eol=lf
 docs/results/grouped-probe-20260723/analysis_zh.md text eol=lf
+docs/results/grouped-probe-20260723/qwen35_tool_protocol_audit_zh.md text eol=lf
 docs/results/grouped-probe-20260723/archive.sha256 text eol=lf
 docs/results/grouped-probe-20260723/results/** -text -diff
 docs/results/grouped-probe-20260723/eval/** -text -diff

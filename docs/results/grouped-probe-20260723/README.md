@@ -6,7 +6,7 @@
 
 这里的 parent 是官方 post-trained `Qwen/Qwen3.5-2B`，不是原始预训练 `Qwen/Qwen3.5-2B-Base`。历史 stage 名 `A/Base` 只表示“未经过本项目 Search-R1 RL”。补充分析还定位到提示词占位符复制，以及恢复文案被宽松正则解析为 `and` 搜索的确定性反馈环；详见 [`analysis_zh.md`](analysis_zh.md)。
 
-完整归因、两条正例、论文规模对照和面试口径见 [`analysis_zh.md`](analysis_zh.md)。
+完整归因、两条正例、论文规模对照和面试口径见 [`analysis_zh.md`](analysis_zh.md)；Qwen 原生 `<tool_call>` 与当前 `<search>` 协议、采样配置和最小验证方案的专项审计见 [`qwen35_tool_protocol_audit_zh.md`](qwen35_tool_protocol_audit_zh.md)。
 
 ## 运行与恢复
 
