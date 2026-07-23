@@ -817,6 +817,10 @@ grep -Fq 'search_mix.py" materialize-native' "$AUTODL_DIR/02_cpu_prepare.sh"
 grep -Fq -- '--expected-tool-protocol qwen35_native' "$AUTODL_DIR/02_cpu_prepare.sh"
 grep -Fq -- '--source-manifest "$SEARCH_MIX_DATA_DIR/manifest.json"' \
     "$AUTODL_DIR/02_cpu_prepare.sh"
+grep -Fq 'if [[ "$build_qwen_native" != 1 ]]' \
+    "$AUTODL_DIR/02_cpu_prepare.sh"
+grep -Fq 'New output was fully verified before its atomic publication.' \
+    "$AUTODL_DIR/02_cpu_prepare.sh"
 grep -Fq 'QWEN35_CHAT_TEMPLATE_SHA256' "$AUTODL_DIR/02_cpu_prepare.sh"
 grep -Fq 'add_generation_prompt=True, tokenize=True, return_dict=False' \
     "$AUTODL_DIR/02_cpu_prepare.sh"

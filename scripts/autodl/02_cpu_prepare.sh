@@ -333,12 +333,16 @@ PY
         return 1
     fi
     if [[ "$seal_search_mix" == 1 ]]; then
-        # Use a fresh process so the large parsed evidence pool is not held twice.
-        "$train_python" "$CHECKOUT_DIR/scripts/data_process/search_mix.py" verify \
-            --manifest "$SEARCH_MIX_DATA_DIR/manifest.json" \
-            --model-dir "$MODEL_DIR" \
-            --eval-catalog "$SEARCH_GATE_DATA_DIR/catalog.jsonl" \
-            --eval-parquet "$SMALL_DATA_DIR/test_128.parquet"
+        # A new incremental native build verifies the source once inside its
+        # staging transaction. Other paths retain the standalone source seal.
+        if [[ "${AUTODL_QWEN_NATIVE_INCREMENTAL:-0}" != 1 ||
+              "$build_qwen_native" != 1 ]]; then
+            "$train_python" "$CHECKOUT_DIR/scripts/data_process/search_mix.py" verify \
+                --manifest "$SEARCH_MIX_DATA_DIR/manifest.json" \
+                --model-dir "$MODEL_DIR" \
+                --eval-catalog "$SEARCH_GATE_DATA_DIR/catalog.jsonl" \
+                --eval-parquet "$SMALL_DATA_DIR/test_128.parquet"
+        fi
         if [[ "${AUTODL_QWEN_NATIVE_INCREMENTAL:-0}" != 1 ]]; then
             PYTHONPATH="$CHECKOUT_DIR" "$retriever_python" \
                 "$CHECKOUT_DIR/scripts/data_process/search_mix.py" replay \
@@ -347,8 +351,11 @@ PY
                 --corpus-path "$CORPUS_JSONL" \
                 --offsets-path "$CORPUS_OFFSETS"
         fi
-        "$train_python" "$CHECKOUT_DIR/scripts/data_process/search_mix.py" verify-replay \
-            --manifest "$SEARCH_MIX_DATA_DIR/manifest.json"
+        if [[ "${AUTODL_QWEN_NATIVE_INCREMENTAL:-0}" != 1 ||
+              "$build_qwen_native" != 1 ]]; then
+            "$train_python" "$CHECKOUT_DIR/scripts/data_process/search_mix.py" verify-replay \
+                --manifest "$SEARCH_MIX_DATA_DIR/manifest.json"
+        fi
     fi
     if [[ "$build_qwen_native" == 1 ]]; then
         "$train_python" "$CHECKOUT_DIR/scripts/data_process/search_mix.py" materialize-native \
@@ -428,13 +435,16 @@ if (conversation.prompt_token_ids[:len(invalid_prefix)] != invalid_prefix
         or not retry.token_ids):
     raise SystemExit("Qwen native retry wrapper did not preserve sampled tokens")
 PY
-        "$train_python" "$CHECKOUT_DIR/scripts/data_process/search_mix.py" verify \
-            --manifest "$QWEN_NATIVE_DATA_DIR/manifest.json" \
-            --source-manifest "$SEARCH_MIX_DATA_DIR/manifest.json" \
-            --model-dir "$MODEL_DIR" \
-            --eval-catalog "$SEARCH_GATE_DATA_DIR/catalog.jsonl" \
-            --eval-parquet "$SMALL_DATA_DIR/test_128.parquet" \
-            --expected-tool-protocol qwen35_native
+        # New output was fully verified before its atomic publication.
+        if [[ "$build_qwen_native" != 1 ]]; then
+            "$train_python" "$CHECKOUT_DIR/scripts/data_process/search_mix.py" verify \
+                --manifest "$QWEN_NATIVE_DATA_DIR/manifest.json" \
+                --source-manifest "$SEARCH_MIX_DATA_DIR/manifest.json" \
+                --model-dir "$MODEL_DIR" \
+                --eval-catalog "$SEARCH_GATE_DATA_DIR/catalog.jsonl" \
+                --eval-parquet "$SMALL_DATA_DIR/test_128.parquet" \
+                --expected-tool-protocol qwen35_native
+        fi
     fi
 
     "$train_python" - "$MODEL_DIR" "$SMALL_DATA_DIR" <<'PY'

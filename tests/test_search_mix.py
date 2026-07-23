@@ -925,7 +925,7 @@ def _regular_file_snapshot(root):
     }
 
 
-def _build_native_fixture(tmp_path, monkeypatch):
+def _prepare_native_fixture_source(tmp_path, monkeypatch):
     source_dir = tmp_path / "source"
     source_dir.mkdir()
     paths = _build_manifest_fixture(source_dir, monkeypatch)
@@ -968,12 +968,19 @@ def _build_native_fixture(tmp_path, monkeypatch):
                                          tmp_path / "corpus.jsonl",
                                          tmp_path / "corpus.offsets")
     source_snapshot_before = _regular_file_snapshot(source_dir)
+    return paths, source_snapshot_before, source_manifest_before
+
+
+def _build_native_fixture(tmp_path, monkeypatch):
+    paths, source_snapshot_before, source_manifest_before = (
+        _prepare_native_fixture_source(tmp_path, monkeypatch))
 
     output_dir = tmp_path / "native"
     manifest_path = search_mix.materialize_native(paths["manifest"],
                                                    output_dir,
                                                    paths["model_dir"])
-    assert _regular_file_snapshot(source_dir) == source_snapshot_before
+    assert (_regular_file_snapshot(paths["manifest"].parent) ==
+            source_snapshot_before)
     return paths, output_dir, manifest_path, source_manifest_before
 
 
@@ -994,6 +1001,82 @@ def test_materialize_native_refuses_output_inside_source(tmp_path):
         search_mix.materialize_native(source_dir / "manifest.json",
                                       source_dir / "native",
                                       tmp_path / "model")
+
+
+def test_materialize_native_reselects_source_once_without_generic_materialize(
+        tmp_path, monkeypatch):
+    paths, source_snapshot, _ = _prepare_native_fixture_source(
+        tmp_path, monkeypatch)
+    original_select = search_mix.select_catalog
+    calls = []
+
+    def recording_select(*args, **kwargs):
+        calls.append(1)
+        return original_select(*args, **kwargs)
+
+    def forbidden_materialize(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("native builder called generic materialize")
+
+    monkeypatch.setattr(search_mix, "select_catalog", recording_select)
+    monkeypatch.setattr(search_mix, "materialize", forbidden_materialize)
+    output_dir = tmp_path / "native"
+    manifest_path = search_mix.materialize_native(paths["manifest"],
+                                                   output_dir,
+                                                   paths["model_dir"])
+
+    assert manifest_path == output_dir / search_mix.MANIFEST_FILE
+    assert len(calls) == 1
+    assert (_regular_file_snapshot(paths["manifest"].parent) ==
+            source_snapshot)
+
+
+def test_materialize_native_failure_does_not_publish_output(
+        tmp_path, monkeypatch):
+    paths, source_snapshot, _ = _prepare_native_fixture_source(
+        tmp_path, monkeypatch)
+    write_parquet = search_mix._atomic_write_parquet
+    calls = []
+
+    def fail_second_write(records, path):
+        calls.append(Path(path).name)
+        if len(calls) == 2:
+            raise RuntimeError("injected native parquet failure")
+        write_parquet(records, path)
+
+    monkeypatch.setattr(search_mix, "_atomic_write_parquet",
+                        fail_second_write)
+    output_dir = tmp_path / "native"
+    with pytest.raises(RuntimeError, match="injected native parquet failure"):
+        search_mix.materialize_native(paths["manifest"], output_dir,
+                                      paths["model_dir"])
+
+    assert not output_dir.exists()
+    assert not list(tmp_path.glob(".native.*"))
+    assert (_regular_file_snapshot(paths["manifest"].parent) ==
+            source_snapshot)
+
+
+def test_materialize_native_validation_failure_does_not_publish_output(
+        tmp_path, monkeypatch):
+    paths, source_snapshot, _ = _prepare_native_fixture_source(
+        tmp_path, monkeypatch)
+
+    def fail_validation(*args, **kwargs):
+        del args, kwargs
+        raise ValueError("injected final native validation failure")
+
+    monkeypatch.setattr(search_mix, "verify_manifest", fail_validation)
+    output_dir = tmp_path / "native"
+    with pytest.raises(ValueError,
+                       match="injected final native validation failure"):
+        search_mix.materialize_native(paths["manifest"], output_dir,
+                                      paths["model_dir"])
+
+    assert not output_dir.exists()
+    assert not list(tmp_path.glob(".native.*"))
+    assert (_regular_file_snapshot(paths["manifest"].parent) ==
+            source_snapshot)
 
 
 def test_materialize_native_is_prompt_only_and_preserves_source_and_selection(
@@ -1017,14 +1100,55 @@ def test_materialize_native_is_prompt_only_and_preserves_source_and_selection(
     }
     assert (output_dir / search_mix.CATALOG_FILE).read_bytes() == paths[
         "catalog"].read_bytes()
+    copied_artifacts = {
+        "catalog": search_mix.CATALOG_FILE,
+        "exclusions": search_mix.EXCLUSIONS_FILE,
+        "retrieval_evidence": search_mix.EVIDENCE_FILE,
+        "retrieval_ledger": search_mix.RETRIEVAL_LEDGER_FILE,
+        "selection_funnel": search_mix.SELECTION_FUNNEL_FILE,
+    }
+    for label, filename in copied_artifacts.items():
+        assert (output_dir / filename).read_bytes() == (
+            paths["manifest"].parent / filename).read_bytes()
+        assert native["artifacts"][label] == legacy["artifacts"][label]
+    for filename in (
+            search_mix.EVIDENCE_FILE,
+            search_mix.RETRIEVAL_LEDGER_FILE,
+            search_mix.SELECTION_FUNNEL_FILE,
+    ):
+        sidecar = filename + ".sha256"
+        assert (output_dir / sidecar).read_bytes() == (
+            paths["manifest"].parent / sidecar).read_bytes()
     for split in search_mix.OUTPUT_FILES:
         assert native["artifacts"][split]["sample_ids"] == legacy["artifacts"][
             split]["sample_ids"]
+        source_rows = search_mix._read_parquet(
+            paths["manifest"].parent / search_mix.OUTPUT_FILES[split])
+        native_rows = search_mix._read_parquet(
+            output_dir / search_mix.OUTPUT_FILES[split])
+        assert [{
+            key: value
+            for key, value in row.items() if key != "prompt"
+        } for row in native_rows] == [{
+            key: value
+            for key, value in row.items() if key != "prompt"
+        } for row in source_rows]
     probe_ids = native["artifacts"]["probe"]["sample_ids"]
     assert native["artifacts"]["probe_g0"]["sample_ids"] == probe_ids[:1]
     assert native["artifacts"]["probe_forced"]["sample_ids"] == probe_ids[:2]
     assert native["artifacts"]["probe_autonomous"][
         "sample_ids"] == probe_ids[:3]
+    native_probe_rows = search_mix._read_parquet(
+        output_dir / search_mix.OUTPUT_FILES["probe"])
+    for label, (filename, rows, _) in search_mix.NATIVE_PROBE_FILES.items():
+        probe_rows = search_mix._read_parquet(output_dir / filename)
+        assert [{
+            key: value
+            for key, value in row.items() if key != "prompt"
+        } for row in probe_rows] == [{
+            key: value
+            for key, value in row.items() if key != "prompt"
+        } for row in native_probe_rows[:rows]]
     with pytest.raises(ValueError, match="tool protocol mismatch"):
         search_mix.verify_manifest(
             manifest_path,

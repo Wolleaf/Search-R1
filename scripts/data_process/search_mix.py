@@ -781,19 +781,20 @@ def retrieve_evidence(local_dir: Path, index_path: Path, corpus_path: Path,
 
 def read_canonical_jsonl(path: Path) -> list[Mapping[str, Any]]:
     records = []
-    for line_number, line in enumerate(
-            path.read_bytes().splitlines(keepends=True), 1):
-        if not line.strip():
-            raise ValueError(f"Blank JSONL line at {path}:{line_number}")
-        try:
-            record = json.loads(line)
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise ValueError(
-                f"Invalid JSONL at {path}:{line_number}") from error
-        if not isinstance(record,
-                          Mapping) or canonical_json_bytes(record) != line:
-            raise ValueError(f"Non-canonical JSONL at {path}:{line_number}")
-        records.append(record)
+    with path.open("rb") as stream:
+        for line_number, line in enumerate(stream, 1):
+            if not line.strip():
+                raise ValueError(f"Blank JSONL line at {path}:{line_number}")
+            try:
+                record = json.loads(line)
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise ValueError(
+                    f"Invalid JSONL at {path}:{line_number}") from error
+            if not isinstance(record,
+                              Mapping) or canonical_json_bytes(record) != line:
+                raise ValueError(
+                    f"Non-canonical JSONL at {path}:{line_number}")
+            records.append(record)
     return records
 
 
@@ -1696,7 +1697,7 @@ def materialize_native(
     eval_catalogs: Sequence[Path] = (),
     eval_parquets: Sequence[Path] = (),
 ) -> Path:
-    """Re-materialize native prompts from sealed retrieval evidence only."""
+    """Re-materialize native prompts from a verified, sealed catalog."""
     source_manifest = source_manifest.resolve()
     source_dir = source_manifest.parent
     output_dir = output_dir.resolve()
@@ -1710,20 +1711,16 @@ def materialize_native(
     else:
         raise ValueError("native output directory must not be inside source data")
 
-    source_payload = verify_manifest(source_manifest,
-                                     model_dir,
-                                     eval_catalogs,
-                                     eval_parquets,
-                                     expected_tool_protocol=LEGACY_XML)
+    _, source_payload, _ = _verify_manifest_artifacts(
+        source_manifest, expected_tool_protocol=LEGACY_XML)
     verify_replay_receipt(source_manifest)
     source_catalog_path = source_dir / CATALOG_FILE
     source_catalog = source_catalog_path.read_bytes()
+    catalog = read_canonical_jsonl(source_catalog_path)
     derived_from = {
         "source_manifest_sha256": sha256_file(source_manifest),
         "source_catalog_sha256": sha256_file(source_catalog_path),
     }
-    ledger, _ = _load_retrieval_contract(source_dir)
-    completed_funnel = _load_selection_funnel(source_dir, ledger, "complete")
 
     output_dir.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(
@@ -1732,42 +1729,90 @@ def materialize_native(
         for source in SOURCE_SPECS:
             _copy_regular_file(verify_source(source_dir, source),
                                source_path(staging, source))
-        for filename in (EVIDENCE_FILE, RETRIEVAL_LEDGER_FILE):
-            source_path_value = source_dir / filename
-            target_path = staging / filename
+        artifacts: dict[str, dict[str, Any]] = {}
+        bound_labels = (
+            "catalog",
+            "exclusions",
+            "retrieval_evidence",
+            "retrieval_ledger",
+            "selection_funnel",
+        )
+        sidecar_labels = {
+            "retrieval_evidence",
+            "retrieval_ledger",
+            "selection_funnel",
+        }
+        for label in bound_labels:
+            artifact = source_payload["artifacts"][label]
+            source_path_value = source_dir / artifact["file"]
+            target_path = staging / artifact["file"]
             _copy_regular_file(source_path_value, target_path)
+            artifacts[label] = dict(artifact)
+            if label not in sidecar_labels:
+                continue
             _copy_regular_file(
                 source_path_value.with_suffix(source_path_value.suffix +
                                               ".sha256"),
                 target_path.with_suffix(target_path.suffix + ".sha256"))
-        _write_selection_funnel(
-            staging,
-            _selection_funnel_payload("retrieval_complete", "retrieve",
-                                      completed_funnel["retrieval"]))
 
-        staged_manifest = materialize(staging,
-                                       model_dir,
-                                       eval_catalogs,
-                                       eval_parquets,
-                                       tool_protocol=QWEN35_NATIVE,
-                                       derived_from=derived_from)
-        target_payload = verify_manifest(
-            staged_manifest,
-            model_dir,
-            eval_catalogs,
-            eval_parquets,
-            expected_tool_protocol=QWEN35_NATIVE,
-            source_manifest=source_manifest)
+        output_records: dict[str, list[dict[str, Any]]] = {}
+        for split, filename in OUTPUT_FILES.items():
+            records = _ordered_records(catalog, split, QWEN35_NATIVE)
+            output_records[split] = records
+            path = staging / filename
+            _atomic_write_parquet(records, path)
+            artifacts[split] = {
+                "file": filename,
+                "rows": len(records),
+                "sha256": sha256_file(path),
+                "sample_ids": [
+                    f"{record['data_source']}:{record['extra_info']['split']}:{record['extra_info']['index']}"
+                    for record in records
+                ],
+            }
+        for label, (filename, rows, force_search) in NATIVE_PROBE_FILES.items():
+            records = _ordered_records(catalog,
+                                       "probe",
+                                       QWEN35_NATIVE,
+                                       limit=rows,
+                                       force_search=force_search)
+            output_records[label] = records
+            path = staging / filename
+            _atomic_write_parquet(records, path)
+            artifacts[label] = {
+                "file": filename,
+                "rows": len(records),
+                "sha256": sha256_file(path),
+                "sample_ids": [
+                    f"{record['data_source']}:{record['extra_info']['split']}:{record['extra_info']['index']}"
+                    for record in records
+                ],
+            }
+
+        manifest = {
+            "schema_version": MATERIALIZED_SCHEMA_VERSION,
+            "selection_policy": source_payload["selection_policy"],
+            "seed": source_payload["seed"],
+            "sources": source_payload["sources"],
+            "retrieval": source_payload["retrieval"],
+            "tokenizer": source_payload["tokenizer"],
+            "quotas": source_payload["quotas"],
+            "materialize_rejection_counts":
+            source_payload["materialize_rejection_counts"],
+            "overlap_checks": source_payload["overlap_checks"],
+            "artifacts": artifacts,
+            "prompt_contract": prompt_contract(QWEN35_NATIVE),
+            "derived_from": derived_from,
+        }
+        staged_manifest = staging / MANIFEST_FILE
+        atomic_write(staged_manifest, canonical_json_bytes(manifest))
+        write_digest_sidecar(staged_manifest)
+
         if (staging / CATALOG_FILE).read_bytes() != source_catalog:
             raise ValueError(
                 "Native materialization changed the selected catalog")
-        if (target_payload["seed"] != source_payload["seed"]
-                or target_payload["quotas"] != source_payload["quotas"]):
-            raise ValueError(
-                "Native materialization changed the seed or category quotas")
         for split in OUTPUT_FILES:
             source_rows = _read_parquet(source_dir / OUTPUT_FILES[split])
-            target_rows = _read_parquet(staging / OUTPUT_FILES[split])
             source_non_prompt = [{
                 key: value
                 for key, value in row.items() if key != "prompt"
@@ -1775,15 +1820,21 @@ def materialize_native(
             target_non_prompt = [{
                 key: value
                 for key, value in row.items() if key != "prompt"
-            } for row in target_rows]
+            } for row in output_records[split]]
             if source_non_prompt != target_non_prompt:
                 raise ValueError(
                     f"Native materialization changed non-prompt {split} fields"
                 )
-            if (target_payload["artifacts"][split]["sample_ids"] !=
+            if (artifacts[split]["sample_ids"] !=
                     source_payload["artifacts"][split]["sample_ids"]):
                 raise ValueError(
                     f"Native materialization changed {split} sample IDs")
+        verify_manifest(staged_manifest,
+                        model_dir,
+                        eval_catalogs,
+                        eval_parquets,
+                        expected_tool_protocol=QWEN35_NATIVE,
+                        source_manifest=source_manifest)
         os.replace(staging, output_dir)
     finally:
         if staging.exists():
@@ -1871,14 +1922,11 @@ def _manifest_tool_protocol(manifest: Mapping[str, Any]) -> str:
     raise ValueError("Manifest schema_version mismatch")
 
 
-def verify_manifest(
-        manifest_path: Path,
-        model_dir: Path,
-        eval_catalogs: Sequence[Path] = (),
-        eval_parquets: Sequence[Path] = (),
-        expected_tool_protocol: Optional[str] = None,
-        source_manifest: Optional[Path] = None,
-) -> Mapping[str, Any]:
+def _verify_manifest_artifacts(
+    manifest_path: Path,
+    expected_tool_protocol: Optional[str] = None,
+) -> tuple[Path, Mapping[str, Any], str]:
+    """Verify the manifest contract and byte identities without reselection."""
     manifest_path = manifest_path.resolve()
     if manifest_path.name != MANIFEST_FILE or not manifest_path.is_file(
     ) or manifest_path.is_symlink():
@@ -1894,28 +1942,6 @@ def verify_manifest(
     if expected_tool_protocol is not None and protocol != normalize_tool_protocol(
             expected_tool_protocol):
         raise ValueError("Manifest tool protocol mismatch")
-    source_payload: Optional[Mapping[str, Any]] = None
-    source_catalog_sha256: Optional[str] = None
-    if protocol == QWEN35_NATIVE:
-        if source_manifest is None:
-            raise ValueError(
-                "Native manifest verification requires --source-manifest")
-        source_manifest = Path(source_manifest).resolve()
-        source_payload = verify_manifest(
-            source_manifest,
-            model_dir,
-            eval_catalogs,
-            eval_parquets,
-            expected_tool_protocol=LEGACY_XML)
-        source_catalog_sha256 = sha256_file(source_manifest.parent /
-                                            CATALOG_FILE)
-        expected_lineage = {
-            "source_manifest_sha256": sha256_file(source_manifest),
-            "source_catalog_sha256": source_catalog_sha256,
-        }
-        if manifest["derived_from"] != expected_lineage:
-            raise ValueError("Native manifest lineage does not match source")
-        verify_replay_receipt(source_manifest)
     if (manifest.get("selection_policy") != SELECTION_POLICY
             or manifest.get("seed") != SEED
             or manifest.get("quotas") != QUOTAS):
@@ -1990,6 +2016,43 @@ def verify_manifest(
             raise ValueError(f"Artifact identity mismatch: {path}")
         if "bytes" in artifact and path.stat().st_size != artifact["bytes"]:
             raise ValueError(f"Artifact byte count mismatch: {path}")
+    return manifest_path, manifest, protocol
+
+
+def verify_manifest(
+        manifest_path: Path,
+        model_dir: Path,
+        eval_catalogs: Sequence[Path] = (),
+        eval_parquets: Sequence[Path] = (),
+        expected_tool_protocol: Optional[str] = None,
+        source_manifest: Optional[Path] = None,
+) -> Mapping[str, Any]:
+    manifest_path, manifest, protocol = _verify_manifest_artifacts(
+        manifest_path, expected_tool_protocol)
+    local_dir = manifest_path.parent
+    artifacts = manifest["artifacts"]
+    source_payload: Optional[Mapping[str, Any]] = None
+    source_catalog_sha256: Optional[str] = None
+    if protocol == QWEN35_NATIVE:
+        if source_manifest is None:
+            raise ValueError(
+                "Native manifest verification requires --source-manifest")
+        source_manifest = Path(source_manifest).resolve()
+        source_payload = verify_manifest(
+            source_manifest,
+            model_dir,
+            eval_catalogs,
+            eval_parquets,
+            expected_tool_protocol=LEGACY_XML)
+        source_catalog_sha256 = sha256_file(source_manifest.parent /
+                                            CATALOG_FILE)
+        expected_lineage = {
+            "source_manifest_sha256": sha256_file(source_manifest),
+            "source_catalog_sha256": source_catalog_sha256,
+        }
+        if manifest["derived_from"] != expected_lineage:
+            raise ValueError("Native manifest lineage does not match source")
+        verify_replay_receipt(source_manifest)
     if protocol == QWEN35_NATIVE:
         if sha256_file(local_dir / CATALOG_FILE) != source_catalog_sha256:
             raise ValueError("Native catalog does not match source catalog")
@@ -2008,13 +2071,23 @@ def verify_manifest(
         if (manifest["seed"] != source_payload["seed"]
                 or manifest["quotas"] != source_payload["quotas"]):
             raise ValueError("Native seed or quotas do not match source")
+        if (manifest["materialize_rejection_counts"] !=
+                source_payload["materialize_rejection_counts"]):
+            raise ValueError(
+                "Native rejection counts do not match source")
         for split in OUTPUT_FILES:
             if (artifacts[split]["sample_ids"] !=
                     source_payload["artifacts"][split]["sample_ids"]):
                 raise ValueError(
                     f"Native {split} sample IDs do not match source")
-    ledger, evidence = _load_retrieval_contract(local_dir)
-    funnel = _load_selection_funnel(local_dir, ledger, "complete")
+        # Source verification already proved these byte-identical artifacts.
+        # Check the copied sidecars without loading the evidence pool again.
+        for filename in (EVIDENCE_FILE, RETRIEVAL_LEDGER_FILE,
+                         SELECTION_FUNNEL_FILE):
+            _verify_sidecar(local_dir / filename)
+    else:
+        ledger, evidence = _load_retrieval_contract(local_dir)
+        funnel = _load_selection_funnel(local_dir, ledger, "complete")
 
     exclusions_path = local_dir / EXCLUSIONS_FILE
     exclusions_raw = exclusions_path.read_bytes()
@@ -2039,25 +2112,27 @@ def verify_manifest(
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(model_dir, local_files_only=True)
-    recomputed, rejection_counts, selection_stats = select_catalog(
-        evidence, tokenizer, set(excluded_list))
-    recomputed.sort(
-        key=lambda item: stable_key("catalog", str(item["source_id"])))
     catalog = read_canonical_jsonl(local_dir / CATALOG_FILE)
-    if catalog != recomputed:
-        raise ValueError("Catalog does not match deterministic reselection")
-    if manifest.get("materialize_rejection_counts") != dict(
-            sorted(rejection_counts.items())):
-        raise ValueError("Manifest rejection counts do not match reselection")
-    expected_materialize = {
-        **selection_stats,
-        "evidence_rows": len(evidence),
-        "excluded_question_count": len(excluded_list),
-        "rejection_counts": dict(sorted(rejection_counts.items())),
-    }
-    if funnel.get("materialize") != expected_materialize:
-        raise ValueError(
-            "Selection funnel does not match deterministic reselection")
+    if protocol == LEGACY_XML:
+        recomputed, rejection_counts, selection_stats = select_catalog(
+            evidence, tokenizer, set(excluded_list))
+        recomputed.sort(
+            key=lambda item: stable_key("catalog", str(item["source_id"])))
+        if catalog != recomputed:
+            raise ValueError("Catalog does not match deterministic reselection")
+        if manifest.get("materialize_rejection_counts") != dict(
+                sorted(rejection_counts.items())):
+            raise ValueError(
+                "Manifest rejection counts do not match reselection")
+        expected_materialize = {
+            **selection_stats,
+            "evidence_rows": len(evidence),
+            "excluded_question_count": len(excluded_list),
+            "rejection_counts": dict(sorted(rejection_counts.items())),
+        }
+        if funnel.get("materialize") != expected_materialize:
+            raise ValueError(
+                "Selection funnel does not match deterministic reselection")
     counts = Counter(
         (record["category"], record["output_split"]) for record in catalog)
     for category, split_quotas in QUOTAS.items():
