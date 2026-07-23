@@ -365,8 +365,7 @@ PY
             --eval-catalog "$SEARCH_GATE_DATA_DIR/catalog.jsonl" \
             --eval-parquet "$SMALL_DATA_DIR/test_128.parquet"
         seal_qwen_native=1
-    elif [[ "$seal_qwen_native" == 0 &&
-            -f "$QWEN_NATIVE_DATA_DIR/manifest.json" &&
+    elif [[ -f "$QWEN_NATIVE_DATA_DIR/manifest.json" &&
             ! -L "$QWEN_NATIVE_DATA_DIR/manifest.json" ]]; then
         seal_qwen_native=1
     elif [[ -e "$QWEN_NATIVE_DATA_DIR/manifest.json" ||

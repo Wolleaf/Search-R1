@@ -849,6 +849,10 @@ grep -Fq 'add_generation_prompt=True, tokenize=True, return_dict=False' \
     "$AUTODL_DIR/02_cpu_prepare.sh")" == 2 ]]
 [[ "$(grep -Ec '^[[:space:]]*build_qwen_native=1$' \
     "$AUTODL_DIR/02_cpu_prepare.sh")" == 2 ]]
+grep -Fq 'elif [[ -f "$QWEN_NATIVE_DATA_DIR/manifest.json" &&' \
+    "$AUTODL_DIR/02_cpu_prepare.sh"
+! grep -Fq 'elif [[ "$seal_qwen_native" == 0 &&' \
+    "$AUTODL_DIR/02_cpu_prepare.sh"
 PREFLIGHT_LINE="$(grep -n 'qwen_native_gate_preflight "$commit"' \
     "$AUTODL_DIR/03_gpu_run.sh" | cut -d: -f1)"
 RETRIEVER_LINE="$(grep -n 'setsid "$RETRIEVER_ENV/bin/python"' \
