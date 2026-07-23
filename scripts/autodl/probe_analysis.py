@@ -259,8 +259,8 @@ def _validate_retrievals(record: Mapping[str, Any], location: str,
         observation = raw_event.get("observation")
         visible_observation = raw_event.get("visible_observation")
         documents = raw_event.get("documents")
-        if not isinstance(query, str) or not query.strip():
-            raise ValueError(f"{event_location}.query must be non-empty")
+        if not isinstance(query, str):
+            raise ValueError(f"{event_location}.query must be a string")
         if not isinstance(observation, str):
             raise ValueError(f"{event_location}.observation must be a string")
         if not isinstance(visible_observation, str):

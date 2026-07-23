@@ -453,6 +453,30 @@ def test_punctuation_only_query_is_scientific_failure_not_analysis_error(
     assert row["valid_correct_multi_search"] is False
 
 
+def test_empty_query_is_scientific_failure_not_analysis_error(
+        tmp_path: Path) -> None:
+    records = _passing_records()
+    empty_query = _find(records, 0, 0)
+    empty_query["retrieval_events"][1]["query"] = ""
+    empty_query["turns"][1]["search_query"] = ""
+    trace, catalog = _fixture(tmp_path, records)
+
+    summary = PROBE.analyze(_args(trace, catalog, tmp_path / "analysis"))
+
+    assert summary["overall"]["qualification_failure_counts"][
+        "near_duplicate_or_empty_query"] == 1
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "analysis" / "per_trajectory.jsonl").read_text(
+            encoding="utf-8").splitlines()
+    ]
+    row = next(
+        item for item in rows
+        if item["sample_id"] == "hotpotqa:train:0" and item["group_slot"] == 0)
+    assert row["query_token_jaccard"] == 1.0
+    assert row["valid_correct_multi_search"] is False
+
+
 def test_clipped_and_invalid_rates_use_trajectory_denominator(
         tmp_path: Path) -> None:
     records = _passing_records()
