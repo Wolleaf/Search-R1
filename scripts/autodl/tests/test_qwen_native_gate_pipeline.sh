@@ -79,6 +79,27 @@ require_native_gate
 [[ "$DATA_DIR" == "$ROOT/data/search_mix_qwen35_native" ]]
 [[ "$EVAL_EXPECTED_ROWS" == 16 && "$EVAL_GROUP_SIZE" == 2 ]]
 
+# GPU helpers must import the sealed checkout without relying on an editable install.
+(
+    unset PYTHONPATH
+    native_deadline_check() { return 0; }
+    require_native_gate() { return 0; }
+    verify_native_data_contract() {
+        [[ "$PYTHONPATH" == "$CHECKOUT_DIR" ]]
+        (
+            cd "$ROOT"
+            "$TRAIN_ENV/bin/python" -S \
+                "$CHECKOUT_DIR/scripts/data_process/search_mix.py" --help \
+                >/dev/null
+        )
+    }
+    file_sha256() { printf 'd%.0s' {1..64}; }
+    native_gate_input_digest() { printf 'e%.0s' {1..64}; }
+    verify_native_predecessor() { return 0; }
+    qwen_native_gate_preflight "$(printf 'c%.0s' {1..40})" \
+        "$(printf 'a%.0s' {1..64})" "$(printf 'b%.0s' {1..64})"
+)
+
 reseal_native_evidence() {
     local evidence="$1" marker="$2" outer="$3"
     local line relative digest tmp="${evidence}.resealed.$$"

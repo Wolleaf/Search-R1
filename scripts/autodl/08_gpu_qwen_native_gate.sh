@@ -538,6 +538,7 @@ verify_native_handoff_seal() {
 qwen_native_gate_preflight() {
     local commit="$1" handoff_digest="$2" checkpoint_digest="$3"
     local data_digest input_digest
+    export PYTHONPATH="$CHECKOUT_DIR${PYTHONPATH:+:$PYTHONPATH}"
     native_deadline_check preflight
     require_native_gate
     verify_native_data_contract
