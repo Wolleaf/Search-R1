@@ -23,7 +23,7 @@
 | --- | --- |
 | 权重或 tokenizer 错配 | 固定 model/tokenizer revision 与文件 digest；直接 HF 参考和 manager 记录同一组权重及 tokenizer 身份 |
 | chat template 未真正生效 | 比较直接 `apply_chat_template` 与 adapter 首轮 token，要求逐 token 相同 |
-| 协议而非采样造成退化 | G0 在相同问题、seed 和 `top_k=20` 下保留 legacy/native 小型配对；legacy 只作诊断，不改历史结论 |
+| 协议而非采样造成退化 | G0 在相同问题、seed、`top_k=20` 和 `presence_penalty=2.0` 下保留 legacy/native 小型配对；legacy 只作诊断，不改历史结论 |
 | parser 或回填错误 | CPU golden tests 加 G1 强制调用，先不以答案正确率评价 |
 | 检索质量或多跳能力不足 | G0 不依赖检索答案，G1 只验证闭环；到 G2 才评价 query、证据链和 EM |
 | RL 或奖励函数影响 | G0-G3 全部不更新权重；协议门禁通过前不接触能力/成本训练 |
@@ -56,12 +56,21 @@ finish(answer: string) # 提交简短最终答案
 
 数据构建器增加协议参数，使用相同 sample ID、配额、seed 和检索证据重新物化一份 native Parquet；只替换说明文本，不重新挑题。manifest 必须记录协议、tool schema digest、tokenizer revision 和源数据 digest。
 
-采样采用 Qwen3.5 non-thinking 建议的 `temperature=1.0`、`top_p=1.0`、`top_k=20`。第一轮不自行实现 `presence_penalty`：当前 HF rollout 没有原生支持，自定义 history-dependent logits processor 会同时改变训练行为策略并扩大验证面，不属于无风险模板适配。若原生协议通过而仍有重复循环，再把它作为单独变量评估；不迁移 vLLM，不更换模型尺寸。
+采样完整采用固定 Qwen3.5 model card 对 non-thinking 文本任务的建议：
+
+```text
+temperature=1.0, top_p=1.0, top_k=20, min_p=0.0,
+presence_penalty=2.0, repetition_penalty=1.0
+```
+
+`top_k=20` 直接进入 HF `GenerationConfig`。当前 Transformers 的 `GenerationConfig` 没有 `presence_penalty`，因此在 HF rollout 内增加一个小型、可配置的 logits processor：只对当前 assistant 回合已经生成过的 token 减去一次固定 penalty，不按出现次数累加，不惩罚 prompt/tool response，并在新的 assistant 回合开始时重置。这与 presence penalty 区别于 frequency/repetition penalty 的定义一致。legacy 默认仍为 `top_k=0/presence_penalty=0`，避免历史入口静默变化；Qwen native 入口显式设为 `20/2.0`。
+
+实现必须同时支持 `presence_penalty=0` 的严格 no-op，并将有效值写入 resolved config 和每个 trace manifest。单测覆盖首次 token 不受罚、已生成 token 只减一次、重复多次不额外累加、batch 独立、回合重置以及 0 值等价。官方提示高 penalty 偶尔会引发语言混杂，因此 G0/G1 同时统计重复片段和异常语言 query；只有出现可复现的明显退化，才将 `2.0 -> 1.5` 注册为一次独立采样对照，不能事后按 EM 挑值。不迁移 vLLM，不更换模型尺寸。
 
 ## 4. CPU 无卡阶段
 
 1. 实现 adapter、配置开关、native 数据 prompt、answer 映射和轨迹字段；旧 XML 代码路径不删除。
-2. 增加 parser 正反例、空/多 action、模板 token 前缀、tool-response role、loss mask、reward 等价、batch reorder 和 legacy 回归测试。
+2. 增加 parser 正反例、空/多 action、模板 token 前缀、tool-response role、loss mask、reward 等价、batch reorder、presence penalty 精确语义和 legacy 回归测试。
 3. 用固定 tokenizer 做真实模板集成测试：schema 确实进入 system，`enable_thinking=False` 生效，第二轮上下文与直接 `apply_chat_template` 的 token 完全一致。
 4. 从已有固定源文件和检索 ledger 重新物化 native probe/train/val Parquet；不重下 Wiki、不重建 BM25、不运行整套历史 CPU 流程。
 5. 生成 resolved config、manifest、SHA-256 与新的 CPU handoff。任一 token 前缀、mask、样本集合或 digest 不一致均停止，不启动 GPU。
@@ -74,8 +83,8 @@ finish(answer: string) # 提交简短最终答案
 
 | 阶段 | 规模与目的 | 通过条件 |
 | --- | --- | --- |
-| G0 原生参考 smoke | 8 个固定问题，每题 2 条；比较直接 HF/native manager，并以同采样 legacy manager 作诊断对照 | 直接 HF 与 native manager 的首轮 prompt token 完全相同；native adapter 可解析不少于 15/16，且没有 `query`、`and` 或空调用 |
-| G1 强制搜索 probe | 16 题 × 2 条；明确要求先搜索，只测 schema、parser 和回填闭环 | 合法首 action `>=31/32`，非退化 query `>=29/32`，退化 query `<=1/32`，首轮截断 `<=1/32`，所有检索均有对齐的 tool response |
+| G0 原生参考 smoke | 8 个固定问题，每题 2 条；比较直接 HF/native manager，并以同一 Qwen 采样参数的 legacy manager 作诊断对照 | 直接 HF 与 native manager 的首轮 prompt token 完全相同；resolved config 确认为 `top_k=20/presence_penalty=2.0`；native adapter 可解析不少于 15/16，且没有 `query`、`and` 或空调用 |
+| G1 强制搜索 probe | 16 题 × 2 条；明确要求先搜索，只测 schema、parser 和回填闭环 | 合法首 action `>=31/32`，非退化 query `>=29/32`，退化 query `<=1/32`，首轮截断 `<=1/32`，所有检索均有对齐的 tool response，重复/异常语言 query 单独列出 |
 | G2 自主搜索 probe | 固定 held-out Hotpot 32 题 × 3 条；允许自主决定搜索和结束 | 非法轨迹、截断轨迹各 `<=5/96`；退化调用不超过全部搜索的 2%；逐题报告 EM、搜索数、query 相关性及完整二搜链 |
 | G3 正式 grouped gate | 现有 held-out Hotpot-64 × group 5 | 沿用原预注册门槛：有效正确多搜 `>=16/320`、覆盖题 `>=8/64`、learnable group `>=8/64`，并满足原非法动作和截断门槛 |
 
@@ -83,7 +92,7 @@ G0/G1 预计约 10 分钟，G2 预计约 25 分钟；G3 已有同规模实测约
 
 ## 6. 归因与停止规则
 
-- **直接 HF 参考也失败**：优先核对 checkpoint revision、tokenizer/template 和官方调用示例；此时不能归因于 Search-R1，也不训练。
+- **直接 HF 参考也失败**：优先核对 checkpoint revision、tokenizer/template、`top_k/presence_penalty` 实际值和官方调用示例；此时不能归因于 Search-R1，也不训练。
 - **参考通过但 G0/G1 失败**：确定是 adapter、batch padding、停止或 parser 实现问题；回 CPU 修复，不靠增大模型或 response 掩盖。
 - **G1 通过但 G2 格式失败**：检查多轮 role 回填、context 裁剪和 observation mask；不改数据配比或奖励。
 - **G2 格式稳定但 G3 能力 NO-GO**：协议因素已经基本排除，剩余假设才是 2B 容量、检索证据质量或缺少格式/多跳 SFT；保留结果后另立实验，不启动稀疏奖励长训。
