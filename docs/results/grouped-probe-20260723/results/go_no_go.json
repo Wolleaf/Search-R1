@@ -1,0 +1,50 @@
+{
+  "catalog_sha256": "6bb480209f33f8c2f94301751ade3e9b993f06bbf4ce5babc27c4e0fb999b036",
+  "checkpoint_digest": "bc67be20efb353ba14d9c1b291a64410afec94f2310e94b59b6b76047b164e78",
+  "criteria": {
+    "clipped_ratio": {
+      "comparison": "<=",
+      "observed": 0.31875,
+      "passed": false,
+      "threshold": 0.05
+    },
+    "covered_question_count": {
+      "comparison": ">=",
+      "observed": 2,
+      "passed": false,
+      "threshold": 8
+    },
+    "invalid_action_ratio": {
+      "comparison": "<=",
+      "observed": 0.578125,
+      "passed": false,
+      "threshold": 0.05
+    },
+    "learnable_group_count": {
+      "comparison": ">=",
+      "observed": 2,
+      "passed": false,
+      "threshold": 8
+    },
+    "valid_correct_multi_search_count": {
+      "comparison": ">=",
+      "observed": 2,
+      "passed": false,
+      "threshold": 16
+    }
+  },
+  "decision": "NO-GO",
+  "failed_criteria": [
+    "valid_correct_multi_search_count",
+    "covered_question_count",
+    "learnable_group_count",
+    "clipped_ratio",
+    "invalid_action_ratio"
+  ],
+  "near_miss_count": 0,
+  "near_miss_diagnosis": "correct_multisearch_exploration_absent_or_rare",
+  "near_miss_threshold_met": false,
+  "schema": "search-r1.grouped-probe-analysis",
+  "schema_version": 2,
+  "trace_sha256": "39c8332e429ccdf438b2edf5d77dfedabf960845efdb4102baf5cb0b71d06382"
+}

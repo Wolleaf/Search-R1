@@ -1,0 +1,213 @@
+{
+  "by_category": {
+    "bridge": {
+      "clean_count": 107,
+      "clipped_count": 74,
+      "clipped_ratio": 0.30833333333333335,
+      "correct_count": 5,
+      "correct_multi_search_count": 2,
+      "cost_contrast_group_count": 0,
+      "covered_question_count": 2,
+      "invalid_action_ratio": 0.5541666666666667,
+      "invalid_action_trajectory_count": 133,
+      "learnable_group_count": 2,
+      "multi_search_count": 69,
+      "near_miss_count": 0,
+      "near_miss_cover_em_count": 0,
+      "near_miss_cover_em_ratio": 0.0,
+      "near_miss_covered_question_count": 0,
+      "near_miss_ratio": 0.0,
+      "outcome_diverse_group_count": 4,
+      "qualification_failure_counts": {
+        "fewer_than_two_searches": 171,
+        "incorrect": 235,
+        "invalid_action": 133,
+        "near_duplicate_or_empty_query": 41,
+        "no_new_document": 51,
+        "no_new_supporting_or_answer_evidence": 62,
+        "response_clipped": 74
+      },
+      "qualifying_evidence_branches": {
+        "answer": 1,
+        "answer_and_supporting_title": 0,
+        "supporting_title": 1
+      },
+      "question_count": 48,
+      "search_diverse_group_count": 24,
+      "trajectory_count": 240,
+      "valid_correct_multi_search_count": 2,
+      "valid_correct_multi_search_ratio": 0.008333333333333333
+    },
+    "comparison": {
+      "clean_count": 28,
+      "clipped_count": 28,
+      "clipped_ratio": 0.35,
+      "correct_count": 2,
+      "correct_multi_search_count": 0,
+      "cost_contrast_group_count": 0,
+      "covered_question_count": 0,
+      "invalid_action_ratio": 0.65,
+      "invalid_action_trajectory_count": 52,
+      "learnable_group_count": 0,
+      "multi_search_count": 21,
+      "near_miss_count": 0,
+      "near_miss_cover_em_count": 0,
+      "near_miss_cover_em_ratio": 0.0,
+      "near_miss_covered_question_count": 0,
+      "near_miss_ratio": 0.0,
+      "outcome_diverse_group_count": 0,
+      "qualification_failure_counts": {
+        "fewer_than_two_searches": 59,
+        "incorrect": 78,
+        "invalid_action": 52,
+        "near_duplicate_or_empty_query": 15,
+        "no_new_document": 16,
+        "no_new_supporting_or_answer_evidence": 18,
+        "response_clipped": 28
+      },
+      "qualifying_evidence_branches": {
+        "answer": 0,
+        "answer_and_supporting_title": 0,
+        "supporting_title": 0
+      },
+      "question_count": 16,
+      "search_diverse_group_count": 4,
+      "trajectory_count": 80,
+      "valid_correct_multi_search_count": 0,
+      "valid_correct_multi_search_ratio": 0.0
+    }
+  },
+  "contract": {
+    "category_questions": {
+      "bridge": 48,
+      "comparison": 16
+    },
+    "expected_questions": 64,
+    "expected_trajectories": 320,
+    "invalid_action_ratio_denominator": "trajectories",
+    "learnable_group_definition": "at least one valid correct multi-search trajectory and at least one unclipped, invalid-action-free EM=0 trajectory",
+    "max_query_token_jaccard": 0.8,
+    "max_searches": 4,
+    "multi_search_minimum": 2,
+    "near_miss_definition": "EM=0 and every non-EM valid-correct-multisearch condition passes; diagnostic only and excluded from GO criteria",
+    "near_miss_diagnostic_threshold": 16,
+    "thresholds": {
+      "covered_question_count": 8,
+      "learnable_group_count": 8,
+      "max_clipped_ratio": 0.05,
+      "max_invalid_action_ratio": 0.05,
+      "valid_correct_multi_search_count": 16
+    },
+    "trajectories_per_question": 5,
+    "valid_correct_multi_search_definition": "EM=1; searches>=2; not clipped; invalid_action_count=0; normalized query-token Jaccard(query 1, query 2)<0.8; retrieval 2 adds a document_id; retrieval 2 adds a catalog supporting title or makes a gold alias visible for the first time"
+  },
+  "decision": "NO-GO",
+  "go_no_go": {
+    "criteria": {
+      "clipped_ratio": {
+        "comparison": "<=",
+        "observed": 0.31875,
+        "passed": false,
+        "threshold": 0.05
+      },
+      "covered_question_count": {
+        "comparison": ">=",
+        "observed": 2,
+        "passed": false,
+        "threshold": 8
+      },
+      "invalid_action_ratio": {
+        "comparison": "<=",
+        "observed": 0.578125,
+        "passed": false,
+        "threshold": 0.05
+      },
+      "learnable_group_count": {
+        "comparison": ">=",
+        "observed": 2,
+        "passed": false,
+        "threshold": 8
+      },
+      "valid_correct_multi_search_count": {
+        "comparison": ">=",
+        "observed": 2,
+        "passed": false,
+        "threshold": 16
+      }
+    },
+    "decision": "NO-GO",
+    "failed_criteria": [
+      "valid_correct_multi_search_count",
+      "covered_question_count",
+      "learnable_group_count",
+      "clipped_ratio",
+      "invalid_action_ratio"
+    ]
+  },
+  "input": {
+    "catalog_path": "/root/autodl-tmp/search-r1/data/search_mix/catalog.jsonl",
+    "catalog_sha256": "6bb480209f33f8c2f94301751ade3e9b993f06bbf4ce5babc27c4e0fb999b036",
+    "checkpoint_digest": "bc67be20efb353ba14d9c1b291a64410afec94f2310e94b59b6b76047b164e78",
+    "group_key_mode": "group_uid",
+    "run_id": "20260723T022333Z-2790-20987",
+    "stage": "group_probe",
+    "trace_path": "/root/autodl-tmp/search-r1/runs/eval/group_probe/attempts/20260723T022333Z-2790-20987/traces/eval_predictions.jsonl",
+    "trace_sha256": "39c8332e429ccdf438b2edf5d77dfedabf960845efdb4102baf5cb0b71d06382"
+  },
+  "near_miss_diagnostic": {
+    "affects_go_no_go": false,
+    "by_category": {
+      "bridge": 0,
+      "comparison": 0
+    },
+    "cover_em_count": 0,
+    "cover_em_definition": "after Unicode/case/punctuation normalization, prediction and any gold alias contain one another on token boundaries; diagnostic only",
+    "covered_question_count": 0,
+    "definition": "EM=0 while every non-EM valid-multisearch condition passes: searches>=2, not clipped, no invalid action, query Jaccard<0.8, a visible new document, and new supporting-title or answer evidence",
+    "diagnosis": "correct_multisearch_exploration_absent_or_rare",
+    "diagnostic_threshold": 16,
+    "examples": [],
+    "threshold_met": false,
+    "trajectory_count": 0
+  },
+  "overall": {
+    "clean_count": 135,
+    "clipped_count": 102,
+    "clipped_ratio": 0.31875,
+    "correct_count": 7,
+    "correct_multi_search_count": 2,
+    "cost_contrast_group_count": 0,
+    "covered_question_count": 2,
+    "invalid_action_ratio": 0.578125,
+    "invalid_action_trajectory_count": 185,
+    "learnable_group_count": 2,
+    "multi_search_count": 90,
+    "near_miss_count": 0,
+    "near_miss_cover_em_count": 0,
+    "near_miss_cover_em_ratio": 0.0,
+    "near_miss_covered_question_count": 0,
+    "near_miss_ratio": 0.0,
+    "outcome_diverse_group_count": 4,
+    "qualification_failure_counts": {
+      "fewer_than_two_searches": 230,
+      "incorrect": 313,
+      "invalid_action": 185,
+      "near_duplicate_or_empty_query": 56,
+      "no_new_document": 67,
+      "no_new_supporting_or_answer_evidence": 80,
+      "response_clipped": 102
+    },
+    "qualifying_evidence_branches": {
+      "answer": 1,
+      "answer_and_supporting_title": 0,
+      "supporting_title": 1
+    },
+    "question_count": 64,
+    "search_diverse_group_count": 28,
+    "trajectory_count": 320,
+    "valid_correct_multi_search_count": 2,
+    "valid_correct_multi_search_ratio": 0.00625
+  },
+  "schema": "search-r1.grouped-probe-analysis",
+  "schema_version": 2
+}

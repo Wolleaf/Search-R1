@@ -1,0 +1,4 @@
+curl: (7) Failed to connect to 127.0.0.1 port 8000 after 0 ms: Connection refused
+Starting eval group_probe (budget 10 RMB, timeout 6250s); log: /root/autodl-tmp/search-r1/runs/eval/group_probe/attempts/20260723T022333Z-2790-20987/train.log
+grouped probe analysis error: trace line 28 retrieval_events[0].query must be non-empty
+AUTODL_PHASE_TERMINAL state=failed exit_code=1

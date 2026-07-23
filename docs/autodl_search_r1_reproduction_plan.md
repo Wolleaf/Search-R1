@@ -191,3 +191,9 @@ bash /root/autodl-tmp/search-r1/checkout/scripts/autodl/07_gpu_group_probe.sh
 两卡单价按 5.76 元/小时记录。当前 probe 的硬上限为 10 元；response 500 只在输出实际变长时增加耗时。后续训练仍以 300 元为总硬上限，但只有 probe GO 后才启用训练预算。100 GB 数据盘足够：新增 Hotpot train 原文件约 0.57 GB，检索 ledger 和混合 Parquet 远小于 checkpoint。
 
 面试中应如实表述：256 是局部截断干扰，但不是缺少多搜的唯一原因；真正的改进是把“多跳数据集标签”转化为由相同检索器验证的可执行二搜证据链，并用 group-level 探针在训练前检查稀疏奖励是否存在可学习信号。
+
+## 8. 2026-07-23 实际探针结果
+
+Base grouped probe 已按预注册配置完成，结论为 **NO-GO**。64 题、每题 5 条轨迹共 320 条中，EM 为 7/320；搜索次数 `0/1/2/3/4` 分布为 `140/90/53/32/5`。只有 2 条有效正确多搜轨迹，覆盖 2 题并形成 2 个可学习 group；cost-contrast group 和 near-miss 均为 0。截断率为 31.88%，非法动作轨迹率为 57.81%，五项硬门槛全部失败。
+
+因此本轮在训练前停止，不启动 `R-mix60`，也不实现或训练 `B-mix20/C-gated-mix20`。一次空 `<search>` query 曾使原外层 analysis 错误退出；评测本身完整成功，最小分析器修复仅将该行为计为科学失败，并在独立离线 attempt 中生成正式 NO-GO。原失败 attempt、成功 eval、恢复血缘、完整轨迹和逐题/逐轨迹报告均归档于 `docs/results/grouped-probe-20260723/`。

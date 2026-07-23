@@ -1,0 +1,5 @@
+at=2026-07-23T03:48:07Z
+backend=/usr/bin/shutdown
+backend_kind=autodl-guest
+work_exit_code=1
+provider_control_plane_confirmed=false
