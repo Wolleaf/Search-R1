@@ -197,3 +197,7 @@ bash /root/autodl-tmp/search-r1/checkout/scripts/autodl/07_gpu_group_probe.sh
 Base grouped probe 已按预注册配置完成，结论为 **NO-GO**。64 题、每题 5 条轨迹共 320 条中，EM 为 7/320；搜索次数 `0/1/2/3/4` 分布为 `140/90/53/32/5`。只有 2 条有效正确多搜轨迹，覆盖 2 题并形成 2 个可学习 group；cost-contrast group 和 near-miss 均为 0。截断率为 31.88%，非法动作轨迹率为 57.81%，五项硬门槛全部失败。
 
 因此本轮在训练前停止，不启动 `R-mix60`，也不实现或训练 `B-mix20/C-gated-mix20`。一次空 `<search>` query 曾使原外层 analysis 错误退出；评测本身完整成功，最小分析器修复仅将该行为计为科学失败，并在独立离线 attempt 中生成正式 NO-GO。原失败 attempt、成功 eval、恢复血缘、完整轨迹和逐题/逐轨迹报告均归档于 `docs/results/grouped-probe-20260723/`。
+
+## 9. Qwen3.5 协议适配后的后续入口
+
+专项审计确认当前 NO-GO 混入了 Qwen3.5 原生工具协议未启用、提示词占位符复制和宽松 parser 误触发等因素。后续不直接启动 `R-mix60`，统一按 [`qwen35_native_tool_adaptation_plan.md`](qwen35_native_tool_adaptation_plan.md) 先完成原生协议适配和 G0-G3 分层门禁；只有新 grouped gate 通过，才恢复本文件第 5 节的能力训练与成本分叉。
