@@ -19,6 +19,7 @@ DATA_ROOT="$PROJECT_ROOT/data"
 SMALL_DATA_DIR="$DATA_ROOT/nq_small"
 SEARCH_GATE_DATA_DIR="$DATA_ROOT/search_opportunity_gate"
 SEARCH_MIX_DATA_DIR="$DATA_ROOT/search_mix"
+QWEN_NATIVE_DATA_DIR="$DATA_ROOT/search_mix_qwen35_native"
 BM25_ROOT="$DATA_ROOT/wiki-18-bm25-index"
 CORPUS_SOURCE_ROOT="$DATA_ROOT/wiki-18-corpus-source"
 CORPUS_ROOT="$DATA_ROOT/wiki-18-corpus"
@@ -75,19 +76,17 @@ cpu_action() {
     local _attempt="$1"
     local commit base_python train_python retriever_python python_version torch_version handoff_digest gpu_count
     local previous_commit previous_python previous_torch build_search_mix=0 seal_search_mix=0
+    local build_qwen_native=0 seal_qwen_native=0
     local spec mode variant steps model_path config_output_dir parent_placeholder trace_placeholder
     local config_response_length eval_group_size
     local trace_digest_placeholder trace_checkpoint_digest trace_parent_digest trace_output trace_stage
-    local -a command_args search_mix_handoff_args
+    local -a command_args previous_handoff_args search_mix_handoff_args qwen_native_handoff_args
     commit="$(expected_commit)"
     verify_checkout "$commit"
     [[ -f "$CHECKOUT_DIR/requirements-autodl.lock" ]] || {
         printf 'Missing requirements-autodl.lock in the pinned checkout.\n' >&2
         return 1
     }
-    rm -f -- "$MANIFEST_DIR/cpu.ok"
-    sync_path "$MANIFEST_DIR"
-
     [[ "${AUTODL_RESEAL_ONLY:-0}" == 0 || "${AUTODL_RESEAL_ONLY:-0}" == 1 ]] || {
         printf 'AUTODL_RESEAL_ONLY must be 0 or 1.\n' >&2
         return 64
@@ -102,20 +101,29 @@ cpu_action() {
         printf 'AUTODL_SEARCH_MIX_INCREMENTAL must be 0 or 1.\n' >&2
         return 64
     }
+    [[ "${AUTODL_QWEN_NATIVE_INCREMENTAL:-0}" == 0 ||
+        "${AUTODL_QWEN_NATIVE_INCREMENTAL:-0}" == 1 ]] || {
+        printf 'AUTODL_QWEN_NATIVE_INCREMENTAL must be 0 or 1.\n' >&2
+        return 64
+    }
     if (( ${AUTODL_RESEAL_ONLY:-0} + ${AUTODL_SEARCH_GATE_INCREMENTAL:-0} +
-          ${AUTODL_SEARCH_MIX_INCREMENTAL:-0} > 1 )); then
+          ${AUTODL_SEARCH_MIX_INCREMENTAL:-0} +
+          ${AUTODL_QWEN_NATIVE_INCREMENTAL:-0} > 1 )); then
         printf 'Choose only one incremental or offline reseal mode.\n' >&2
         return 64
     fi
 
     if [[ "${AUTODL_RESEAL_ONLY:-0}" == 1 ||
           "${AUTODL_SEARCH_GATE_INCREMENTAL:-0}" == 1 ||
-          "${AUTODL_SEARCH_MIX_INCREMENTAL:-0}" == 1 ]]; then
+          "${AUTODL_SEARCH_MIX_INCREMENTAL:-0}" == 1 ||
+          "${AUTODL_QWEN_NATIVE_INCREMENTAL:-0}" == 1 ]]; then
         export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1 PIP_NO_INDEX=1
         train_python="$TRAIN_ENV/bin/python"
         retriever_python="$RETRIEVER_ENV/bin/python"
         [[ -x "$train_python" && -x "$retriever_python" &&
-            -f "$HANDOFF" && -f "$HANDOFF.sha256" ]] || {
+            -f "$HANDOFF" && ! -L "$HANDOFF" &&
+            -f "$HANDOFF.sha256" && ! -L "$HANDOFF.sha256" &&
+            -f "$MANIFEST_DIR/cpu.ok" && ! -L "$MANIFEST_DIR/cpu.ok" ]] || {
             printf 'Incremental reseal requires the existing environments and CPU handoff.\n' >&2
             return 1
         }
@@ -132,12 +140,27 @@ payload = json.loads(Path(sys.argv[1]).read_text())
 print(payload["checkout_commit"], payload["python_version"], payload["torch_version"], sep="\t")
 PY
         )
+        previous_handoff_args=()
+        if [[ "${AUTODL_QWEN_NATIVE_INCREMENTAL:-0}" == 1 ]]; then
+            previous_handoff_args+=(
+                --require-artifact data/search_mix/retrieval_replay.json
+                --require-artifact data/search_mix/retrieval_replay.json.sha256
+            )
+        fi
         "$train_python" "$CHECKOUT_DIR/scripts/autodl/handoff.py" verify \
             --root "$PROJECT_ROOT" \
             --commit "$previous_commit" \
             --python-version "$previous_python" \
             --torch-version "$previous_torch" \
-            --manifest "$HANDOFF"
+            --manifest "$HANDOFF" \
+            "${previous_handoff_args[@]}"
+        handoff_digest="$(sha256sum -- "$HANDOFF" | cut -d' ' -f1)"
+        [[ "$(tr -d '\r\n' <"$MANIFEST_DIR/cpu.ok")" == "$handoff_digest" ]] || {
+            printf 'cpu.ok does not match the previous sealed handoff.\n' >&2
+            return 1
+        }
+        rm -f -- "$MANIFEST_DIR/cpu.ok"
+        sync_path "$MANIFEST_DIR"
         "$train_python" -m pip freeze --all >"$_attempt/train-freeze.current.txt"
         "$retriever_python" -m pip freeze --all >"$_attempt/retriever-freeze.current.txt"
         cmp -s "$MANIFEST_DIR/train-freeze.txt" "$_attempt/train-freeze.current.txt" || {
@@ -166,7 +189,26 @@ PY
             export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1 PIP_NO_INDEX=1
             build_search_mix=1
         fi
+        if [[ "${AUTODL_QWEN_NATIVE_INCREMENTAL:-0}" == 1 ]]; then
+            [[ -f "$SEARCH_MIX_DATA_DIR/manifest.json" &&
+                ! -L "$SEARCH_MIX_DATA_DIR/manifest.json" ]] || {
+                printf 'Qwen native materialization requires the sealed search_mix manifest.\n' >&2
+                return 1
+            }
+            if [[ -f "$QWEN_NATIVE_DATA_DIR/manifest.json" &&
+                  ! -L "$QWEN_NATIVE_DATA_DIR/manifest.json" ]]; then
+                seal_qwen_native=1
+            elif [[ -e "$QWEN_NATIVE_DATA_DIR" || -L "$QWEN_NATIVE_DATA_DIR" ]]; then
+                printf 'Qwen native data target exists without a regular manifest: %s\n' \
+                    "$QWEN_NATIVE_DATA_DIR" >&2
+                return 1
+            else
+                build_qwen_native=1
+            fi
+        fi
     elif [[ "${AUTODL_RESEAL_ONLY:-0}" == 0 ]]; then
+        rm -f -- "$MANIFEST_DIR/cpu.ok"
+        sync_path "$MANIFEST_DIR"
         base_python="$(resolve_llmdevelop_python)"
         [[ -x "$base_python" ]] || {
             printf 'llmdevelop Python is not executable: %s\n' "$base_python" >&2
@@ -255,6 +297,17 @@ PY
             --local-dir "$SEARCH_MIX_DATA_DIR"
         export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1 PIP_NO_INDEX=1
         build_search_mix=1
+        if [[ -f "$QWEN_NATIVE_DATA_DIR/manifest.json" &&
+              ! -L "$QWEN_NATIVE_DATA_DIR/manifest.json" ]]; then
+            # A failed post-materialization retry may reuse only source-bound data.
+            seal_qwen_native=1
+        elif [[ -e "$QWEN_NATIVE_DATA_DIR" || -L "$QWEN_NATIVE_DATA_DIR" ]]; then
+            printf 'Qwen native data target exists without a regular manifest: %s\n' \
+                "$QWEN_NATIVE_DATA_DIR" >&2
+            return 1
+        else
+            build_qwen_native=1
+        fi
     fi
 
     if [[ "$build_search_mix" == 1 ]]; then
@@ -286,12 +339,102 @@ PY
             --model-dir "$MODEL_DIR" \
             --eval-catalog "$SEARCH_GATE_DATA_DIR/catalog.jsonl" \
             --eval-parquet "$SMALL_DATA_DIR/test_128.parquet"
-        PYTHONPATH="$CHECKOUT_DIR" "$retriever_python" \
-            "$CHECKOUT_DIR/scripts/data_process/search_mix.py" replay \
-            --manifest "$SEARCH_MIX_DATA_DIR/manifest.json" \
-            --index-path "$BM25_ROOT/bm25" \
-            --corpus-path "$CORPUS_JSONL" \
-            --offsets-path "$CORPUS_OFFSETS"
+        if [[ "${AUTODL_QWEN_NATIVE_INCREMENTAL:-0}" != 1 ]]; then
+            PYTHONPATH="$CHECKOUT_DIR" "$retriever_python" \
+                "$CHECKOUT_DIR/scripts/data_process/search_mix.py" replay \
+                --manifest "$SEARCH_MIX_DATA_DIR/manifest.json" \
+                --index-path "$BM25_ROOT/bm25" \
+                --corpus-path "$CORPUS_JSONL" \
+                --offsets-path "$CORPUS_OFFSETS"
+        fi
+        "$train_python" "$CHECKOUT_DIR/scripts/data_process/search_mix.py" verify-replay \
+            --manifest "$SEARCH_MIX_DATA_DIR/manifest.json"
+    fi
+    if [[ "$build_qwen_native" == 1 ]]; then
+        "$train_python" "$CHECKOUT_DIR/scripts/data_process/search_mix.py" materialize-native \
+            --source-manifest "$SEARCH_MIX_DATA_DIR/manifest.json" \
+            --output-dir "$QWEN_NATIVE_DATA_DIR" \
+            --model-dir "$MODEL_DIR" \
+            --eval-catalog "$SEARCH_GATE_DATA_DIR/catalog.jsonl" \
+            --eval-parquet "$SMALL_DATA_DIR/test_128.parquet"
+        seal_qwen_native=1
+    elif [[ "$seal_qwen_native" == 0 &&
+            -f "$QWEN_NATIVE_DATA_DIR/manifest.json" &&
+            ! -L "$QWEN_NATIVE_DATA_DIR/manifest.json" ]]; then
+        seal_qwen_native=1
+    elif [[ -e "$QWEN_NATIVE_DATA_DIR/manifest.json" ||
+            -L "$QWEN_NATIVE_DATA_DIR/manifest.json" ]]; then
+        printf 'Qwen native manifest exists but is not a regular non-symlink file.\n' >&2
+        return 1
+    fi
+    if [[ "$seal_qwen_native" == 1 ]]; then
+        "$train_python" - "$MODEL_DIR/chat_template.jinja" <<'PY'
+import hashlib
+from pathlib import Path
+import sys
+
+from transformers import AutoTokenizer
+
+from search_r1.llm_agent.tool_protocol import (
+    QWEN35_CHAT_TEMPLATE_SHA256,
+    QWEN35_NATIVE,
+    Qwen35Conversation,
+    parse_action,
+    qwen35_messages,
+    qwen35_tools,
+    render_qwen35_prompt,
+)
+
+path = Path(sys.argv[1])
+if not path.is_file() or path.is_symlink():
+    raise SystemExit(f"Qwen chat template is missing or symlinked: {path}")
+actual = hashlib.sha256(path.read_bytes()).hexdigest()
+if actual != QWEN35_CHAT_TEMPLATE_SHA256:
+    raise SystemExit(
+        f"Qwen chat template digest mismatch: expected "
+        f"{QWEN35_CHAT_TEMPLATE_SHA256}, found {actual}")
+
+tokenizer = AutoTokenizer.from_pretrained(path.parent, local_files_only=True)
+messages = qwen35_messages("Who wrote Hamlet?")
+prompt_ids = tokenizer(render_qwen35_prompt(tokenizer, messages),
+                       add_special_tokens=False)["input_ids"]
+direct_prompt_ids = tokenizer.apply_chat_template(
+    messages, tools=qwen35_tools(), enable_thinking=False,
+    add_generation_prompt=True, tokenize=True, return_dict=False)
+if direct_prompt_ids != prompt_ids:
+    raise SystemExit("Qwen native rendered-string and direct template tokens differ")
+conversation = Qwen35Conversation(tokenizer, messages, prompt_ids)
+
+search_text = (
+    "  <tool_call><function=search><parameter=query>Hamlet author"
+    "</parameter></function></tool_call>  ")
+search_ids = tokenizer(search_text, add_special_tokens=False)["input_ids"]
+search_prefix = list(conversation.prompt_token_ids) + list(search_ids)
+search = conversation.append_followup(
+    search_text, parse_action(search_text, QWEN35_NATIVE),
+    "  Hamlet was written by William Shakespeare.  ", 384,
+    response_token_ids=search_ids)
+if (conversation.prompt_token_ids[:len(search_prefix)] != search_prefix
+        or not search.token_ids or not search.visible_observation):
+    raise SystemExit("Qwen native search wrapper did not preserve sampled tokens")
+
+invalid_text = '  {"name":"search","arguments":{"query":"Hamlet author"}}  '
+invalid_ids = tokenizer(invalid_text, add_special_tokens=False)["input_ids"]
+invalid_prefix = list(conversation.prompt_token_ids) + list(invalid_ids)
+retry = conversation.append_followup(
+    invalid_text, parse_action(invalid_text, QWEN35_NATIVE), "", 384,
+    response_token_ids=invalid_ids)
+if (conversation.prompt_token_ids[:len(invalid_prefix)] != invalid_prefix
+        or not retry.token_ids):
+    raise SystemExit("Qwen native retry wrapper did not preserve sampled tokens")
+PY
+        "$train_python" "$CHECKOUT_DIR/scripts/data_process/search_mix.py" verify \
+            --manifest "$QWEN_NATIVE_DATA_DIR/manifest.json" \
+            --source-manifest "$SEARCH_MIX_DATA_DIR/manifest.json" \
+            --model-dir "$MODEL_DIR" \
+            --eval-catalog "$SEARCH_GATE_DATA_DIR/catalog.jsonl" \
+            --eval-parquet "$SMALL_DATA_DIR/test_128.parquet" \
+            --expected-tool-protocol qwen35_native
     fi
 
     "$train_python" - "$MODEL_DIR" "$SMALL_DATA_DIR" <<'PY'
@@ -318,8 +461,10 @@ PY
     "$train_python" "$CHECKOUT_DIR/scripts/data_process/multihop_search_gate.py" verify \
         --manifest "$SEARCH_GATE_DATA_DIR/manifest.json"
 
-    PYTHONPATH="$CHECKOUT_DIR" "$retriever_python" - \
-        "$BM25_ROOT/bm25" "$CORPUS_JSONL" "$CORPUS_OFFSETS" <<'PY'
+    # Native-only resealing changes prompts, so the prior handoff already covers BM25.
+    if [[ "${AUTODL_QWEN_NATIVE_INCREMENTAL:-0}" != 1 ]]; then
+        PYTHONPATH="$CHECKOUT_DIR" "$retriever_python" - \
+            "$BM25_ROOT/bm25" "$CORPUS_JSONL" "$CORPUS_OFFSETS" <<'PY'
 from search_r1.search.bm25_server import BM25Retriever
 import sys
 
@@ -333,6 +478,7 @@ hits = retriever.search("Who wrote Hamlet?", topk=1, return_scores=True)
 if not hits or not hits[0]["document"]["contents"]:
     raise SystemExit("BM25 smoke query returned no document")
 PY
+    fi
 
     "$train_python" -m pytest -q -p no:cacheprovider "$CHECKOUT_DIR/tests"
     PYTHON_BIN="$train_python" bash "$CHECKOUT_DIR/scripts/autodl/tests/test_runtime.sh"
@@ -340,6 +486,7 @@ PY
     bash "$CHECKOUT_DIR/scripts/autodl/tests/test_gated_followup.sh"
     bash "$CHECKOUT_DIR/scripts/autodl/tests/test_search_opportunity_pipeline.sh"
     PYTHON_BIN="$train_python" bash "$CHECKOUT_DIR/scripts/autodl/tests/test_group_probe_pipeline.sh"
+    PYTHON_BIN="$train_python" bash "$CHECKOUT_DIR/scripts/autodl/tests/test_qwen_native_gate_pipeline.sh"
     bash "$CHECKOUT_DIR/scripts/autodl/tests/test_shutdown_watchdog.sh"
     "$train_python" "$CHECKOUT_DIR/scripts/autodl/tests/test_results.py"
     "$train_python" "$CHECKOUT_DIR/scripts/autodl/tests/test_paired_eval.py"
@@ -459,6 +606,60 @@ PY
                 >"$MANIFEST_DIR/config-${gpu_count}gpu-$variant-trace-eval.yaml"
         done
     done
+
+    if [[ "$seal_qwen_native" == 1 ]]; then
+        for spec in \
+            "qwen_native_g1|$QWEN_NATIVE_DATA_DIR/probe_forced_16.parquet|2" \
+            "qwen_native_g2|$QWEN_NATIVE_DATA_DIR/probe_autonomous_32.parquet|3" \
+            "qwen_native_g3|$QWEN_NATIVE_DATA_DIR/probe_multi_64.parquet|5"; do
+            IFS='|' read -r variant eval_data_file eval_group_size <<<"$spec"
+            AUTODL_CONFIG_ONLY=1 \
+                AUTODL_ROOT="$PROJECT_ROOT" \
+                GPU_COUNT=2 \
+                MAX_RESPONSE_LENGTH=500 \
+                DATA_DIR="$QWEN_NATIVE_DATA_DIR" \
+                OUTPUT_DIR="$config_output_dir" \
+                EVAL_DATA_FILE="$eval_data_file" \
+                EVAL_GROUP_SIZE="$eval_group_size" \
+                TRACE_OUTPUT_DIR="$trace_placeholder" \
+                TRACE_STAGE="$variant" \
+                TRACE_RUN_ID=config-compose \
+                TRACE_CHECKPOINT_DIGEST="$trace_digest_placeholder" \
+                TOOL_PROTOCOL=qwen35_native \
+                bash "$CHECKOUT_DIR/scripts/autodl/train_small_grpo.sh" \
+                eval "$variant" "$MODEL_DIR" \
+                >"$MANIFEST_DIR/config-2gpu-$variant-eval.yaml"
+        done
+        "$train_python" - "$MANIFEST_DIR" "$QWEN_NATIVE_DATA_DIR" <<'PY'
+from pathlib import Path
+import sys
+
+from omegaconf import OmegaConf
+
+manifest_dir, data_dir = map(Path, sys.argv[1:])
+specs = {
+    "qwen_native_g1": ("probe_forced_16.parquet", 2),
+    "qwen_native_g2": ("probe_autonomous_32.parquet", 3),
+    "qwen_native_g3": ("probe_multi_64.parquet", 5),
+}
+for variant, (filename, group_size) in specs.items():
+    path = manifest_dir / f"config-2gpu-{variant}-eval.yaml"
+    config = OmegaConf.load(path)
+    rollout = config.actor_rollout_ref.rollout
+    if (config.tool_protocol != "qwen35_native"
+            or config.data.return_raw_chat is not True
+            or Path(config.data.val_files) != data_dir / filename
+            or config.data.eval_group_size != group_size
+            or config.data.val_batch_size != 8
+            or config.data.max_response_length != 500
+            or config.data.max_prompt_length != 4096
+            or rollout.top_k != 20
+            or float(rollout.min_p) != 0.0
+            or float(rollout.presence_penalty) != 2.0
+            or float(rollout.repetition_penalty) != 1.0):
+        raise SystemExit(f"Qwen native resolved config mismatch: {path}")
+PY
+    fi
 
     "$train_python" - \
         "$MANIFEST_DIR" \
@@ -657,6 +858,15 @@ PY
             --extra-file "$MANIFEST_DIR/config-2gpu-group_probe-eval.yaml"
         )
     fi
+    qwen_native_handoff_args=()
+    if [[ "$seal_qwen_native" == 1 ]]; then
+        qwen_native_handoff_args+=(
+            --data "$QWEN_NATIVE_DATA_DIR"
+            --extra-file "$MANIFEST_DIR/config-2gpu-qwen_native_g1-eval.yaml"
+            --extra-file "$MANIFEST_DIR/config-2gpu-qwen_native_g2-eval.yaml"
+            --extra-file "$MANIFEST_DIR/config-2gpu-qwen_native_g3-eval.yaml"
+        )
+    fi
 
     "$train_python" "$CHECKOUT_DIR/scripts/autodl/handoff.py" create \
         --root "$PROJECT_ROOT" \
@@ -666,6 +876,7 @@ PY
         --corpus "$CORPUS_ROOT" \
         --data "$SMALL_DATA_DIR" \
         "${search_mix_handoff_args[@]}" \
+        "${qwen_native_handoff_args[@]}" \
         --requirements "$CHECKOUT_DIR/requirements-autodl.lock" \
         --extra-file "$CORPUS_GZIP" \
         --extra-file "$MANIFEST_DIR/train-freeze.txt" \

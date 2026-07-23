@@ -39,6 +39,42 @@ def _object_array(values):
     return output
 
 
+def test_native_protocol_requires_search_agent_loop_at_trainer_setup():
+    config = OmegaConf.create({
+        'tool_protocol': 'qwen35_native',
+        'do_search': False,
+    })
+
+    with pytest.raises(ValueError, match=(
+            'qwen35_native requires do_search=true')):
+        RayPPOTrainer(
+            config=config,
+            tokenizer=None,
+            role_worker_mapping={},
+            resource_pool_manager=None,
+        )
+
+
+def test_native_protocol_rejects_unregistered_training_at_trainer_setup():
+    config = OmegaConf.create({
+        'tool_protocol': 'qwen35_native',
+        'do_search': True,
+        'trainer': {
+            'val_only': False,
+        },
+    })
+
+    with pytest.raises(ValueError, match=(
+            'qwen35_native training is disabled until its '
+            'sampling/log-prob contract is registered')):
+        RayPPOTrainer(
+            config=config,
+            tokenizer=None,
+            role_worker_mapping={},
+            resource_pool_manager=None,
+        )
+
+
 @pytest.mark.parametrize(('decoded_query', 'trailing_output'), [
     ('France capital', ''),
     ('France  capital', ''),
@@ -291,3 +327,62 @@ def test_trace_turns_bind_multiple_searches_without_using_trailing_search():
     ]
     assert turns[-1]['search_query'] == 'unused query'
     assert turns[-1]['retrieval_executed'] is False
+
+
+def test_trace_turns_use_native_normalized_actions_without_xml_reparse():
+    generation_events = [{
+        'turn': 0,
+        'text': ('checking\n<tool_call><function=search><parameter=query>'
+                 'France capital</parameter></function></tool_call>'),
+        'action': 'search',
+        'content': 'France capital',
+        'parse_error': None,
+        'reasoning_prefix': 'checking',
+        'valid_action': True,
+        'done': False,
+        'executed_search': True,
+    }, {
+        'turn': 1,
+        'text': 'Paris',
+        'action': 'answer',
+        'content': 'Paris',
+        'parse_error': None,
+        'reasoning_prefix': '',
+        'valid_action': True,
+        'done': True,
+        'executed_search': False,
+    }]
+    retrieval_events = [{
+        'turn': 0,
+        'query': 'France capital',
+        'documents': [{'document_id': '7'}],
+        'visible_observation': 'Paris is the capital.',
+    }]
+
+    turns = _event_aligned_trace_turns(generation_events, retrieval_events, 1)
+
+    assert [turn['action'] for turn in turns] == ['search', 'answer']
+    assert turns[0]['think'] == 'checking'
+    assert turns[0]['search_query'] == 'France capital'
+    assert turns[0]['retrieval_executed'] is True
+    assert turns[1]['answer'] == 'Paris'
+
+
+def test_trace_turns_keep_native_parse_error_invalid():
+    events = [{
+        'turn': 0,
+        'text': '{"name":"search"}',
+        'action': None,
+        'content': '',
+        'parse_error': 'json_tool_call_not_supported',
+        'reasoning_prefix': '',
+        'valid_action': False,
+        'done': False,
+        'executed_search': False,
+    }]
+
+    turns = _event_aligned_trace_turns(events, [], 0)
+
+    assert len(turns) == 1
+    assert turns[0]['action'] == 'invalid'
+    assert turns[0]['valid_action'] is False

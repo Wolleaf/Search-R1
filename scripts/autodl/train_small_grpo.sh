@@ -7,7 +7,8 @@ PROJECT_ROOT="${AUTODL_ROOT:-/root/autodl-tmp/search-r1}"
 CHECKOUT_DIR="$PROJECT_ROOT/checkout"
 TRAIN_PYTHON="$PROJECT_ROOT/envs/train/bin/python"
 MODEL_DIR="$PROJECT_ROOT/models/Qwen3.5-2B"
-DATA_DIR="$PROJECT_ROOT/data/nq_small"
+DATA_DIR_WAS_SET="${DATA_DIR+x}"
+CALLER_DATA_DIR="${DATA_DIR-}"
 EVAL_DATA_FILE="${EVAL_DATA_FILE:-}"
 EVAL_GROUP_SIZE="${EVAL_GROUP_SIZE:-1}"
 GPU_COUNT="${GPU_COUNT:?Set GPU_COUNT explicitly to 1 or 2}"
@@ -19,6 +20,7 @@ TRACE_STAGE="${TRACE_STAGE:-}"
 TRACE_RUN_ID="${TRACE_RUN_ID:-}"
 TRACE_CHECKPOINT_DIGEST="${TRACE_CHECKPOINT_DIGEST:-}"
 TRACE_PARENT_CHECKPOINT_DIGEST="${TRACE_PARENT_CHECKPOINT_DIGEST:-}"
+TOOL_PROTOCOL="${TOOL_PROTOCOL:-legacy_xml}"
 GRPO_GROUP_SIZE=5
 PPO_MINI_BATCH_SIZE=$((TRAIN_BATCH_SIZE * GRPO_GROUP_SIZE))
 readonly MAX_TURNS=4
@@ -28,14 +30,24 @@ readonly RETRIEVER_TOPK=3
 readonly SMOKE_STEPS=2
 
 [[ "$GPU_COUNT" == 1 || "$GPU_COUNT" == 2 ]] || { printf 'GPU_COUNT must be 1 or 2.\n' >&2; exit 64; }
+[[ "$TOOL_PROTOCOL" == legacy_xml || "$TOOL_PROTOCOL" == qwen35_native ]] || {
+    printf 'TOOL_PROTOCOL must be legacy_xml or qwen35_native.\n' >&2
+    exit 64
+}
 [[ "$TRAIN_BATCH_SIZE" == 8 || "$TRAIN_BATCH_SIZE" == 4 ]] || {
     printf 'TRAIN_BATCH_SIZE must be 8 (default) or the documented OOM fallback 4.\n' >&2
     exit 64
 }
-[[ "$EVAL_GROUP_SIZE" == 1 || "$EVAL_GROUP_SIZE" == 5 ]] || {
-    printf 'EVAL_GROUP_SIZE must be 1 (normal evaluation) or 5 (group probe).\n' >&2
+[[ "$EVAL_GROUP_SIZE" == 1 || "$EVAL_GROUP_SIZE" == 2 ||
+    "$EVAL_GROUP_SIZE" == 3 || "$EVAL_GROUP_SIZE" == 5 ]] || {
+    printf 'EVAL_GROUP_SIZE must be 1, 2, 3, or 5.\n' >&2
     exit 64
 }
+if [[ "$TOOL_PROTOCOL" == legacy_xml && "$EVAL_GROUP_SIZE" != 1 &&
+      "$EVAL_GROUP_SIZE" != 5 ]]; then
+    printf 'Legacy XML evaluation supports group size 1 or 5 only.\n' >&2
+    exit 64
+fi
 case "$MAX_RESPONSE_LENGTH" in
     500|384)
         readonly MAX_PROMPT_LENGTH=4096
@@ -49,6 +61,33 @@ case "$MAX_RESPONSE_LENGTH" in
         exit 64
         ;;
 esac
+
+case "$TOOL_PROTOCOL:$MODE:$VARIANT" in
+    qwen35_native:eval:qwen_native_g1|qwen35_native:eval:qwen_native_g2|qwen35_native:eval:qwen_native_g3)
+        EXPECTED_DATA_DIR="$PROJECT_ROOT/data/search_mix_qwen35_native"
+        ;;
+    legacy_xml:eval:group_probe)
+        EXPECTED_DATA_DIR="$PROJECT_ROOT/data/search_mix"
+        ;;
+    legacy_xml:train:smoke|legacy_xml:train:reproduce|legacy_xml:train:control|legacy_xml:train:cost_aware|legacy_xml:train:cost_aware_gated)
+        EXPECTED_DATA_DIR="$PROJECT_ROOT/data/nq_small"
+        ;;
+    legacy_xml:eval:base|legacy_xml:eval:reproduced|legacy_xml:eval:control|legacy_xml:eval:cost_aware|legacy_xml:eval:cost_aware_gated|legacy_xml:eval:search_opportunity)
+        EXPECTED_DATA_DIR="$PROJECT_ROOT/data/nq_small"
+        ;;
+    *)
+        printf 'TOOL_PROTOCOL=%s is not registered for %s:%s.\n' \
+            "$TOOL_PROTOCOL" "$MODE" "$VARIANT" >&2
+        exit 64
+        ;;
+esac
+if [[ "$DATA_DIR_WAS_SET" == x && "$CALLER_DATA_DIR" != "$EXPECTED_DATA_DIR" ]]; then
+    printf 'DATA_DIR for %s:%s with TOOL_PROTOCOL=%s must be exactly %s.\n' \
+        "$MODE" "$VARIANT" "$TOOL_PROTOCOL" "$EXPECTED_DATA_DIR" >&2
+    exit 64
+fi
+readonly DATA_DIR="$EXPECTED_DATA_DIR"
+
 [[ -x "$TRAIN_PYTHON" && -d "$MODEL_DIR" && -d "$DATA_DIR" ]] || {
     printf 'CPU preparation is incomplete under %s.\n' "$PROJECT_ROOT" >&2
     exit 1
@@ -115,7 +154,7 @@ case "$MODE:$VARIANT" in
         VAL_BEFORE_TRAIN=false
         USE_KL_LOSS=true
         ;;
-    eval:base|eval:reproduced|eval:control|eval:cost_aware|eval:cost_aware_gated|eval:search_opportunity|eval:group_probe)
+    eval:base|eval:reproduced|eval:control|eval:cost_aware|eval:cost_aware_gated|eval:search_opportunity|eval:group_probe|eval:qwen_native_g1|eval:qwen_native_g2|eval:qwen_native_g3)
         [[ $# == 3 ]] || {
             printf 'Pass exactly one model/checkpoint path for evaluation.\n' >&2
             exit 64
@@ -126,7 +165,9 @@ case "$MODE:$VARIANT" in
         SAVE_FREQ=-1
         TEST_FREQ=-1
         MODEL_PATH="${3:?Pass the selected checkpoint for evaluation}"
-        if [[ "$VARIANT" == search_opportunity || "$VARIANT" == group_probe ]]; then
+        if [[ "$VARIANT" == search_opportunity || "$VARIANT" == group_probe ||
+              "$VARIANT" == qwen_native_g1 || "$VARIANT" == qwen_native_g2 ||
+              "$VARIANT" == qwen_native_g3 ]]; then
             [[ -n "$EVAL_DATA_FILE" ]] || {
                 printf 'EVAL_DATA_FILE is required for %s evaluation.\n' "$VARIANT" >&2
                 exit 64
@@ -160,27 +201,69 @@ case "$MODE:$VARIANT" in
         printf '   or: %s eval {base|reproduced|control|cost_aware|cost_aware_gated} MODEL_PATH\n' "$0" >&2
         printf '   or: EVAL_DATA_FILE=<parquet> %s eval search_opportunity MODEL_PATH\n' "$0" >&2
         printf '   or: EVAL_DATA_FILE=<parquet> EVAL_GROUP_SIZE=5 %s eval group_probe MODEL_PATH\n' "$0" >&2
+        printf '   or: TOOL_PROTOCOL=qwen35_native EVAL_DATA_FILE=<parquet> %s eval qwen_native_g{1,2,3} MODEL_PATH\n' "$0" >&2
         exit 64
         ;;
 esac
 
 if [[ "$MODE:$VARIANT" != eval:search_opportunity &&
-      "$MODE:$VARIANT" != eval:group_probe && -n "$EVAL_DATA_FILE" ]]; then
+      "$MODE:$VARIANT" != eval:group_probe &&
+      "$MODE:$VARIANT" != eval:qwen_native_g1 &&
+      "$MODE:$VARIANT" != eval:qwen_native_g2 &&
+      "$MODE:$VARIANT" != eval:qwen_native_g3 && -n "$EVAL_DATA_FILE" ]]; then
     printf 'EVAL_DATA_FILE is only valid for a registered custom evaluation.\n' >&2
     exit 64
 fi
-if [[ "$MODE:$VARIANT" == eval:group_probe ]]; then
-    [[ "$EVAL_GROUP_SIZE" == 5 ]] || {
-        printf 'Group probe evaluation requires EVAL_GROUP_SIZE=5.\n' >&2
+case "$MODE:$VARIANT" in
+eval:group_probe)
+    [[ "$TOOL_PROTOCOL" == legacy_xml && "$EVAL_GROUP_SIZE" == 5 ]] || {
+        printf 'Legacy group probe requires TOOL_PROTOCOL=legacy_xml and EVAL_GROUP_SIZE=5.\n' >&2
         exit 64
     }
     VAL_BATCH_SIZE=8
-else
+    ;;
+eval:qwen_native_g1)
+    [[ "$TOOL_PROTOCOL" == qwen35_native && "$EVAL_GROUP_SIZE" == 2 ]] || {
+        printf 'Qwen native G1 requires TOOL_PROTOCOL=qwen35_native and EVAL_GROUP_SIZE=2.\n' >&2
+        exit 64
+    }
+    VAL_BATCH_SIZE=8
+    ;;
+eval:qwen_native_g2)
+    [[ "$TOOL_PROTOCOL" == qwen35_native && "$EVAL_GROUP_SIZE" == 3 ]] || {
+        printf 'Qwen native G2 requires TOOL_PROTOCOL=qwen35_native and EVAL_GROUP_SIZE=3.\n' >&2
+        exit 64
+    }
+    VAL_BATCH_SIZE=8
+    ;;
+eval:qwen_native_g3)
+    [[ "$TOOL_PROTOCOL" == qwen35_native && "$EVAL_GROUP_SIZE" == 5 ]] || {
+        printf 'Qwen native G3 requires TOOL_PROTOCOL=qwen35_native and EVAL_GROUP_SIZE=5.\n' >&2
+        exit 64
+    }
+    VAL_BATCH_SIZE=8
+    ;;
+*)
     [[ "$EVAL_GROUP_SIZE" == 1 ]] || {
-        printf 'Only group probe evaluation may use EVAL_GROUP_SIZE=5.\n' >&2
+        printf 'Only registered grouped evaluations may use EVAL_GROUP_SIZE greater than 1.\n' >&2
         exit 64
     }
     VAL_BATCH_SIZE=64
+    ;;
+esac
+
+if [[ "$TOOL_PROTOCOL" == qwen35_native ]]; then
+    ROLLOUT_TOP_K=20
+    ROLLOUT_MIN_P=0.0
+    ROLLOUT_PRESENCE_PENALTY=2.0
+    ROLLOUT_REPETITION_PENALTY=1.0
+    RETURN_RAW_CHAT=true
+else
+    ROLLOUT_TOP_K=0
+    ROLLOUT_MIN_P=0.0
+    ROLLOUT_PRESENCE_PENALTY=0.0
+    ROLLOUT_REPETITION_PENALTY=1.0
+    RETURN_RAW_CHAT=false
 fi
 
 [[ "$TOTAL_STEPS" =~ ^[1-9][0-9]*$ ]] || { printf 'steps must be a positive integer.\n' >&2; exit 64; }
@@ -237,6 +320,7 @@ HYDRA_ARGS=(
     "data.train_batch_size=$TRAIN_BATCH_SIZE"
     "data.val_batch_size=$VAL_BATCH_SIZE"
     "data.eval_group_size=$EVAL_GROUP_SIZE"
+    "data.return_raw_chat=$RETURN_RAW_CHAT"
     "data.max_prompt_length=$MAX_PROMPT_LENGTH"
     "data.max_response_length=$MAX_RESPONSE_LENGTH"
     "data.max_start_length=$MAX_START_LENGTH"
@@ -268,7 +352,10 @@ HYDRA_ARGS=(
     "actor_rollout_ref.rollout.n_agent=$GRPO_GROUP_SIZE"
     actor_rollout_ref.rollout.temperature=1.0
     actor_rollout_ref.rollout.top_p=1.0
-    actor_rollout_ref.rollout.top_k=0
+    "actor_rollout_ref.rollout.top_k=$ROLLOUT_TOP_K"
+    "actor_rollout_ref.rollout.min_p=$ROLLOUT_MIN_P"
+    "actor_rollout_ref.rollout.presence_penalty=$ROLLOUT_PRESENCE_PENALTY"
+    "actor_rollout_ref.rollout.repetition_penalty=$ROLLOUT_REPETITION_PENALTY"
     ++actor_rollout_ref.rollout.micro_batch_size=1
     "actor_rollout_ref.ref.log_prob_micro_batch_size=$GPU_COUNT"
     "++actor_rollout_ref.ref.fsdp_config.wrap_policy.transformer_layer_cls_to_wrap=[Qwen3_5DecoderLayer]"
@@ -292,6 +379,7 @@ HYDRA_ARGS=(
     hydra.output_subdir=null
     hydra.job.chdir=false
     "max_turns=$MAX_TURNS"
+    "++tool_protocol=$TOOL_PROTOCOL"
     retriever.url=http://127.0.0.1:8000/retrieve
     "retriever.topk=$RETRIEVER_TOPK"
     "${TRACE_HYDRA_ARGS[@]}"

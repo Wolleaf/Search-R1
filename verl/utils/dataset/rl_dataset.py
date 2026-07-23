@@ -22,6 +22,10 @@ import torch
 import numpy as np
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer, PreTrainedTokenizer
+from search_r1.llm_agent.tool_protocol import (LEGACY_XML, QWEN35_NATIVE,
+                                               normalize_tool_protocol,
+                                               render_qwen35_prompt,
+                                               validate_qwen35_messages)
 from verl.utils.fs import copy_local_path_from_hdfs
 
 from verl.utils.model import compute_position_id_with_mask
@@ -69,7 +73,8 @@ class RLHFDataset(Dataset):
                  cache_dir='~/.cache/verl/rlhf',
                  chat_template_func=None,
                  return_raw_chat=False,
-                 truncation='error'):
+                 truncation='error',
+                 tool_protocol=LEGACY_XML):
         if not isinstance(parquet_files, (List, ListConfig)):
             parquet_files = [parquet_files]
 
@@ -84,6 +89,7 @@ class RLHFDataset(Dataset):
         self.return_raw_chat = return_raw_chat
         self.chat_template_func = chat_template_func
         self.truncation = truncation
+        self.tool_protocol = normalize_tool_protocol(tool_protocol)
 
         self._download()
         self._read_files_and_tokenize()
@@ -125,7 +131,12 @@ class RLHFDataset(Dataset):
 
         chat = row_dict.pop(self.prompt_key)
 
-        if self.tokenizer.chat_template:
+        if self.tool_protocol == QWEN35_NATIVE:
+            raw_chat = chat.tolist() if hasattr(chat, 'tolist') else list(chat)
+            raw_chat = validate_qwen35_messages(raw_chat)
+            prompt_with_chat_template = render_qwen35_prompt(
+                self.tokenizer, raw_chat)
+        elif self.tokenizer.chat_template:
             prompt_with_chat_template = self.tokenizer.apply_chat_template(chat, add_generation_prompt=True, tokenize=False)
         else:
             prompt_with_chat_template = chat[0]['content']
@@ -145,7 +156,9 @@ class RLHFDataset(Dataset):
         row_dict['position_ids'] = position_ids[0]
 
         # encode prompts without chat template
-        if self.return_raw_chat:
+        if self.tool_protocol == QWEN35_NATIVE:
+            row_dict['raw_prompt'] = raw_chat
+        elif self.return_raw_chat:
             row_dict['raw_prompt'] = chat.tolist()
 
         # add index for each prompt

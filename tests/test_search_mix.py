@@ -51,6 +51,20 @@ class CharacterTokenizer:
                                         for index in range(len(text))]
         return result
 
+    def apply_chat_template(self,
+                            messages,
+                            tools=None,
+                            enable_thinking=False,
+                            add_generation_prompt=True,
+                            tokenize=False,
+                            return_dict=False):
+        del tools, enable_thinking, add_generation_prompt, return_dict
+        rendered = "chat|" + "|".join(
+            f"{message['role']}:{message['content']}" for message in messages)
+        if tokenize:
+            return [ord(character) for character in rendered]
+        return rendered
+
     def decode(self, input_ids, skip_special_tokens=True):
         del skip_special_tokens
         return "".join(chr(token) for token in input_ids)
@@ -169,6 +183,20 @@ def test_registered_mix_uses_hotpot_majority_with_bridge_weighting():
                for category in search_mix.QUOTAS.values()) == 512
     assert sum(category["val"]
                for category in search_mix.QUOTAS.values()) == 128
+
+    native = search_mix.parse_args([
+        "materialize-native", "--source-manifest", "source/manifest.json",
+        "--output-dir", "native", "--model-dir", "model"
+    ])
+    assert native.source_manifest == Path("source/manifest.json")
+    assert native.output_dir == Path("native")
+    verify = search_mix.parse_args([
+        "verify", "--manifest", "native/manifest.json", "--model-dir",
+        "model", "--expected-tool-protocol", "qwen35_native",
+        "--source-manifest", "source/manifest.json"
+    ])
+    assert verify.expected_tool_protocol == search_mix.QWEN35_NATIVE
+    assert verify.source_manifest == Path("source/manifest.json")
 
 
 def test_candidate_accepts_nq_comparison_and_bridge():
@@ -552,6 +580,64 @@ def test_quota_split_builds_fixed_multihop_probe(monkeypatch):
             for record in probe} == expected_probe_indices
 
 
+def test_native_prompt_changes_only_model_facing_messages(monkeypatch):
+    monkeypatch.setattr(search_mix, "QUOTAS", deepcopy(SMALL_QUOTAS))
+    catalog, _, _ = search_mix.select_catalog(_small_evidence(),
+                                              CharacterTokenizer(),
+                                              excluded_questions=set())
+
+    legacy = search_mix._ordered_records(catalog, "probe")
+    native = search_mix._ordered_records(catalog, "probe",
+                                         search_mix.QWEN35_NATIVE)
+
+    assert len(legacy) == len(native)
+    for old, new in zip(legacy, native):
+        assert {key: value for key, value in old.items() if key != "prompt"} == {
+            key: value for key, value in new.items() if key != "prompt"
+        }
+        assert [message["role"] for message in new["prompt"]] == [
+            "system", "user"
+        ]
+        source_index = new["extra_info"]["index"]
+        selected = next(item for item in catalog
+                        if item["source_index"] == source_index)
+        assert new["prompt"][1]["content"] == (
+            f"Question: {selected['question']}\n")
+        assert not any(tag in new["prompt"][1]["content"] for tag in (
+            "<think>", "<search>", "<answer>", "<tool_call>"))
+
+
+def test_native_probe_subsets_use_fixed_probe_prefix(monkeypatch):
+    monkeypatch.setattr(search_mix, "QUOTAS", deepcopy(SMALL_QUOTAS))
+    catalog, _, _ = search_mix.select_catalog(_small_evidence(),
+                                              CharacterTokenizer(),
+                                              excluded_questions=set())
+    probe = search_mix._ordered_records(catalog, "probe",
+                                        search_mix.QWEN35_NATIVE)
+    forced = search_mix._ordered_records(catalog,
+                                         "probe",
+                                         search_mix.QWEN35_NATIVE,
+                                         limit=2,
+                                         force_search=True)
+    autonomous = search_mix._ordered_records(catalog,
+                                             "probe",
+                                             search_mix.QWEN35_NATIVE,
+                                             limit=2)
+
+    identity = lambda row: (row["data_source"], row["extra_info"]["split"],
+                            row["extra_info"]["index"])
+    assert [identity(row) for row in forced] == [
+        identity(row) for row in probe[:2]
+    ]
+    assert [identity(row) for row in autonomous] == [
+        identity(row) for row in probe[:2]
+    ]
+    assert forced[0]["prompt"] != autonomous[0]["prompt"]
+    assert forced[0]["prompt"][0] == autonomous[0]["prompt"][0]
+    assert forced[0]["prompt"][1]["content"].endswith(
+        autonomous[0]["prompt"][1]["content"])
+
+
 def test_output_records_expose_only_five_trainer_fields(monkeypatch):
     monkeypatch.setattr(search_mix, "QUOTAS", deepcopy(SMALL_QUOTAS))
     catalog, _, _ = search_mix.select_catalog(_small_evidence(),
@@ -830,6 +916,293 @@ def _rewrite_manifest_artifact(manifest_path, label, artifact_path):
     search_mix.write_digest_sidecar(manifest_path)
 
 
+def _regular_file_snapshot(root):
+    files = (path for path in Path(root).rglob("*")
+             if path.is_file() and not path.is_symlink())
+    return {
+        path.relative_to(root).as_posix(): search_mix.sha256_file(path)
+        for path in sorted(files, key=lambda value: value.as_posix())
+    }
+
+
+def _build_native_fixture(tmp_path, monkeypatch):
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    paths = _build_manifest_fixture(source_dir, monkeypatch)
+    source_manifest_before = paths["manifest"].read_bytes()
+
+    for source in search_mix.SOURCE_SPECS:
+        path = search_mix.source_path(source_dir, source)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(source, encoding="utf-8")
+
+    def verify_fixture_source(local_dir, source):
+        path = search_mix.source_path(Path(local_dir), source)
+        if not path.is_file() or path.is_symlink():
+            raise ValueError("fixture source is missing")
+        return path
+
+    monkeypatch.setattr(search_mix, "verify_source", verify_fixture_source)
+    monkeypatch.setattr(search_mix, "_atomic_write_parquet",
+                        lambda records, path: _write_json_rows(path, records))
+    monkeypatch.setattr(
+        search_mix, "NATIVE_PROBE_FILES", {
+            "probe_g0": ("probe_g0_8.parquet", 1, False),
+            "probe_forced": ("probe_forced_16.parquet", 2, True),
+            "probe_autonomous": ("probe_autonomous_32.parquet", 3, False),
+        })
+    source_snapshot_before = _regular_file_snapshot(source_dir)
+
+    def forbidden_upstream_call(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("prompt-only materialization called an upstream stage")
+
+    monkeypatch.setattr(search_mix, "download_sources", forbidden_upstream_call)
+    monkeypatch.setattr(search_mix, "retrieve_evidence",
+                        forbidden_upstream_call)
+
+    _, replay_steps = _selected_replay_steps(paths)
+    _install_fake_retriever(monkeypatch, replay_steps)
+    search_mix.replay_selected_retrieval(paths["manifest"],
+                                         tmp_path / "index",
+                                         tmp_path / "corpus.jsonl",
+                                         tmp_path / "corpus.offsets")
+    source_snapshot_before = _regular_file_snapshot(source_dir)
+
+    output_dir = tmp_path / "native"
+    manifest_path = search_mix.materialize_native(paths["manifest"],
+                                                   output_dir,
+                                                   paths["model_dir"])
+    assert _regular_file_snapshot(source_dir) == source_snapshot_before
+    return paths, output_dir, manifest_path, source_manifest_before
+
+
+def test_materialize_native_refuses_existing_output_directory(tmp_path):
+    output_dir = tmp_path / "native"
+    output_dir.mkdir()
+
+    with pytest.raises(FileExistsError, match="refusing to overwrite"):
+        search_mix.materialize_native(tmp_path / "source" / "manifest.json",
+                                      output_dir, tmp_path / "model")
+
+
+def test_materialize_native_refuses_output_inside_source(tmp_path):
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+
+    with pytest.raises(ValueError, match="must not be inside source data"):
+        search_mix.materialize_native(source_dir / "manifest.json",
+                                      source_dir / "native",
+                                      tmp_path / "model")
+
+
+def test_materialize_native_is_prompt_only_and_preserves_source_and_selection(
+        tmp_path, monkeypatch):
+    paths, output_dir, manifest_path, source_manifest_before = (
+        _build_native_fixture(tmp_path, monkeypatch))
+    native = search_mix.verify_manifest(
+        manifest_path,
+        paths["model_dir"],
+        expected_tool_protocol=search_mix.QWEN35_NATIVE,
+        source_manifest=paths["manifest"])
+    legacy = json.loads(paths["manifest"].read_bytes())
+
+    assert paths["manifest"].read_bytes() == source_manifest_before
+    assert native["schema_version"] == search_mix.MATERIALIZED_SCHEMA_VERSION
+    assert native["prompt_contract"] == search_mix.prompt_contract(
+        search_mix.QWEN35_NATIVE)
+    assert native["derived_from"] == {
+        "source_manifest_sha256": search_mix.sha256_file(paths["manifest"]),
+        "source_catalog_sha256": search_mix.sha256_file(paths["catalog"]),
+    }
+    assert (output_dir / search_mix.CATALOG_FILE).read_bytes() == paths[
+        "catalog"].read_bytes()
+    for split in search_mix.OUTPUT_FILES:
+        assert native["artifacts"][split]["sample_ids"] == legacy["artifacts"][
+            split]["sample_ids"]
+    probe_ids = native["artifacts"]["probe"]["sample_ids"]
+    assert native["artifacts"]["probe_g0"]["sample_ids"] == probe_ids[:1]
+    assert native["artifacts"]["probe_forced"]["sample_ids"] == probe_ids[:2]
+    assert native["artifacts"]["probe_autonomous"][
+        "sample_ids"] == probe_ids[:3]
+    with pytest.raises(ValueError, match="tool protocol mismatch"):
+        search_mix.verify_manifest(
+            manifest_path,
+            paths["model_dir"],
+            expected_tool_protocol=search_mix.LEGACY_XML)
+    tampered = json.loads(manifest_path.read_bytes())
+    tampered["prompt_contract"]["tool_schema_sha256"] = "0" * 64
+    manifest_path.write_bytes(search_mix.canonical_json_bytes(tampered))
+    search_mix.write_digest_sidecar(manifest_path)
+    with pytest.raises(ValueError, match="prompt contract mismatch"):
+        search_mix.verify_manifest(manifest_path, paths["model_dir"])
+
+
+def test_native_prompt_validation_rejects_reserved_markers_and_token_drift():
+    tokenizer = CharacterTokenizer()
+    messages = search_mix.qwen35_messages("Where is Paris?")
+    assert search_mix._validate_native_prompt(tokenizer, messages) > 0
+
+    poisoned = deepcopy(messages)
+    poisoned[1]["content"] = "Question: Where is <search>Paris</search>?\n"
+    with pytest.raises(ValueError, match="reserved protocol marker"):
+        search_mix._validate_native_prompt(tokenizer, poisoned)
+
+    class DriftTokenizer(CharacterTokenizer):
+
+        def apply_chat_template(self, *args, **kwargs):
+            value = super().apply_chat_template(*args, **kwargs)
+            if kwargs.get("tokenize"):
+                return value + [1]
+            return value
+
+    with pytest.raises(ValueError, match="prompt tokens differ"):
+        search_mix._validate_native_prompt(DriftTokenizer(), messages)
+
+
+def test_native_prompt_validation_enforces_exact_start_limit():
+    tokenizer = CharacterTokenizer()
+    base = search_mix.qwen35_messages("x")
+    base_length = search_mix._validate_native_prompt(tokenizer, base, 10_000)
+    exact = search_mix.qwen35_messages("x" * (1024 - base_length + 1))
+    assert search_mix._validate_native_prompt(tokenizer, exact) == 1024
+    too_long = search_mix.qwen35_messages("x" * (1024 - base_length + 2))
+    with pytest.raises(ValueError, match="1025 tokens; maximum is 1024"):
+        search_mix._validate_native_prompt(tokenizer, too_long)
+
+
+def test_verify_native_scans_every_materialized_prompt(tmp_path, monkeypatch):
+    paths, _, manifest_path, _ = _build_native_fixture(tmp_path, monkeypatch)
+    original = search_mix._validate_native_prompt
+    calls = []
+
+    def recording_validator(tokenizer, messages, max_start_length=1024):
+        calls.append(messages)
+        return original(tokenizer, messages, max_start_length)
+
+    monkeypatch.setattr(search_mix, "_validate_native_prompt",
+                        recording_validator)
+    payload = search_mix.verify_manifest(
+        manifest_path,
+        paths["model_dir"],
+        expected_tool_protocol=search_mix.QWEN35_NATIVE,
+        source_manifest=paths["manifest"])
+    expected = sum(payload["artifacts"][label]["rows"] for label in (
+        *search_mix.OUTPUT_FILES, *search_mix.NATIVE_PROBE_FILES))
+    assert len(calls) == expected
+
+
+def test_verify_native_requires_source_manifest(tmp_path, monkeypatch):
+    paths, _, manifest_path, _ = _build_native_fixture(tmp_path, monkeypatch)
+
+    with pytest.raises(ValueError, match="requires --source-manifest"):
+        search_mix.verify_manifest(manifest_path, paths["model_dir"])
+
+
+def test_verify_native_rejects_modified_source_manifest(tmp_path, monkeypatch):
+    paths, _, manifest_path, _ = _build_native_fixture(tmp_path, monkeypatch)
+    source = json.loads(paths["manifest"].read_bytes())
+    source["seed"] += 1
+    paths["manifest"].write_bytes(search_mix.canonical_json_bytes(source))
+    search_mix.write_digest_sidecar(paths["manifest"])
+
+    with pytest.raises(ValueError, match="Manifest contract mismatch"):
+        search_mix.verify_manifest(manifest_path,
+                                   paths["model_dir"],
+                                   source_manifest=paths["manifest"])
+
+
+def test_verify_native_rejects_source_catalog_drift(tmp_path, monkeypatch):
+    paths, _, manifest_path, _ = _build_native_fixture(tmp_path, monkeypatch)
+    paths["catalog"].write_bytes(paths["catalog"].read_bytes() + b"\n")
+
+    with pytest.raises(ValueError, match="Artifact identity mismatch"):
+        search_mix.verify_manifest(manifest_path,
+                                   paths["model_dir"],
+                                   source_manifest=paths["manifest"])
+
+
+def test_verify_native_rejects_coordinated_retrieval_ledger_drift(
+        tmp_path, monkeypatch):
+    paths, output_dir, manifest_path, _ = _build_native_fixture(
+        tmp_path, monkeypatch)
+    ledger_path = output_dir / search_mix.RETRIEVAL_LEDGER_FILE
+    ledger = json.loads(ledger_path.read_bytes())
+    ledger["candidate_order_sha256"] = "1" * 64
+    ledger_path.write_bytes(search_mix.canonical_json_bytes(ledger))
+    search_mix.write_digest_sidecar(ledger_path)
+
+    funnel_path = output_dir / search_mix.SELECTION_FUNNEL_FILE
+    funnel = json.loads(funnel_path.read_bytes())
+    funnel["retrieval"]["candidate_order_sha256"] = "1" * 64
+    funnel_path.write_bytes(search_mix.canonical_json_bytes(funnel))
+    search_mix.write_digest_sidecar(funnel_path)
+
+    manifest = json.loads(manifest_path.read_bytes())
+    for label, artifact_path in (("retrieval_ledger", ledger_path),
+                                 ("selection_funnel", funnel_path)):
+        manifest["artifacts"][label]["sha256"] = search_mix.sha256_file(
+            artifact_path)
+        manifest["artifacts"][label]["bytes"] = artifact_path.stat().st_size
+    manifest["retrieval"]["ledger_sha256"] = search_mix.sha256_file(
+        ledger_path)
+    manifest_path.write_bytes(search_mix.canonical_json_bytes(manifest))
+    search_mix.write_digest_sidecar(manifest_path)
+
+    with pytest.raises(
+            ValueError,
+            match="Native artifact identity does not match source: retrieval_ledger"
+    ):
+        search_mix.verify_manifest(manifest_path,
+                                   paths["model_dir"],
+                                   source_manifest=paths["manifest"])
+
+
+def test_verify_native_rejects_coordinated_selection_funnel_drift(
+        tmp_path, monkeypatch):
+    paths, output_dir, manifest_path, _ = _build_native_fixture(
+        tmp_path, monkeypatch)
+    funnel_path = output_dir / search_mix.SELECTION_FUNNEL_FILE
+    funnel = json.loads(funnel_path.read_bytes())
+    funnel["retrieval"]["source_rows"]["nq"] += 1
+    funnel_path.write_bytes(search_mix.canonical_json_bytes(funnel))
+    search_mix.write_digest_sidecar(funnel_path)
+    _rewrite_manifest_artifact(manifest_path, "selection_funnel", funnel_path)
+
+    with pytest.raises(
+            ValueError,
+            match="Native artifact identity does not match source: selection_funnel"
+    ):
+        search_mix.verify_manifest(manifest_path,
+                                   paths["model_dir"],
+                                   source_manifest=paths["manifest"])
+
+
+def test_verify_native_rejects_tampered_lineage(tmp_path, monkeypatch):
+    paths, _, manifest_path, _ = _build_native_fixture(tmp_path, monkeypatch)
+    manifest = json.loads(manifest_path.read_bytes())
+    manifest["derived_from"]["source_manifest_sha256"] = "0" * 64
+    manifest_path.write_bytes(search_mix.canonical_json_bytes(manifest))
+    search_mix.write_digest_sidecar(manifest_path)
+
+    with pytest.raises(ValueError, match="lineage does not match source"):
+        search_mix.verify_manifest(manifest_path,
+                                   paths["model_dir"],
+                                   source_manifest=paths["manifest"])
+
+
+def test_generic_materialize_cli_rejects_tool_protocol(tmp_path, capsys):
+    with pytest.raises(SystemExit) as error:
+        search_mix.parse_args([
+            "materialize", "--local-dir",
+            str(tmp_path), "--model-dir",
+            str(tmp_path / "model"), "--tool-protocol",
+            search_mix.QWEN35_NATIVE
+        ])
+    assert error.value.code == 2
+    assert "unrecognized arguments: --tool-protocol" in capsys.readouterr().err
+
+
 def test_materialize_quota_failure_replaces_funnel_with_receipt(
         tmp_path, monkeypatch):
     paths = _build_manifest_fixture(tmp_path, monkeypatch)
@@ -965,6 +1338,48 @@ def test_replay_selected_retrieval_replays_queries_and_seals_receipt(
     assert receipt["evidence_sha256"] == search_mix.sha256_file(
         paths["evidence"])
     search_mix._verify_sidecar(receipt_path)
+    assert search_mix.verify_replay_receipt(paths["manifest"]) == receipt
+
+
+@pytest.mark.parametrize("field,value", [
+    ("manifest_sha256", "0" * 64),
+    ("query_count", 0),
+    ("selected_order_sha256", "0" * 64),
+])
+def test_verify_replay_receipt_rejects_resigned_semantic_drift(
+        tmp_path, monkeypatch, field, value):
+    paths = _build_manifest_fixture(tmp_path, monkeypatch)
+    _, steps = _selected_replay_steps(paths)
+    _install_fake_retriever(monkeypatch, steps)
+    receipt_path = search_mix.replay_selected_retrieval(
+        paths["manifest"], tmp_path / "index", tmp_path / "corpus.jsonl",
+        tmp_path / "corpus.offsets")
+    receipt = json.loads(receipt_path.read_bytes())
+    receipt[field] = value
+    receipt_path.write_bytes(search_mix.canonical_json_bytes(receipt))
+    search_mix.write_digest_sidecar(receipt_path)
+
+    with pytest.raises(ValueError, match="Replay receipt contract mismatch"):
+        search_mix.verify_replay_receipt(paths["manifest"])
+
+
+def test_verify_replay_receipt_rejects_missing_sidecar_and_symlink(
+        tmp_path, monkeypatch):
+    paths = _build_manifest_fixture(tmp_path, monkeypatch)
+    _, steps = _selected_replay_steps(paths)
+    _install_fake_retriever(monkeypatch, steps)
+    receipt_path = search_mix.replay_selected_retrieval(
+        paths["manifest"], tmp_path / "index", tmp_path / "corpus.jsonl",
+        tmp_path / "corpus.offsets")
+    sidecar = receipt_path.with_suffix(receipt_path.suffix + ".sha256")
+    sidecar.unlink()
+    with pytest.raises(ValueError, match="Digest sidecar mismatch"):
+        search_mix.verify_replay_receipt(paths["manifest"])
+
+    receipt_path.rename(tmp_path / "real-receipt.json")
+    receipt_path.symlink_to(tmp_path / "real-receipt.json")
+    with pytest.raises(ValueError, match="missing or symlinked"):
+        search_mix.verify_replay_receipt(paths["manifest"])
 
 
 @pytest.mark.parametrize("phase", ["first", "second"])

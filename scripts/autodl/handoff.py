@@ -154,6 +154,7 @@ def verify(args: argparse.Namespace) -> None:
 
     root = args.root.resolve()
     previous = ""
+    artifact_paths: set[str] = set()
     for item in payload["artifacts"]:
         if set(item) != {"bytes", "path", "sha256"}:
             raise ValueError("artifact entry has missing or unknown fields")
@@ -161,6 +162,7 @@ def verify(args: argparse.Namespace) -> None:
         if relative.is_absolute() or ".." in relative.parts or relative.as_posix() <= previous:
             raise ValueError("artifact paths must be unique, sorted, and relative")
         previous = relative.as_posix()
+        artifact_paths.add(previous)
         if has_symlink_component(root, relative):
             raise ValueError(f"artifact path contains a symlink: {relative}")
         path = root / relative
@@ -168,6 +170,13 @@ def verify(args: argparse.Namespace) -> None:
             raise ValueError(f"artifact size mismatch: {relative}")
         if sha256_file(path) != item["sha256"]:
             raise ValueError(f"artifact checksum mismatch: {relative}")
+
+    for required in args.require_artifact:
+        relative = Path(required)
+        normalized = relative.as_posix()
+        if (relative.is_absolute() or not normalized or ".." in relative.parts
+                or normalized not in artifact_paths):
+            raise ValueError(f"required artifact is not sealed: {required}")
 
 
 def parser() -> argparse.ArgumentParser:
@@ -193,6 +202,7 @@ def parser() -> argparse.ArgumentParser:
     verify_parser.add_argument("--python-version", required=True)
     verify_parser.add_argument("--torch-version", required=True)
     verify_parser.add_argument("--manifest", type=Path, required=True)
+    verify_parser.add_argument("--require-artifact", action="append", default=[])
     verify_parser.set_defaults(handler=verify)
     return result
 

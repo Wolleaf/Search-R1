@@ -2,7 +2,7 @@
 
 本目录是 Search-R1-small 云端复现的唯一入口。固定镜像为 **PyTorch 2.8.0 / Python 3.12 / Ubuntu 22.04 / CUDA 12.8**，持久目录为 `/root/autodl-tmp/search-r1`。正常流程始终是 **Git -> CPU -> GPU**；脚本不扫描机器规格、不自动改配置、不自动重试。GPU phase 本身不关机；需要时显式绑定本次 attempt 启动独立 watchdog。
 
-`03/05/06` 保留此前 NQ 与搜索机会门实验的可执行证据，不作为下一轮混合数据训练入口。`07_gpu_group_probe.sh` 是当前唯一 GPU 入口：先用 Base 在检索验证的 held-out 64 题上做 group-5 探针，再决定是否训练。
+`03/05/06/07` 保留此前 NQ、搜索机会门和 XML grouped probe 的可执行证据，不作为 Qwen3.5 原生协议入口。当前增量流程先重封 native CPU handoff，再由 `08_gpu_qwen_native_gate.sh` 依次执行 G0+G1、G2 和 G3；任一门禁未通过都不进入训练。
 
 ## 最短正常路径
 
@@ -59,7 +59,41 @@ bash /root/autodl-tmp/search-r1/checkout/scripts/autodl/02_cpu_prepare.sh
 
 该模式只新增固定 revision 的 NQ/HotpotQA train JSONL，不重装环境或重下大资产。train venv 下载并校验源文件，retriever venv 生成真实 top-3 evidence，train venv 按 Qwen tokenizer 的实际 384-token observation 筛选并生成 Parquet；train 固定为 NQ 192、comparison 56、bridge 264，val 为 64/16/48。该配比来自首轮完整漏斗：comparison 严格可用 74 题、bridge 766 题，且 comparison 候选未被 cap 截断；因此保持 NQ/Hotpot 总比例和证据规则不变，只显式重分配 Hotpot 类别。最终 retriever venv 对 640 题重放 1024 次查询。`selection_funnel.json` 记录各层候选、拒绝原因和差额；即使配额不足也先保存失败 receipt 再退出。NQ test-128 与现有 HotpotQA/2Wiki dev-256 都被排除；任一配额不足、source/evidence 不一致或重放漂移都会失败关闭。
 
-### 3. GPU Base grouped probe
+已有完整 `search_mix` 和 CPU handoff 后，Qwen3.5 原生协议数据使用离线增量模式：
+
+```bash
+AUTODL_QWEN_NATIVE_INCREMENTAL=1 \
+bash /root/autodl-tmp/search-r1/checkout/scripts/autodl/02_cpu_prepare.sh
+```
+
+该模式不联网、不重装环境、不下载资产，也不重放整套 BM25 查询。它要求上一次成功 handoff 已封存语义校验通过的 `retrieval_replay.json` 及 sidecar，只从该 source、evidence、selection funnel 和固定 tokenizer 物化独立的 `data/search_mix_qwen35_native/`，保持相同 train/val/probe 样本 ID，并新增固定 G0-8、强制搜索 G1-16、自主搜索 G2-32 和 G3-64 Parquet。CPU 会用真实 tokenizer 扫描六个 Parquet 共 760 条 prompt，逐条检查 canonical messages、保留标记、模板 token 一致性和 1024-token 初始上限。原 `data/search_mix/` 不会被覆盖。随后运行测试、组合两卡 native resolved config，并把协议、tool schema、chat template、tokenizer revision、replay receipt、数据和配置 digest 纳入新 handoff。
+
+### 3. GPU Qwen native 分层门禁
+
+每个门禁都是一个独立 GPU attempt，完成后都应把入口打印的 exact attempt 路径交给 `04_watch_and_shutdown.sh`。先运行 G0+G1：
+
+```bash
+QWEN_NATIVE_GATE_STAGE=g0_g1 GPU_COUNT=2 AUTODL_PRICE_PER_HOUR=5.76 \
+bash /root/autodl-tmp/search-r1/checkout/scripts/autodl/08_gpu_qwen_native_gate.sh
+```
+
+G0 使用同一模型进程比较 direct HF、native manager 和 legacy manager；G1 在固定 16 题上做每题两条的强制搜索闭环。结果位于 `runs/qwen-native-gate/attempts/<gpu-attempt>/`。只有 `go_no_go.json` 为 `GO` 才能继续。G2 和 G3 必须显式传入上一阶段打印并封存的 exact marker，不能按 `latest` 或时间猜前驱：
+
+```bash
+QWEN_NATIVE_GATE_STAGE=g2 \
+QWEN_NATIVE_PREDECESSOR_EVIDENCE=/root/autodl-tmp/search-r1/manifests/qwen-native-gate/<g0_g1-attempt>.ok \
+GPU_COUNT=2 AUTODL_PRICE_PER_HOUR=5.76 \
+bash /root/autodl-tmp/search-r1/checkout/scripts/autodl/08_gpu_qwen_native_gate.sh
+
+QWEN_NATIVE_GATE_STAGE=g3 \
+QWEN_NATIVE_PREDECESSOR_EVIDENCE=/root/autodl-tmp/search-r1/manifests/qwen-native-gate/<g2-attempt>.ok \
+GPU_COUNT=2 AUTODL_PRICE_PER_HOUR=5.76 \
+bash /root/autodl-tmp/search-r1/checkout/scripts/autodl/08_gpu_qwen_native_gate.sh
+```
+
+G2 是 32 题 × 3 条自主搜索，G3 是 held-out 64 题 × group 5。三段 GPU action 的工作 timeout 额度分别为 2、3、10 元，外层 deadline 同时覆盖 handoff/数据校验、BM25、模型生成、分析和封存；内部生成 timeout 取注册额度与“剩余时间减 180 秒收尾预留”的较小值。BM25 不继承 phase lock，并由有界 TERM→KILL 清理。进程若不响应 TERM，GNU `timeout` 最多再保留 120 秒强杀宽限（按 5.76 元/小时最坏约 0.19 元），所以额度不是含该宽限的绝对账单上限。超时作为工程失败封存并交给 watchdog 请求关机，但 guest shutdown 不等于平台已停止计费，仍须在 AutoDL 控制台确认。协议、采样、数据、checkpoint 和前驱 digest 均进入证据。科学 NO-GO 会完整封存并正常结束，不会自动换 seed、重试或进入训练；其他工程/schema 错误保留原始非零 exit code。
+
+### 历史 GPU Base grouped probe
 
 CPU 混合数据 handoff 完成后，两卡实例只运行：
 
@@ -115,7 +149,7 @@ GO 只表示值得进入下一阶段，不能直接在 NQ 上只重训一个 C�
 
 ## 固定配置与回退
 
-当前 `07` grouped probe 固定为两张 GPU、validation batch 8、每题 group 5、最多 4 次搜索、retriever top-k 3、start 1024、observation 384、response 500、prompt cap 4096、temperature/top-p 1.0，并固定 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`。历史 `03/05/06` 继续锁定 response 256、prompt 3584；搜索轮数不能通过环境变量覆盖，且新实验不得复用历史入口。未来只有 probe GO 后另行实现的对称训练入口才会采用 train batch 8、group 5 和 `500/4096`。
+当前 `08` native gate 固定为两张 GPU、batch 8、最多 4 次搜索、retriever top-k 3、`start/observation/response/prompt=1024/384/500/4096`，并固定 `temperature/top-p/top-k/min-p/presence/repetition=1.0/1.0/20/0.0/2.0/1.0`。G1/G2/G3 的评测 group 分别为 2/3/5。历史 `07` 继续保持 XML group-5 配置，`03/05/06` 保持 response 256、prompt 3584；新实验不得复用历史入口。
 
 只有新的两卡 2-step gate 在第二次 backward 明确 OOM 时才人工重跑：先保持 batch 8、group 5，将 `MAX_RESPONSE_LENGTH=384`，prompt cap 仍为 4096。当前各 GPU micro-batch 已为 1，降低总 batch 不能可靠解决单条长序列 OOM；只有证据表明问题来自批次级驻留时才考虑 batch 4。B/C 必须共享同一卡数和同一组回退参数。失败不会自动重试、不会覆盖旧 attempt，也不会采用早于固定终点的 checkpoint。
 
@@ -145,7 +179,7 @@ bash /root/autodl-tmp/search-r1/checkout/scripts/autodl/04_watch_and_shutdown.sh
 tail -f "$attempt/shutdown-watchdog.log"
 ```
 
-watchdog 同时支持成功和失败终态，但只有在 commit/checkout、持久盘、exact attempt、phase lock、原始 exit code、唯一终态 marker 和日志 sentinel 全部重新验证后才会调用 AutoDL 的 `/usr/bin/shutdown`（无参数）。旧流程成功时校验 `comparison.sha256`、results、`gpu.ok` 和 attempt digest；C-gated、搜索机会门与 grouped probe 分别校验自己的 result root、全部 `evidence.sha256` 条目、新 marker 和 attempt digest，不借用或改写旧 `gpu.ok`。锁冲突、状态不完整、校验失败或 dry-run 会保持开机并记录 `shutdown-skipped`；test mode 只记录模拟状态，绝不调用真实 backend。`shutdown-requested` 表示即将调用 backend，`shutdown-dispatched` 只表示 backend 已返回 0，两者都不能证明 AutoDL 控制平面已停止。无论 watchdog 结果如何，仍须在 AutoDL 控制台确认实例已停止且不再计费；SSH 断开本身不能证明停止计费。
+watchdog 同时支持成功和失败终态，但只有在 commit/checkout、持久盘、exact attempt、phase lock、原始 exit code、唯一终态 marker 和日志 sentinel 全部重新验证后才会调用 AutoDL 的 `/usr/bin/shutdown`（无参数）。旧流程成功时校验 `comparison.sha256`、results、`gpu.ok` 和 attempt digest；C-gated、搜索机会门与 grouped probe 分别校验自己的 result root、全部 `evidence.sha256` 条目、新 marker 和 attempt digest，不借用或改写旧 `gpu.ok`。锁冲突（包括 admission `exit 75` 后旧锁已经释放）、状态不完整、校验失败或 dry-run 都会保持开机并记录 `shutdown-skipped`；test mode 只记录模拟状态，绝不调用真实 backend。`shutdown-requested` 表示即将调用 backend，`shutdown-dispatched` 只表示 backend 已返回 0，两者都不能证明 AutoDL 控制平面已停止。无论 watchdog 结果如何，仍须在 AutoDL 控制台确认实例已停止且不再计费；SSH 断开本身不能证明停止计费。
 
 ## 历史 CPU 后处理（仅旧 03 comparison）
 

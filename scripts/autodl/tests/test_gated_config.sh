@@ -7,9 +7,11 @@ ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$ROOT"' EXIT
 
 mkdir -p "$ROOT/envs/train/bin" "$ROOT/models/Qwen3.5-2B" "$ROOT/data/nq_small" \
+    "$ROOT/data/search_mix" "$ROOT/data/search_mix_qwen35_native" \
     "$ROOT/parent-checkpoint" "$ROOT/output" "$ROOT/traces"
 printf 'parquet-placeholder\n' >"$ROOT/data/search-opportunity.parquet"
 printf 'parquet-placeholder\n' >"$ROOT/data/group-probe.parquet"
+printf 'parquet-placeholder\n' >"$ROOT/data/search_mix_qwen35_native/native-probe.parquet"
 ln -s "$CHECKOUT" "$ROOT/checkout"
 cat >"$ROOT/envs/train/bin/python" <<'SH'
 #!/usr/bin/env bash
@@ -19,6 +21,7 @@ chmod 0755 "$ROOT/envs/train/bin/python"
 
 DIGEST="$(printf 'a%.0s' {1..64})"
 CAPTURE="$ROOT/args.txt"
+unset DATA_DIR
 COMMON=(
     AUTODL_CONFIG_ONLY=1 AUTODL_ROOT="$ROOT" GPU_COUNT=2
     OUTPUT_DIR="$ROOT/output" CAPTURE_LOG="$CAPTURE"
@@ -50,10 +53,15 @@ env "${COMMON[@]}" \
 grep -Fxq -- 'algorithm.cost_lambda=0.10' "$CAPTURE"
 grep -Fxq -- '++algorithm.cost_reward_mode=correct_only' "$CAPTURE"
 grep -Fxq -- 'actor_rollout_ref.rollout.n_agent=5' "$CAPTURE"
+grep -Fxq -- 'actor_rollout_ref.rollout.top_k=0' "$CAPTURE"
+grep -Fxq -- 'actor_rollout_ref.rollout.presence_penalty=0.0' "$CAPTURE"
+grep -Fxq -- 'data.return_raw_chat=false' "$CAPTURE"
+grep -Fxq -- '++tool_protocol=legacy_xml' "$CAPTURE"
 grep -Fxq -- 'data.train_batch_size=8' "$CAPTURE"
 grep -Fxq -- 'data.max_response_length=500' "$CAPTURE"
 grep -Fxq -- 'data.max_prompt_length=4096' "$CAPTURE"
 grep -Fxq -- "++trainer.trace_parent_checkpoint_digest=$DIGEST" "$CAPTURE"
+grep -Fxq -- "data.train_files=$ROOT/data/nq_small/train_512.parquet" "$CAPTURE"
 
 env "${COMMON[@]}" MAX_RESPONSE_LENGTH=384 \
     bash "$AUTODL_DIR/train_small_grpo.sh" \
@@ -96,6 +104,7 @@ grep -Fxq -- "data.val_files=$ROOT/data/search-opportunity.parquet" "$CAPTURE"
 grep -Fxq -- 'max_turns=4' "$CAPTURE"
 
 env "${COMMON[@]}" \
+    DATA_DIR="$ROOT/data/search_mix" \
     EVAL_DATA_FILE="$ROOT/data/group-probe.parquet" \
     EVAL_GROUP_SIZE=5 \
     TRACE_OUTPUT_DIR="$ROOT/traces" \
@@ -108,6 +117,48 @@ grep -Fxq -- 'data.eval_group_size=5' "$CAPTURE"
 grep -Fxq -- 'data.val_batch_size=8' "$CAPTURE"
 grep -Fxq -- 'data.max_response_length=500' "$CAPTURE"
 grep -Fxq -- 'data.max_prompt_length=4096' "$CAPTURE"
+grep -Fxq -- "data.train_files=$ROOT/data/search_mix/train_512.parquet" "$CAPTURE"
+
+env "${COMMON[@]}" \
+    DATA_DIR="$ROOT/data/search_mix_qwen35_native" \
+    TOOL_PROTOCOL=qwen35_native \
+    EVAL_DATA_FILE="$ROOT/data/search_mix_qwen35_native/native-probe.parquet" \
+    EVAL_GROUP_SIZE=2 \
+    bash "$AUTODL_DIR/train_small_grpo.sh" \
+    eval qwen_native_g1 "$ROOT/models/Qwen3.5-2B"
+grep -Fxq -- "data.train_files=$ROOT/data/search_mix_qwen35_native/train_512.parquet" "$CAPTURE"
+grep -Fxq -- '++tool_protocol=qwen35_native' "$CAPTURE"
+
+expect_exit_64() {
+    set +e
+    "$@" >/dev/null 2>&1
+    local rc=$?
+    set -e
+    if ((rc != 64)); then
+        printf 'Expected exit 64, got %s: %s\n' "$rc" "$*" >&2
+        exit 1
+    fi
+}
+
+expect_exit_64 env "${COMMON[@]}" \
+    DATA_DIR="$ROOT/data/search_mix" \
+    bash "$AUTODL_DIR/train_small_grpo.sh" \
+    train control 20 "$ROOT/parent-checkpoint"
+expect_exit_64 env "${COMMON[@]}" \
+    DATA_DIR="$ROOT/data/nq_small" \
+    EVAL_DATA_FILE="$ROOT/data/group-probe.parquet" EVAL_GROUP_SIZE=5 \
+    bash "$AUTODL_DIR/train_small_grpo.sh" \
+    eval group_probe "$ROOT/models/Qwen3.5-2B"
+expect_exit_64 env "${COMMON[@]}" \
+    DATA_DIR="$ROOT/data/search_mix" TOOL_PROTOCOL=qwen35_native \
+    EVAL_DATA_FILE="$ROOT/data/search_mix_qwen35_native/native-probe.parquet" \
+    EVAL_GROUP_SIZE=2 \
+    bash "$AUTODL_DIR/train_small_grpo.sh" \
+    eval qwen_native_g1 "$ROOT/models/Qwen3.5-2B"
+expect_exit_64 env "${COMMON[@]}" \
+    DATA_DIR="$ROOT/data/search_mix_qwen35_native" TOOL_PROTOCOL=qwen35_native \
+    bash "$AUTODL_DIR/train_small_grpo.sh" \
+    train reproduce 2
 
 if env "${COMMON[@]}" \
     EVAL_DATA_FILE="$ROOT/data/group-probe.parquet" \

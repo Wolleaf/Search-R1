@@ -90,6 +90,18 @@
           ]
         }
       ]
+    },
+    {
+      "id": "gpu-qwen-native-gate",
+      "path": "scripts/autodl/08_gpu_qwen_native_gate.sh",
+      "documentation": [
+        {
+          "path": "scripts/autodl/README.md",
+          "required_literals": [
+            "/root/autodl-tmp/search-r1/checkout/scripts/autodl/08_gpu_qwen_native_gate.sh"
+          ]
+        }
+      ]
     }
   ],
   "shutdown": {

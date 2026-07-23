@@ -19,6 +19,8 @@ from verl import DataProto
 import torch
 from verl.utils.reward_score import qa_em
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
+from search_r1.llm_agent.tool_protocol import (LEGACY_XML, QWEN35_NATIVE,
+                                                normalize_tool_protocol)
 import re
 import numpy as np
 
@@ -39,13 +41,15 @@ class RewardManager():
                  format_score=0.,
                  cost_lambda=0.,
                  max_searches=1,
-                 cost_reward_mode='linear') -> None:
+                 cost_reward_mode='linear',
+                 tool_protocol=LEGACY_XML) -> None:
         self.tokenizer = tokenizer
         self.num_examine = num_examine  # the number of batches of decoded responses to print to the console
         self.format_score = format_score
         self.cost_lambda = float(cost_lambda)
         self.max_searches = int(max_searches)
         self.cost_reward_mode = str(cost_reward_mode)
+        self.tool_protocol = normalize_tool_protocol(tool_protocol)
         if not np.isfinite(self.cost_lambda) or self.cost_lambda < 0:
             raise ValueError('cost_lambda must be finite and non-negative')
         if self.max_searches <= 0:
@@ -110,7 +114,25 @@ class RewardManager():
             data_source = data_item.non_tensor_batch['data_source']
             compute_score_fn = _select_rm_score_fn(data_source)
 
-            score = compute_score_fn(solution_str=sequences_str, ground_truth=ground_truth, format_score=self.format_score)
+            if self.tool_protocol == QWEN35_NATIVE:
+                if 'final_answer' not in data.non_tensor_batch:
+                    raise KeyError(
+                        'final_answer is required for qwen35_native reward')
+                final_answer = data_item.non_tensor_batch['final_answer']
+                if final_answer is not None and not isinstance(final_answer, str):
+                    raise ValueError('native final_answer must be a string or None')
+                if final_answer is None or not final_answer.strip():
+                    score = 0.0
+                elif qa_em.em_check(final_answer, ground_truth['target']):
+                    score = 1.0
+                else:
+                    score = self.format_score
+            else:
+                score = compute_score_fn(
+                    solution_str=sequences_str,
+                    ground_truth=ground_truth,
+                    format_score=self.format_score,
+                )
 
             em_scores[i] = score
             posthoc_utilities[i] = score - search_costs[i]
@@ -241,14 +263,18 @@ def main_task(config):
                               cost_lambda=config.algorithm.get('cost_lambda', 0.0),
                               max_searches=config.max_turns,
                               cost_reward_mode=config.algorithm.get(
-                                  'cost_reward_mode', 'linear'))
+                                  'cost_reward_mode', 'linear'),
+                              tool_protocol=config.get('tool_protocol',
+                                                       LEGACY_XML))
 
     # Note that we always use function-based RM for validation
     val_reward_fn = RewardManager(tokenizer=tokenizer,
                                   num_examine=1,
                                   cost_lambda=config.algorithm.get('cost_lambda', 0.0),
                                   max_searches=config.max_turns,
-                                  cost_reward_mode='linear')
+                                  cost_reward_mode='linear',
+                                  tool_protocol=config.get('tool_protocol',
+                                                           LEGACY_XML))
 
     resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
     trainer = RayPPOTrainer(config=config,

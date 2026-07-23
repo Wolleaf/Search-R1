@@ -35,21 +35,23 @@
 
 新增配置 `tool_protocol=legacy_xml|qwen35_native`。默认保留 `legacy_xml`，保证上游行为和历史测试不被静默改变；本项目后续 Qwen3.5 配置显式使用 `qwen35_native`。不建设通用插件框架，只实现一个小型 Qwen3.5 adapter，并向现有 generation manager 返回相同的内部 `(action, content)`。
 
-原生模式注册两个函数：
+原生模式只注册一个函数：
 
 ```text
 search(query: string)  # 检索外部证据
-finish(answer: string) # 提交简短最终答案
 ```
 
-初始输入必须由固定 revision 的 tokenizer 执行 `apply_chat_template(..., tools=TOOLS, enable_thinking=False, add_generation_prompt=True)`；不再在 user 文本中展示 `query` 占位符，也不要求默认 non-thinking 模型输出 `<think>`。搜索结果按模板作为新的 `<tool_response>` 回合回填，再开启新的 assistant 回合。每次用 tokenizer 对完整 messages 重渲染并校验旧 token 是严格前缀，只追加新增 token，避免手写 Qwen 特殊 token。
+Qwen 官方模板的终局是普通 assistant 文本，不是自定义 `finish` 工具：合法 `search` call 映射为内部 search；完全不含协议 marker 的非空文本映射为内部 answer。初始输入固定为 canonical system + `Question: ...` user 两条消息，再由固定 revision tokenizer 执行 `apply_chat_template(..., tools=TOOLS, enable_thinking=False, add_generation_prompt=True)`；不在 user 文本中展示 `query` 占位符。搜索结果按模板作为新的 `<tool_response>` 回合回填，再开启新的 assistant 回合。
+
+多轮时不能把采样文本 decode 后再 encode，因为官方模板会 `trim` assistant content，且非规范 BPE 分段不保证可逆。实现用唯一 ASCII sentinel 从真实模板中只提取当前 assistant 之后的 suffix，再严格拼接 `exact prompt IDs + exact sampled response IDs + suffix IDs`；若采样结果已含 EOS，则去掉 suffix 开头的重复 EOS。这样既保留真实采样 token，又继续由官方模板定义 tool response 和下一轮 assistant wrapper。
 
 ### 3.2 严格解析与训练语义
 
 - 只接受输出末尾唯一、结构完整的官方 `<tool_call>`；函数名、参数名、嵌套或数量错误均判 invalid。
 - 拒绝空 query 和字面量 `query`/`and`，恢复提示不包含任何成对 action 标签。
-- `finish(answer)` 映射回现有内部 answer 字段，使 EM 与成本奖励公式完全不变。
-- assistant 生成的 tool call/finish token 参与策略训练；tool response、role 边界和下一轮 generation prefix 全部进入 observation mask，不计入策略 loss。
+- marker-free 的普通最终文本只在环境元数据中映射为 `answer`；它不被伪造成 `<answer>` token，EM 直接读取 batch-aligned `final_answer`，成本奖励公式不变。
+- assistant 实际采样的 tool call、普通答案和 EOS token 参与策略训练；tool response、恢复消息、role 边界和下一轮 generation prefix 全部进入 observation mask，不计入策略 loss。
+- 长度合同按 policy right side 计算：`4 * (500 + 384) + 500 = 4036 <= 4096`。initial left prompt 不计入这 4036 个 token；native rolling cap 为 `1024 + 4096 = 5120`，因此最坏 `1024 + 4036 = 5060` token 的采样上下文与 PPO 重算上下文保持一致。有效容量内不左裁历史，policy right side 超限也直接报错，不能静默截断训练 token。
 - 日志同时保存模型原始生成、规范化 action、parse error reason、query、原始检索文档、可见 observation、最终答案、截断和每个回合的 role，使失败可以逐条复算。
 
 ### 3.3 数据与采样
@@ -65,7 +67,7 @@ presence_penalty=2.0, repetition_penalty=1.0
 
 `top_k=20` 直接进入 HF `GenerationConfig`。当前 Transformers 的 `GenerationConfig` 没有 `presence_penalty`，因此在 HF rollout 内增加一个小型、可配置的 logits processor：只对当前 assistant 回合已经生成过的 token 减去一次固定 penalty，不按出现次数累加，不惩罚 prompt/tool response，并在新的 assistant 回合开始时重置。这与 presence penalty 区别于 frequency/repetition penalty 的定义一致。legacy 默认仍为 `top_k=0/presence_penalty=0`，避免历史入口静默变化；Qwen native 入口显式设为 `20/2.0`。
 
-实现必须同时支持 `presence_penalty=0` 的严格 no-op，并将有效值写入 resolved config 和每个 trace manifest。单测覆盖首次 token 不受罚、已生成 token 只减一次、重复多次不额外累加、batch 独立、回合重置以及 0 值等价。官方提示高 penalty 偶尔会引发语言混杂，因此 G0/G1 同时统计重复片段和异常语言 query；只有出现可复现的明显退化，才将 `2.0 -> 1.5` 注册为一次独立采样对照，不能事后按 EM 挑值。不迁移 vLLM，不更换模型尺寸。
+实现必须同时支持 `presence_penalty=0` 的严格 no-op。有效采样值由 resolved config 与 `run.env` 交叉校验，阶段另写 `sampling.json`；这些文件与 trace manifest/digest 一起进入 evidence seal，而不是假定每个 trace manifest 自带全部采样字段。单测覆盖首次 token 不受罚、已生成 token 只减一次、重复多次不额外累加、batch 独立、回合重置以及 0 值等价。官方提示高 penalty 偶尔会引发语言混杂，因此 G0/G1 同时统计重复片段和异常语言 query；只有出现可复现的明显退化，才将 `2.0 -> 1.5` 注册为一次独立采样对照，不能事后按 EM 挑值。不迁移 vLLM，不更换模型尺寸。
 
 ## 4. CPU 无卡阶段
 
@@ -75,7 +77,7 @@ presence_penalty=2.0, repetition_penalty=1.0
 4. 从已有固定源文件和检索 ledger 重新物化 native probe/train/val Parquet；不重下 Wiki、不重建 BM25、不运行整套历史 CPU 流程。
 5. 生成 resolved config、manifest、SHA-256 与新的 CPU handoff。任一 token 前缀、mask、样本集合或 digest 不一致均停止，不启动 GPU。
 
-最低验证命令为 `python -m pytest -q`、native 数据构建器的校验模式以及 `AUTODL_CONFIG_ONLY=1` 配置解析。实现、测试和 CPU 证据分别提交，便于回退和审计。
+最低验证命令为 `python -m pytest -q`、native 数据构建器的校验模式以及 `AUTODL_CONFIG_ONLY=1` 配置解析。CPU 增量入口只复用已封存的检索 ledger 和选题结果，不重新下载语料或运行 BM25。
 
 ## 5. GPU 分层验证
 
@@ -83,12 +85,12 @@ presence_penalty=2.0, repetition_penalty=1.0
 
 | 阶段 | 规模与目的 | 通过条件 |
 | --- | --- | --- |
-| G0 原生参考 smoke | 8 个固定问题，每题 2 条；比较直接 HF/native manager，并以同一 Qwen 采样参数的 legacy manager 作诊断对照 | 直接 HF 与 native manager 的首轮 prompt token 完全相同；resolved config 确认为 `top_k=20/presence_penalty=2.0`；native adapter 可解析不少于 15/16，且没有 `query`、`and` 或空调用 |
+| G0 原生参考 smoke | 8 个固定问题，每题 2 条；比较直接 HF/native manager，并以同一 Qwen 采样参数的 legacy manager 作诊断对照 | direct/native 首轮 prompt token `16/16` 相同，首轮 `raw_text` 逐条 `16/16` 相同；direct 与 native 各自可解析 `>=15/16`；resolved config 为 `top_k=20/presence_penalty=2.0`，且 native 退化 query 为 0 |
 | G1 强制搜索 probe | 16 题 × 2 条；明确要求先搜索，只测 schema、parser 和回填闭环 | 合法首 action `>=31/32`，非退化 query `>=29/32`，退化 query `<=1/32`，首轮截断 `<=1/32`，所有检索均有对齐的 tool response，重复/异常语言 query 单独列出 |
 | G2 自主搜索 probe | 固定 held-out Hotpot 32 题 × 3 条；允许自主决定搜索和结束 | 非法轨迹、截断轨迹各 `<=5/96`；退化调用不超过全部搜索的 2%；逐题报告 EM、搜索数、query 相关性及完整二搜链 |
 | G3 正式 grouped gate | 现有 held-out Hotpot-64 × group 5 | 沿用原预注册门槛：有效正确多搜 `>=16/320`、覆盖题 `>=8/64`、learnable group `>=8/64`，并满足原非法动作和截断门槛 |
 
-G0/G1 预计约 10 分钟，G2 预计约 25 分钟；G3 已有同规模实测约 85 分钟、约 8.12 元。协议验证总硬上限设为 15 元，超出即保存现场并关机，不自动进入训练。
+G0+G1、G2、G3 分别建立独立 exact attempt，整个 paid stage 的外层 TERM deadline 依次由 2、3、10 元和当次整机时价换算。deadline 覆盖 handoff/数据复核、BM25、模型生成、分析与 evidence seal；内部生成 timeout 取注册额度与“剩余时间减 180 秒收尾预留”的较小值。BM25 不继承 phase lock，清理使用有界 TERM→KILL，保证异常时 watchdog 仍能接管。进程若不响应 TERM，GNU `timeout` 最多再保留 120 秒强杀宽限（按 5.76 元/小时最坏约 0.19 元），因此该额度是工作时限，不是含强杀宽限的绝对账单上限。G2 必须绑定 G0+G1 的 evidence digest，G3 必须绑定 G2 的 evidence digest；科学 NO-GO 正常归档且不自动重试，超时或其他工程错误返回非零并交给已绑定 exact attempt 的 watchdog。三个注册额度合计 15 元，任一阶段失败都不自动进入下一阶段或训练。
 
 ## 6. 归因与停止规则
 
@@ -110,6 +112,8 @@ R-mix60-native
 
 B/C 除奖励模式外共享 parent digest、数据顺序、seed、batch、group、长度、协议和检索器。最终在同一 test 集配对报告 EM、搜索成本、Utility、共同答对题的搜索差及完整轨迹。旧 NO-GO 和 C-old 坍缩仍作为项目中“发现协议问题与奖励问题并逐层修复”的失败经验，不改写为成功结果。
 
+当前脚本和核心 trainer 都只允许 native 的 `val_only` 门禁，任何 native train 组合都会 fail closed。G3 通过后再开放 `R/B/C-native` 训练入口时，必须先预注册采样分布口径：HF rollout 的 `top_k=20/presence_penalty=2.0` 是 proposal sampling，而现有 PPO actor 按 temperature 后的完整词表重算 log-prob。二选一：训练显式关闭 `top_k/presence_penalty`、继续使用完整词表 log-prob；或保存并在 old/current policy 中一致复算逐 token processed proposal log-prob。仅让 B/C 使用相同 proposal 参数可以保证对比口径一致，但不等于严格的 on-policy PPO，不能据此解除训练门禁。
+
 ## 8. 本轮交付边界
 
-当前提交只冻结执行计划，不修改训练代码或重新解释历史指标。下一次实现严格按“adapter 与测试 -> CPU 物化和 handoff -> G0/G1 -> G2 -> G3 -> 训练”的顺序推进；任何前置 gate 未通过，后续高成本阶段均不启动。
+当前实现已完成 adapter、严格 parser、native role 回填、采样兼容、plain-answer reward、完整轨迹、独立数据物化与 G0-G3 云端入口；旧 XML 路径和历史结果保持不变。下一步只在无卡实例执行增量 CPU 物化与 handoff，验证通过后再按 `G0/G1 -> G2 -> G3 -> 训练` 逐段开 GPU；任何前置 gate 未通过，后续高成本阶段均不启动。

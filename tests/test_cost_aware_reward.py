@@ -13,7 +13,7 @@ class _Tokenizer:
         return 'correct' if sequence[-1].item() == 11 else 'incorrect'
 
 
-def _data(search_counts=None):
+def _data(search_counts=None, final_answers=None):
     tensors = {
         'prompts': torch.tensor([[1], [2]]),
         'responses': torch.tensor([[10, 11], [20, 22]]),
@@ -21,15 +21,18 @@ def _data(search_counts=None):
     }
     if search_counts is not None:
         tensors['executed_search_count'] = torch.tensor(search_counts)
+    non_tensors = {
+        'reward_model': np.array([
+            {'ground_truth': {'target': ['unused']}},
+            {'ground_truth': {'target': ['unused']}},
+        ], dtype=object),
+        'data_source': np.array(['nq', 'nq'], dtype=object),
+    }
+    if final_answers is not None:
+        non_tensors['final_answer'] = np.array(final_answers, dtype=object)
     return DataProto.from_dict(
         tensors=tensors,
-        non_tensors={
-            'reward_model': np.array([
-                {'ground_truth': {'target': ['unused']}},
-                {'ground_truth': {'target': ['unused']}},
-            ], dtype=object),
-            'data_source': np.array(['nq', 'nq'], dtype=object),
-        },
+        non_tensors=non_tensors,
     )
 
 
@@ -136,3 +139,46 @@ def test_nonzero_lambda_requires_aligned_search_count():
 
     with pytest.raises(ValueError, match='must have shape'):
         manager(_data(search_counts=[[0], [1]]))
+
+
+def test_native_reward_uses_aligned_plain_final_answer():
+    data = _data(search_counts=[1, 4], final_answers=['Paris', 'London'])
+    data.non_tensor_batch['reward_model'] = np.array([
+        {'ground_truth': {'target': ['paris']}},
+        {'ground_truth': {'target': ['Paris']}},
+    ], dtype=object)
+    data.reorder(torch.tensor([1, 0]))
+
+    reward = main_ppo.RewardManager(
+        tokenizer=_Tokenizer(),
+        num_examine=0,
+        cost_lambda=0.1,
+        max_searches=4,
+        tool_protocol='qwen35_native',
+    )(data)
+
+    assert reward.sum(-1).tolist() == pytest.approx([-0.1, 0.975])
+    assert data.batch['sequence_em_scores'].tolist() == [0.0, 1.0]
+
+
+def test_native_unfinished_answer_scores_zero_without_fabricating_xml():
+    data = _data(search_counts=[0, 0], final_answers=[None, ''])
+
+    reward = main_ppo.RewardManager(
+        tokenizer=_Tokenizer(),
+        num_examine=0,
+        tool_protocol='qwen35_native',
+    )(data)
+
+    assert reward.sum(-1).tolist() == [0.0, 0.0]
+
+
+def test_native_reward_requires_environment_final_answer():
+    manager = main_ppo.RewardManager(
+        tokenizer=_Tokenizer(),
+        num_examine=0,
+        tool_protocol='qwen35_native',
+    )
+
+    with pytest.raises(KeyError, match='final_answer'):
+        manager(_data(search_counts=[0, 0]))

@@ -54,6 +54,9 @@ actor_rollout_ref:
     temperature: 1.0
     top_k: -1 # 0 for hf rollout, -1 for vllm rollout
     top_p: 1
+    min_p: 0.0
+    presence_penalty: 0.0
+    repetition_penalty: 1.0
     prompt_length: ${data.max_prompt_length}  # for xperf_gpt
     response_length: ${data.max_response_length}
     # for vllm rollout

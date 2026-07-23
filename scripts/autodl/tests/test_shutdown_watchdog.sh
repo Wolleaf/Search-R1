@@ -157,6 +157,34 @@ replace_with_group_probe_results() {
     printf '%s\n' "$digest" >"$ATTEMPT/evidence-digest"
 }
 
+replace_with_qwen_native_gate_results() {
+    local result_dir marker relative digest
+    local -a files=(
+        summary.json summary.md go_no_go.json per_trajectory.jsonl
+        per_question.jsonl lineage.tsv run-index.tsv stage.txt sampling.json
+        raw-trace.jsonl
+    )
+    result_dir="$PROJECT_ROOT/runs/qwen-native-gate/attempts/$(basename -- "$ATTEMPT")"
+    marker="$PROJECT_ROOT/manifests/qwen-native-gate/$(basename -- "$ATTEMPT").ok"
+    mkdir -p "$result_dir" "$(dirname -- "$marker")"
+    for relative in "${files[@]}"; do printf 'evidence:%s\n' "$relative" >"$result_dir/$relative"; done
+    printf '{"decision":"NO-GO","stage":"g2"}\n' >"$result_dir/go_no_go.json"
+    printf 'g2\n' >"$result_dir/stage.txt"
+    (
+        cd "$PROJECT_ROOT"
+        for relative in "${files[@]}"; do
+            printf 'runs/qwen-native-gate/attempts/%s/%s\n' \
+                "$(basename -- "$ATTEMPT")" "$relative"
+        done | LC_ALL=C sort | while IFS= read -r relative; do sha256sum "$relative"; done
+    ) >"$result_dir/evidence.sha256"
+    digest="$(sha256sum "$result_dir/evidence.sha256" | cut -d' ' -f1)"
+    printf '%s\n' "$digest" >"$marker"
+    printf 'qwen-native-gate-v1\n' >"$ATTEMPT/result-contract"
+    printf '%s\n' "$result_dir" >"$ATTEMPT/result-root"
+    printf '%s\n' "$marker" >"$ATTEMPT/evidence-marker"
+    printf '%s\n' "$digest" >"$ATTEMPT/evidence-digest"
+}
+
 run_watchdog() {
     local backend_rc="$1" mode="$2"
     SEARCH_R1_AUTODL_TEST_MODE=1 \
@@ -286,6 +314,21 @@ run_watchdog 0 --test-foreground
 grep -Fq 'reason=authorization-revalidation-failed' "$ATTEMPT/shutdown-skipped"
 assert_no_backend_event
 
+# A native-gate NO-GO is also complete scientific evidence.
+new_case qwen-native-no-go 0 success
+replace_with_qwen_native_gate_results
+run_watchdog 0 --test-foreground
+[[ -f "$ATTEMPT/shutdown-safe" && -f "$ATTEMPT/shutdown-dispatched" ]]
+assert_order
+
+new_case qwen-native-tampered 0 success
+replace_with_qwen_native_gate_results
+printf 'tampered\n' >>"$(cat "$ATTEMPT/result-root")/sampling.json"
+run_watchdog 0 --test-foreground
+[[ -f "$ATTEMPT/shutdown-skipped" && ! -e "$ATTEMPT/shutdown-safe" ]]
+grep -Fq 'reason=authorization-revalidation-failed' "$ATTEMPT/shutdown-skipped"
+assert_no_backend_event
+
 # The real detached path cannot run until its PID and admission nonce are durable.
 new_case detached-success 0 success
 run_detached_watchdog
@@ -350,6 +393,14 @@ run_watchdog 0 --test-foreground
 [[ -f "$ATTEMPT/shutdown-safe" && -f "$ATTEMPT/shutdown-requested" && -f "$ATTEMPT/shutdown-dispatched" ]]
 [[ "$(cat "$ATTEMPT/exit-code")" == 7 ]]
 assert_order
+
+# Exit 75 means this attempt never acquired the global phase lock. Even after
+# the competing worker releases it, this terminal attempt must not shut down.
+new_case released-lock-conflict 75 failed
+run_watchdog 0 --test-foreground
+[[ -f "$ATTEMPT/shutdown-skipped" && ! -e "$ATTEMPT/shutdown-safe" ]]
+grep -Fq 'reason=lock-conflict' "$ATTEMPT/shutdown-skipped"
+assert_no_backend_event
 
 # Partial terminal publication fails closed.
 new_case incomplete 0 success

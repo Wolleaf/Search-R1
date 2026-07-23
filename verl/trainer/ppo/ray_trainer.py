@@ -43,6 +43,7 @@ from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seql
 
 import re
 from search_r1.llm_agent.generation import LLMGenerationManager, GenerationConfig
+from search_r1.llm_agent.tool_protocol import QWEN35_NATIVE
 from search_r1.trajectory_trace import (TraceJsonlWriter,
                                         parse_search_r1_transcript,
                                         stable_sample_id)
@@ -171,43 +172,70 @@ def _event_aligned_trace_turns(generation_events, retrieval_events,
     turns = []
     for event in generation_events:
         event_text = str(event.get('text', ''))
-        event_turns = parse_search_r1_transcript(event_text)
-        if not event_turns:
-            event_turns = [{
-                'turn': 0,
-                'think': '',
-                'action': 'invalid',
-                'search_query': None,
-                'answer': None,
-                'observation': None,
-                'invalid_text': [],
-                'valid_action': False,
-            }]
-        action_match = re.search(r'<(search|answer)>(.*?)</\1>', event_text,
-                                 re.DOTALL)
         environment_action = None
-        if action_match is not None:
-            action = action_match.group(1)
-            content = action_match.group(2).strip()
-            value_field = 'search_query' if action == 'search' else 'answer'
-            environment_action = next(
-                (turn for turn in event_turns
-                 if turn['action'] == action and turn[value_field] == content),
-                None)
-            if environment_action is None:
-                environment_action = {
+        if 'action' in event:
+            action = event.get('action')
+            content = event.get('content', '')
+            parse_error = event.get('parse_error')
+            if action not in ('search', 'answer', None):
+                raise ValueError('generation event has an unknown action')
+            if not isinstance(content, str):
+                raise ValueError('generation event content must be a string')
+            if parse_error is not None and not isinstance(parse_error, str):
+                raise ValueError('generation event parse_error must be a string or None')
+            parsed_valid = action in ('search', 'answer') and parse_error is None
+            event_turn = {
+                'turn': 0,
+                'think': str(event.get('reasoning_prefix', '')),
+                'action': action if parsed_valid else 'invalid',
+                'search_query': content if parsed_valid and action == 'search' else None,
+                'answer': content if parsed_valid and action == 'answer' else None,
+                'observation': None,
+                'invalid_text': [] if parsed_valid else [event_text],
+                'valid_action': parsed_valid,
+            }
+            event_turns = [event_turn]
+            if parsed_valid:
+                environment_action = event_turn
+        else:
+            event_turns = parse_search_r1_transcript(event_text)
+            if not event_turns:
+                event_turns = [{
                     'turn': 0,
                     'think': '',
-                    'action': action,
-                    'search_query': content if action == 'search' else None,
-                    'answer': content if action == 'answer' else None,
+                    'action': 'invalid',
+                    'search_query': None,
+                    'answer': None,
                     'observation': None,
                     'invalid_text': [],
-                    'valid_action': True,
-                    'synthetic_environment_action': True,
-                }
-                event_turns.append(environment_action)
-        if bool(event.get('valid_action', False)) != (action_match is not None):
+                    'valid_action': False,
+                }]
+            action_match = re.search(r'<(search|answer)>(.*?)</\1>', event_text,
+                                     re.DOTALL)
+            if action_match is not None:
+                action = action_match.group(1)
+                content = action_match.group(2).strip()
+                value_field = ('search_query'
+                               if action == 'search' else 'answer')
+                environment_action = next(
+                    (turn for turn in event_turns
+                     if turn['action'] == action
+                     and turn[value_field] == content), None)
+                if environment_action is None:
+                    environment_action = {
+                        'turn': 0,
+                        'think': '',
+                        'action': action,
+                        'search_query': content if action == 'search' else None,
+                        'answer': content if action == 'answer' else None,
+                        'observation': None,
+                        'invalid_text': [],
+                        'valid_action': True,
+                        'synthetic_environment_action': True,
+                    }
+                    event_turns.append(environment_action)
+            parsed_valid = action_match is not None
+        if bool(event.get('valid_action', False)) != parsed_valid:
             raise ValueError(
                 'generation event valid_action does not match parsed action')
 
@@ -611,6 +639,15 @@ class RayPPOTrainer(object):
 
         # assert torch.cuda.is_available(), 'cuda must be available on driver'
 
+        if config.get('tool_protocol', 'legacy_xml') == QWEN35_NATIVE:
+            if not config.get('do_search', False):
+                raise ValueError(
+                    'qwen35_native requires do_search=true for the agent loop')
+            if not config.get('trainer', {}).get('val_only', False):
+                raise ValueError(
+                    'qwen35_native training is disabled until its '
+                    'sampling/log-prob contract is registered')
+
         self.tokenizer = tokenizer
         self.config = config
         self.reward_fn = reward_fn
@@ -745,6 +782,14 @@ class RayPPOTrainer(object):
                 turn['answer'] for turn in turns
                 if turn['action'] == 'answer' and turn['answer'] is not None
             ]
+            if 'final_answer' in item.non_tensor_batch:
+                final_answer = item.non_tensor_batch['final_answer']
+                if final_answer is not None and not isinstance(final_answer, str):
+                    raise ValueError('trace final_answer must be a string or None')
+                event_answer = answers[-1] if answers else None
+                if final_answer != event_answer:
+                    raise ValueError(
+                        'trace final_answer does not match generation events')
 
             records.append({
                 'sample_id': stable_sample_id(
@@ -876,6 +921,8 @@ class RayPPOTrainer(object):
                                          max_prompt_length=self.config.data.max_prompt_length,
                                          filter_prompts=True,
                                          return_raw_chat=self.config.data.get('return_raw_chat', False),
+                                         tool_protocol=self.config.get(
+                                             'tool_protocol', 'legacy_xml'),
                                          truncation='error')
         if self.config.data.train_data_num is not None:
             if self.config.data.train_data_num > len(self.train_dataset.dataframe):
@@ -896,6 +943,8 @@ class RayPPOTrainer(object):
                                        max_prompt_length=self.config.data.max_prompt_length,
                                        filter_prompts=True,
                                        return_raw_chat=self.config.data.get('return_raw_chat', False),
+                                       tool_protocol=self.config.get(
+                                           'tool_protocol', 'legacy_xml'),
                                        truncation='error')
         if self.config.data.val_data_num is not None:
             if self.config.data.val_data_num > len(self.val_dataset.dataframe):
@@ -952,6 +1001,7 @@ class RayPPOTrainer(object):
             no_think_rl=self.config.algorithm.no_think_rl,
             search_url = self.config.retriever.url,
             topk = self.config.retriever.topk,
+            tool_protocol=self.config.get('tool_protocol', 'legacy_xml'),
         )
 
         # Agent config preparation
@@ -967,6 +1017,7 @@ class RayPPOTrainer(object):
                 test_batch = DataProto.from_single_dict(test_data)
                 test_batch = _prepare_validation_batch(
                     test_batch, eval_group_size)
+                raw_messages = test_batch.non_tensor_batch.get('raw_prompt')
 
                 # we only do validation on rule-based rm
                 if self.config.reward_model.enable and test_batch[0].non_tensor_batch['reward_model']['style'] == 'model':
@@ -1003,6 +1054,7 @@ class RayPPOTrainer(object):
                 test_batch: DataProto = DataProto.from_single_dict(batch_dict)
                 test_batch = _prepare_validation_batch(
                     test_batch, eval_group_size)
+                raw_messages = test_batch.non_tensor_batch.get('raw_prompt')
                 
                 test_gen_batch = test_batch.pop(batch_keys=['input_ids', 'attention_mask', 'position_ids'])
                 test_gen_batch.meta_info = _validation_meta_info(
@@ -1014,6 +1066,7 @@ class RayPPOTrainer(object):
                         final_gen_batch_output = generation_manager.run_llm_loop(
                             gen_batch=test_gen_batch,
                             initial_input_ids=first_input_ids,
+                            raw_messages=raw_messages,
                         )
                     
                     test_batch = test_batch.union(final_gen_batch_output)
@@ -1189,6 +1242,7 @@ class RayPPOTrainer(object):
             no_think_rl=self.config.algorithm.no_think_rl,
             search_url = self.config.retriever.url,
             topk = self.config.retriever.topk,
+            tool_protocol=self.config.get('tool_protocol', 'legacy_xml'),
         )
 
         generation_manager = LLMGenerationManager(
@@ -1211,6 +1265,7 @@ class RayPPOTrainer(object):
                 batch = batch.repeat(repeat_times=agent_count, interleave=True)
                 batch.non_tensor_batch['group_slot'] = np.tile(
                     np.arange(agent_count, dtype=object), prompt_batch_size)
+                raw_messages = batch.non_tensor_batch.get('raw_prompt')
 
                 # pop those keys for generation
                 gen_batch = batch.pop(batch_keys=['input_ids', 'attention_mask', 'position_ids'])
@@ -1240,6 +1295,7 @@ class RayPPOTrainer(object):
                             final_gen_batch_output = generation_manager.run_llm_loop(
                                 gen_batch=gen_batch,
                                 initial_input_ids=first_input_ids,
+                                raw_messages=raw_messages,
                             )
 
                         # final_gen_batch_output.batch.apply(lambda x: x.long(), inplace=True)

@@ -1,11 +1,15 @@
 import torch
 import re
 import numpy as np
+from copy import deepcopy
 from collections import defaultdict
 import os
 from typing import List, Dict, Any, Tuple
 from dataclasses import dataclass
 from .tensor_helper import TensorHelper, TensorConfig
+from .tool_protocol import (LEGACY_XML, QWEN35_NATIVE, ParsedAction,
+                            Qwen35Conversation, normalize_tool_protocol,
+                            parse_action)
 from verl import DataProto
 from verl.utils.tracking import Tracking
 import shutil
@@ -22,6 +26,7 @@ class GenerationConfig:
     no_think_rl: bool=False
     search_url: str = None
     topk: int = 3
+    tool_protocol: str = LEGACY_XML
 
 class LLMGenerationManager:
     def __init__(
@@ -35,6 +40,10 @@ class LLMGenerationManager:
         self.actor_rollout_wg = actor_rollout_wg
         self.config = config
         self.is_validation = is_validation
+        self.tool_protocol = normalize_tool_protocol(
+            getattr(config, 'tool_protocol', LEGACY_XML))
+        if self.tool_protocol == QWEN35_NATIVE:
+            self._validate_native_right_side_capacity()
 
         self.tensor_fn = TensorHelper(TensorConfig(
             pad_token_id=tokenizer.pad_token_id,
@@ -42,6 +51,20 @@ class LLMGenerationManager:
             max_obs_length=config.max_obs_length,
             max_start_length=config.max_start_length
         ))
+
+    def _validate_native_right_side_capacity(self) -> None:
+        """Ensure PPO can retain every generated token across all turns."""
+        response_length = self.config.max_response_length
+        required_length = (
+            self.config.max_turns
+            * (response_length + self.config.max_obs_length)
+            + response_length
+        )
+        if required_length > self.config.max_prompt_length:
+            raise ValueError(
+                'qwen35_native right-side capacity requires '
+                f'{required_length} tokens, but max_prompt_length is '
+                f'{self.config.max_prompt_length}')
 
     def _batch_tokenize(self, responses: List[str]) -> torch.Tensor:
         """Tokenize a batch of responses."""
@@ -52,8 +75,66 @@ class LLMGenerationManager:
             padding="longest"
         )['input_ids']
 
+    def _current_tool_protocol(self) -> str:
+        config = getattr(self, 'config', None)
+        return normalize_tool_protocol(
+            getattr(self, 'tool_protocol',
+                    getattr(config, 'tool_protocol', LEGACY_XML)))
+
+    def _pad_token_rows(self, rows: List[List[int]], device=None) -> torch.Tensor:
+        """Right-pad variable-length token rows without re-tokenizing them."""
+        width = max((len(row) for row in rows), default=0)
+        output = torch.full(
+            (len(rows), width),
+            self.tokenizer.pad_token_id,
+            dtype=torch.long,
+            device=device,
+        )
+        for index, row in enumerate(rows):
+            if row:
+                output[index, :len(row)] = torch.tensor(
+                    row, dtype=torch.long, device=device)
+        return output
+
+    def _postprocess_native_responses(
+            self, responses: torch.Tensor) -> Tuple[torch.Tensor, List[str]]:
+        """Drop post-EOS padding while preserving every sampled token."""
+        eos_token_id = self.tokenizer.eos_token_id
+        pad_token_id = self.tokenizer.pad_token_id
+        token_rows = []
+        response_texts = []
+        for response in responses:
+            sampled = []
+            text_tokens = []
+            for token_id in response.tolist():
+                token_id = int(token_id)
+                if token_id == eos_token_id:
+                    sampled.append(token_id)
+                    break
+                if token_id == pad_token_id:
+                    break
+                sampled.append(token_id)
+                text_tokens.append(token_id)
+            token_rows.append(sampled)
+            try:
+                text = self.tokenizer.decode(
+                    text_tokens,
+                    skip_special_tokens=False,
+                    clean_up_tokenization_spaces=False,
+                )
+            except TypeError:
+                text = self.tokenizer.decode(
+                    text_tokens, skip_special_tokens=False)
+            response_texts.append(text)
+        return self._pad_token_rows(token_rows, responses.device), response_texts
+
     def _postprocess_responses(self, responses: torch.Tensor) -> torch.Tensor:
         """Process responses to stop at search operation or answer operation."""
+        if self._current_tool_protocol() == QWEN35_NATIVE:
+            if self.config.no_think_rl:
+                raise ValueError('stop')
+            return self._postprocess_native_responses(responses)
+
         responses_str = self.tokenizer.batch_decode(
             responses, 
             skip_special_tokens=True
@@ -74,6 +155,85 @@ class LLMGenerationManager:
             print("RESPONSES:", responses_str)
         responses = self._batch_tokenize(responses_str)
         return responses, responses_str
+
+    def _prepare_native_conversations(self, gen_batch: DataProto,
+                                      raw_messages) -> List[Qwen35Conversation]:
+        if raw_messages is None:
+            raw_messages = gen_batch.non_tensor_batch.get('raw_prompt')
+        if raw_messages is None:
+            raise ValueError(
+                'qwen35_native generation requires batch-aligned raw messages')
+        if isinstance(raw_messages, np.ndarray):
+            raw_messages = raw_messages.tolist()
+        if len(raw_messages) != len(gen_batch):
+            raise ValueError('raw messages are not batch-aligned')
+
+        conversations = []
+        input_ids = gen_batch.batch['input_ids']
+        attention_mask = gen_batch.batch['attention_mask']
+        for index, messages in enumerate(raw_messages):
+            if isinstance(messages, np.ndarray):
+                messages = messages.tolist()
+            prompt_ids = input_ids[index][attention_mask[index].bool()].tolist()
+            if len(prompt_ids) > self.config.max_start_length:
+                raise ValueError(
+                    'native prompt exceeds max_start_length and would make '
+                    'rollout/log-prob contexts disagree')
+            conversations.append(
+                Qwen35Conversation(
+                    self.tokenizer,
+                    deepcopy(messages),
+                    prompt_ids,
+                ))
+        return conversations
+
+    @staticmethod
+    def _parsed_action_record(turn: int, parsed: ParsedAction) -> Dict[str, Any]:
+        return {
+            'turn': int(turn),
+            'action': parsed.action if parsed.valid else 'invalid',
+            'content': parsed.content,
+            'parse_error': parsed.error,
+            'reasoning_prefix': parsed.prefix,
+        }
+
+    def _process_native_followups(
+        self,
+        conversations: List[Qwen35Conversation],
+        response_ids: torch.Tensor,
+        responses_str: List[str],
+        parsed_actions: List[ParsedAction],
+        observations: List[str],
+        active_mask: torch.Tensor,
+        device=None,
+    ) -> Tuple[torch.Tensor, List[str]]:
+        suffix_rows = []
+        visible_observations = [''] * len(responses_str)
+        for index, active in enumerate(active_mask.tolist()):
+            parsed = parsed_actions[index]
+            if active and (parsed.action == 'search' or not parsed.valid):
+                sampled_ids = []
+                for token_id in response_ids[index].tolist():
+                    token_id = int(token_id)
+                    if token_id == self.tokenizer.eos_token_id:
+                        sampled_ids.append(token_id)
+                        break
+                    if token_id == self.tokenizer.pad_token_id:
+                        break
+                    sampled_ids.append(token_id)
+                followup = conversations[index].append_followup(
+                    responses_str[index],
+                    parsed,
+                    observations[index],
+                    self.config.max_obs_length,
+                    response_token_ids=sampled_ids,
+                )
+                suffix_rows.append(list(followup.token_ids))
+                visible_observations[index] = followup.visible_observation
+            else:
+                suffix_rows.append([])
+        return (self._pad_token_rows(suffix_rows, device=device),
+                visible_observations)
 
     def _process_next_obs(
             self, next_obs: List[str]) -> Tuple[torch.Tensor, List[str]]:
@@ -110,9 +270,13 @@ class LLMGenerationManager:
         new_attention_mask = self.tensor_fn.create_attention_mask(new_input_ids)
         new_position_ids = self.tensor_fn.create_position_ids(new_attention_mask)
 
-        # Cut to appropriate length
+        # Native PPO replays the initial left side plus the complete policy
+        # right side, so rollout generation must retain the same context.
         effective_len = new_attention_mask.sum(dim=1).max()
-        max_len = min(self.config.max_prompt_length, effective_len)
+        rolling_capacity = self.config.max_prompt_length
+        if self._current_tool_protocol() == QWEN35_NATIVE:
+            rolling_capacity += self.config.max_start_length
+        max_len = min(rolling_capacity, effective_len)
 
         new_rollings = DataProto.from_dict({
             'input_ids': new_input_ids[:, -max_len:],
@@ -168,6 +332,11 @@ class LLMGenerationManager:
                     pad_to_left=False
                 )
         effective_len = self.tensor_fn.create_attention_mask(responses).sum(dim=1).max()
+        if (self._current_tool_protocol() == QWEN35_NATIVE
+                and effective_len > self.config.max_prompt_length):
+            raise RuntimeError(
+                'qwen35_native policy right side exceeded its validated '
+                'max_prompt_length capacity')
         max_len = min(self.config.max_prompt_length, effective_len)
         
         return {'responses': responses[:, :max_len], 'responses_with_info_mask': responses_with_info_mask[:, :max_len]}
@@ -226,8 +395,12 @@ class LLMGenerationManager:
         padded_output.batch = trimmed_batch
         return padded_output
 
-    def run_llm_loop(self, gen_batch, initial_input_ids: torch.Tensor) -> Tuple[Dict, Dict]:
+    def run_llm_loop(self, gen_batch, initial_input_ids: torch.Tensor,
+                     raw_messages=None) -> Tuple[Dict, Dict]:
         """Run main LLM generation loop."""
+        native_protocol = self._current_tool_protocol() == QWEN35_NATIVE
+        conversations = (self._prepare_native_conversations(
+            gen_batch, raw_messages) if native_protocol else None)
         
         original_left_side = {'input_ids': initial_input_ids[:, -self.config.max_start_length:]}
         original_right_side = {'responses': initial_input_ids[:, []], 'responses_with_info_mask': initial_input_ids[:, []]}
@@ -238,6 +411,8 @@ class LLMGenerationManager:
         executed_search_count = torch.zeros(gen_batch.batch['input_ids'].shape[0], dtype=torch.long)
         retrieval_events = [[] for _ in range(gen_batch.batch['input_ids'].shape[0])]
         generation_events = [[] for _ in range(gen_batch.batch['input_ids'].shape[0])]
+        final_answers = [None for _ in range(gen_batch.batch['input_ids'].shape[0])]
+        parsed_action_history = [[] for _ in range(gen_batch.batch['input_ids'].shape[0])]
         active_num_list = [active_mask.sum().item()]
         rollings = gen_batch
 
@@ -245,6 +420,7 @@ class LLMGenerationManager:
         for step in range(self.config.max_turns):
             if not active_mask.sum():
                 break
+            turn_active_mask = active_mask.clone()
             rollings.batch = self.tensor_fn.cut_to_effective_len(
                 rollings.batch,
                 keys=['input_ids', 'attention_mask', 'position_ids']
@@ -275,6 +451,7 @@ class LLMGenerationManager:
             next_obs, dones, valid_action, executed_search = self.execute_predictions(
                 responses_str, self.tokenizer.pad_token, active_mask
             )
+            parsed_actions = getattr(self, '_last_parsed_actions', None)
             for index, active in enumerate(active_mask.tolist()):
                 if active:
                     generation_events[index][-1].update({
@@ -282,6 +459,19 @@ class LLMGenerationManager:
                         'done': bool(dones[index]),
                         'executed_search': bool(executed_search[index]),
                     })
+                    if native_protocol:
+                        parsed = parsed_actions[index]
+                        parsed_record = self._parsed_action_record(step, parsed)
+                        parsed_action_history[index].append(parsed_record)
+                        generation_events[index][-1].update({
+                            'tool_protocol': QWEN35_NATIVE,
+                            'action': parsed.action if parsed.valid else None,
+                            'content': parsed.content,
+                            'parse_error': parsed.error,
+                            'reasoning_prefix': parsed.prefix,
+                        })
+                        if parsed.action == 'answer' and parsed.valid:
+                            final_answers[index] = parsed.content
             curr_active_mask = torch.tensor([not done for done in dones], dtype=torch.bool)
             active_mask = active_mask * curr_active_mask
             active_num_list.append(active_mask.sum().item())
@@ -289,8 +479,19 @@ class LLMGenerationManager:
             valid_action_stats += torch.tensor(valid_action, dtype=torch.int)
             executed_search_count += torch.tensor(executed_search, dtype=torch.long)
 
-            next_obs_ids, visible_observations = self._process_next_obs(
-                next_obs)
+            if native_protocol:
+                next_obs_ids, visible_observations = self._process_native_followups(
+                    conversations,
+                    responses_ids,
+                    responses_str,
+                    parsed_actions,
+                    next_obs,
+                    turn_active_mask,
+                    device=responses_ids.device,
+                )
+            else:
+                next_obs_ids, visible_observations = self._process_next_obs(
+                    next_obs)
             for index, event in enumerate(
                     self._last_execution_retrieval_events):
                 if event is not None:
@@ -342,6 +543,7 @@ class LLMGenerationManager:
             _, dones, valid_action, executed_search = self.execute_predictions(
                 responses_str, self.tokenizer.pad_token, active_mask, do_search=False
             )
+            parsed_actions = getattr(self, '_last_parsed_actions', None)
             for index, active in enumerate(active_mask.tolist()):
                 if active:
                     generation_events[index][-1].update({
@@ -349,6 +551,20 @@ class LLMGenerationManager:
                         'done': bool(dones[index]),
                         'executed_search': bool(executed_search[index]),
                     })
+                    if native_protocol:
+                        parsed = parsed_actions[index]
+                        parsed_record = self._parsed_action_record(
+                            self.config.max_turns, parsed)
+                        parsed_action_history[index].append(parsed_record)
+                        generation_events[index][-1].update({
+                            'tool_protocol': QWEN35_NATIVE,
+                            'action': parsed.action if parsed.valid else None,
+                            'content': parsed.content,
+                            'parse_error': parsed.error,
+                            'reasoning_prefix': parsed.prefix,
+                        })
+                        if parsed.action == 'answer' and parsed.valid:
+                            final_answers[index] = parsed.content
 
             curr_active_mask = torch.tensor([not done for done in dones], dtype=torch.bool)
             active_mask = active_mask * curr_active_mask
@@ -377,6 +593,9 @@ class LLMGenerationManager:
             executed_search_count,
             retrieval_events,
             generation_events,
+            final_answers=final_answers if native_protocol else None,
+            parsed_actions=(parsed_action_history
+                            if native_protocol else None),
         )
 
     def _compose_final_output(self, left_side: Dict,
@@ -384,7 +603,9 @@ class LLMGenerationManager:
                             meta_info: Dict,
                             executed_search_count: torch.Tensor,
                             retrieval_events=None,
-                            generation_events=None) -> DataProto:
+                            generation_events=None,
+                            final_answers=None,
+                            parsed_actions=None) -> DataProto:
         """Compose final generation output."""
         final_output = right_side.copy()
         final_output['prompts'] = left_side['input_ids']
@@ -421,6 +642,18 @@ class LLMGenerationManager:
             aligned_generations = np.empty(len(generation_events), dtype=object)
             aligned_generations[:] = generation_events
             non_tensors['generation_events'] = aligned_generations
+        if final_answers is not None:
+            if non_tensors is None:
+                non_tensors = {}
+            aligned_answers = np.empty(len(final_answers), dtype=object)
+            aligned_answers[:] = final_answers
+            non_tensors['final_answer'] = aligned_answers
+        if parsed_actions is not None:
+            if non_tensors is None:
+                non_tensors = {}
+            aligned_actions = np.empty(len(parsed_actions), dtype=object)
+            aligned_actions[:] = parsed_actions
+            non_tensors['parsed_actions'] = aligned_actions
         final_output = DataProto.from_dict(final_output, non_tensors=non_tensors)
         final_output.meta_info.update(meta_info)
         
@@ -481,7 +714,10 @@ class LLMGenerationManager:
                     search_result = search_results.pop(0) if do_search else ''
                     metadata = search_metadata.pop(0) if do_search else None
                     observation = search_result.strip()
-                    next_obs.append(f'\n\n<information>{observation}</information>\n\n')
+                    if self._current_tool_protocol() == QWEN35_NATIVE:
+                        next_obs.append(observation)
+                    else:
+                        next_obs.append(f'\n\n<information>{observation}</information>\n\n')
                     dones.append(0)
                     valid_action.append(1)
                     executed_search.append(int(do_search))
@@ -491,7 +727,11 @@ class LLMGenerationManager:
                         'observation': observation,
                     } if do_search else None)
                 else:
-                    next_obs.append(f'\nMy previous action is invalid. \
+                    if self._current_tool_protocol() == QWEN35_NATIVE:
+                        # The adapter renders a native user retry message.
+                        next_obs.append('')
+                    else:
+                        next_obs.append(f'\nMy previous action is invalid. \
 If I want to search, I should put the query between <search> and </search>. \
 If I want to give the final answer, I should put the answer between <answer> and </answer>. Let me try again.\n')
                     dones.append(0)
@@ -517,22 +757,33 @@ If I want to give the final answer, I should put the answer between <answer> and
         """
         actions = []
         contents = []
-                
+        parsed_actions = []
+
         for prediction in predictions:
             if isinstance(prediction, str): # for llm output
-                pattern = r'<(search|answer)>(.*?)</\1>'
-                match = re.search(pattern, prediction, re.DOTALL)
-                if match:
-                    content = match.group(2).strip()  # Return only the content inside the tags
-                    action = match.group(1)
+                if self._current_tool_protocol() == QWEN35_NATIVE:
+                    parsed = parse_action(prediction, QWEN35_NATIVE)
+                    action = parsed.action if parsed.valid else None
+                    content = parsed.content
                 else:
-                    content = ''
-                    action = None
+                    pattern = r'<(search|answer)>(.*?)</\1>'
+                    match = re.search(pattern, prediction, re.DOTALL)
+                    if match:
+                        content = match.group(2).strip()  # Return only the content inside the tags
+                        action = match.group(1)
+                        parsed = ParsedAction(action, content)
+                    else:
+                        content = ''
+                        action = None
+                        parsed = ParsedAction(None, '', 'missing_legacy_action')
             else:
                 raise ValueError(f"Invalid prediction type: {type(prediction)}")
             
             actions.append(action)
             contents.append(content)
+            parsed_actions.append(parsed)
+
+        self._last_parsed_actions = parsed_actions
             
         return actions, contents
 

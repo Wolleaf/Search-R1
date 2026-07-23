@@ -411,6 +411,14 @@ validate_followup_success_artifacts() {
                 per_question.jsonl lineage.tsv run-index.tsv
             )
             ;;
+        qwen-native-gate-v1)
+            results_relative_parent='runs/qwen-native-gate/attempts'
+            marker_relative_parent='manifests/qwen-native-gate'
+            required=(
+                summary.json summary.md go_no_go.json per_trajectory.jsonl
+                per_question.jsonl lineage.tsv run-index.tsv stage.txt sampling.json
+            )
+            ;;
         *) return 1 ;;
     esac
 
@@ -589,6 +597,10 @@ watchdog_worker() {
     }
     if ! wait_for_terminal_evidence; then
         publish_skipped terminal-evidence-incomplete
+        return 0
+    fi
+    if [[ "$WORK_RC" == 75 ]]; then
+        publish_skipped lock-conflict
         return 0
     fi
     if ! acquire_phase_lock; then

@@ -17,6 +17,9 @@ rollout:
   temperature: 1.0
   top_k: 50 # 0 for hf rollout, -1 for vllm rollout
   top_p: 0.7
+  min_p: 0.0
+  presence_penalty: 0.0
+  repetition_penalty: 1.0
   prompt_length: 1536
   response_length: 512
   # for vllm rollout

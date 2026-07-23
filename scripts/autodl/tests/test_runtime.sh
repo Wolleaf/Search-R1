@@ -111,7 +111,18 @@ printf 'lock\n' >"$TEST_ROOT/handoff/requirements.lock"
     --commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
     --python-version 3.12.0 \
     --torch-version 2.8.0+cu128 \
-    --manifest "$TEST_ROOT/handoff/manifests/cpu_handoff.json"
+    --manifest "$TEST_ROOT/handoff/manifests/cpu_handoff.json" \
+    --require-artifact data/train.parquet
+if "$PYTHON_BIN" "$AUTODL_DIR/handoff.py" verify \
+        --root "$TEST_ROOT/handoff" \
+        --commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+        --python-version 3.12.0 \
+        --torch-version 2.8.0+cu128 \
+        --manifest "$TEST_ROOT/handoff/manifests/cpu_handoff.json" \
+        --require-artifact data/retrieval_replay.json >/dev/null 2>&1; then
+    printf 'A handoff missing a required artifact was accepted.\n' >&2
+    exit 1
+fi
 printf 'tampered\n' >"$TEST_ROOT/handoff/model/config.json"
 if "$PYTHON_BIN" "$AUTODL_DIR/handoff.py" verify \
     --root "$TEST_ROOT/handoff" \
