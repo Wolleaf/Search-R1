@@ -4,6 +4,8 @@
 
 本轮结论为 **NO-GO**，不启动 `R-mix60`，也不实现或训练后续 `B-mix20/C-gated-mix20`。固定的 64 道 held-out HotpotQA 题按每题 5 条轨迹采样，共得到 320 条完整轨迹；仅有 2 条“答对且有效多搜”轨迹，覆盖 2 道题，低于预注册的 16 条/8 题门槛。near-miss 为 0，说明问题不只是答案抽取格式，而是当前 Base 缺少稳定的正确多跳搜索探索。
 
+完整归因、两条正例、query 退化统计和面试口径见 [`analysis_zh.md`](analysis_zh.md)。
+
 ## 运行与恢复
 
 - 评测 commit：`5a3bfb82a3c0ded8b4b91d22d6b8a026a855e067`
