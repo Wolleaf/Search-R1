@@ -159,8 +159,7 @@ PY
             printf 'cpu.ok does not match the previous sealed handoff.\n' >&2
             return 1
         }
-        rm -f -- "$MANIFEST_DIR/cpu.ok"
-        sync_path "$MANIFEST_DIR"
+        # Keep the previous marker until the replacement handoff is verified.
         "$train_python" -m pip freeze --all >"$_attempt/train-freeze.current.txt"
         "$retriever_python" -m pip freeze --all >"$_attempt/retriever-freeze.current.txt"
         cmp -s "$MANIFEST_DIR/train-freeze.txt" "$_attempt/train-freeze.current.txt" || {
