@@ -1,10 +1,12 @@
-# Base Grouped Probe 结果归档
+# RL Parent Grouped Probe 结果归档
 
 ## 结论
 
-本轮结论为 **NO-GO**，不启动 `R-mix60`，也不实现或训练后续 `B-mix20/C-gated-mix20`。固定的 64 道 held-out HotpotQA 题按每题 5 条轨迹采样，共得到 320 条完整轨迹；仅有 2 条“答对且有效多搜”轨迹，覆盖 2 道题，低于预注册的 16 条/8 题门槛。near-miss 为 0，说明问题不只是答案抽取格式，而是当前 Base 缺少稳定的正确多跳搜索探索。
+本轮结论为 **NO-GO**，不启动 `R-mix60`，也不实现或训练后续 `B-mix20/C-gated-mix20`。固定的 64 道 held-out HotpotQA 题按每题 5 条轨迹采样，共得到 320 条完整轨迹；仅有 2 条“答对且有效多搜”轨迹，覆盖 2 道题，低于预注册的 16 条/8 题门槛。near-miss 为 0，说明问题不只是答案抽取格式，而是当前 parent 与自定义工具协议尚未形成稳定的正确多跳搜索探索。
 
-完整归因、两条正例、query 退化统计和面试口径见 [`analysis_zh.md`](analysis_zh.md)。
+这里的 parent 是官方 post-trained `Qwen/Qwen3.5-2B`，不是原始预训练 `Qwen/Qwen3.5-2B-Base`。历史 stage 名 `A/Base` 只表示“未经过本项目 Search-R1 RL”。补充分析还定位到提示词占位符复制，以及恢复文案被宽松正则解析为 `and` 搜索的确定性反馈环；详见 [`analysis_zh.md`](analysis_zh.md)。
+
+完整归因、两条正例、论文规模对照和面试口径见 [`analysis_zh.md`](analysis_zh.md)。
 
 ## 运行与恢复
 
@@ -40,4 +42,4 @@
 - `failed-phase/`：原分析器严格校验导致的真实失败现场
 - `analysis/` 与 `results/recovery-lineage.tsv`：离线恢复 attempt 及评测/分析 commit 血缘
 
-该 NO-GO 只说明当前 Base、当前检索器和预注册配置下不具备足够学习信号，不证明成本感知方法在所有训练策略上无效。若后续继续，应建立新的明确假设和 commit，而不是事后降低本次门槛或重复采样直到通过。
+该 NO-GO 只说明当前 parent、当前协议和预注册的 60-step 低成本方案没有达到启动条件，不证明 Qwen3.5 不会工具调用，也不证明论文的长程 Search-R1 或成本感知方法普遍无效。若后续继续，应建立新的明确假设和 commit，而不是事后降低本次门槛或重复采样直到通过。
