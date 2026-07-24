@@ -42,7 +42,357 @@ n_search=0/1/2/3/4: 5 / 40 / 36 / 13 / 2
 
 上述数字只用于诊断潜力，不改变 G2 的正式 `NO-GO`，也不能替代新的 GPU 门禁。
 
-## 3. 当前问题清单
+## 3. 当前 prompt、答案抽取与 EM 合同
+
+### 3.1 G2 实际测的是什么
+
+G2 使用固定 revision `Qwen/Qwen3.5-2B@15852e8c16360a2fea060d615a32b45270f8a8fc`。这是已经后训练的 Qwen3.5-2B；纯 base 是另一个模型 ID `Qwen/Qwen3.5-2B-Base`。本轮是 `probe_autonomous_32`：32 道题、每题采样 3 条，共 96 条轨迹，`force_search=False`，且没有进行任何 RL 参数更新。因此，G2 只能观察初始模型在当前接口下的行为，不能把它描述成“训练后的模型”。
+
+### 3.2 当前自定义 prompt 与工具 schema
+
+当前代码在 [`tool_protocol.py`](../search_r1/llm_agent/tool_protocol.py) 中构造两条消息。G2 的精确自定义内容如下；system 的视觉换行仅用于文档排版，代码中是拼接后的一行字符串：
+
+```text
+system:
+Call at most one tool per assistant turn. Use search when external
+evidence is needed. After each search result, decide whether another
+search is needed. Use at most four searches. When you have enough
+evidence, answer with only the short final answer, without a tool call
+or explanation.
+
+user:
+Question: <question>
+```
+
+实际 user 字符串在问题后保留一个尾随 `\n`。只有 G1 强制搜索探针才会在 user 问题前增加 `Call search at least once before answering.`；G2 没有这句话。注册给模型的唯一工具为：
+
+```json
+[
+  {
+    "type": "function",
+    "function": {
+      "name": "search",
+      "description": "Search the external knowledge base for evidence needed to answer the question. Call exactly one search per assistant turn.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "A specific factual search query."
+          }
+        },
+        "required": ["query"],
+        "additionalProperties": false
+      }
+    }
+  }
+]
+```
+
+数据加载和 rollout 都通过同一个固定模板渲染：
+
+```python
+tokenizer.apply_chat_template(
+    messages,
+    tools=qwen35_tools(),
+    enable_thinking=False,
+    add_generation_prompt=True,
+    tokenize=False,
+)
+```
+
+固定 `chat_template.jinja` 的 SHA-256 为 `273d8e0e683b885071fb17e08d71e5f2a5ddfb5309756181681de4f5a1822d80`。模型真正看到的结构近似如下；`# Tools`、调用格式和 `<IMPORTANT>` 段由 Qwen 模板注入，不是本项目手写 prompt：
+
+```text
+<|im_start|>system
+# Tools
+
+You have access to the following functions:
+
+<tools>
+{"type":"function","function":{"name":"search", ...}}
+</tools>
+
+If you choose to call a function ONLY reply in the following format
+with NO suffix:
+<tool_call>
+<function=example_function_name>
+<parameter=example_parameter_1>
+value_1
+</parameter>
+</function>
+</tool_call>
+
+<IMPORTANT>
+...
+- If there is no function call available, answer the question like
+  normal with your current knowledge and do not tell the user about
+  function calls
+</IMPORTANT>
+
+Call at most one tool per assistant turn. ...
+<|im_end|>
+<|im_start|>user
+Question: <question>
+<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+```
+
+`enable_thinking=False` 只让模板预填一个空 thinking 块，不会限制后续正文长度。搜索动作必须使用原生格式：
+
+```text
+<tool_call>
+<function=search>
+<parameter=query>
+Ryan Neates football club
+</parameter>
+</function>
+</tool_call>
+```
+
+代码内部把检索结果追加为 `role="tool"`，固定 Qwen 模板再把它渲染为新的 user `<tool_response>...</tool_response>` 回合，随后打开新的 assistant 回合。最终答案则不是工具调用，也没有边界标签，只是普通 assistant 文本。
+
+### 3.3 为什么模型会给长回答
+
+当前 system 已经写了 `only the short final answer`，所以根因不是“忘了要求短答案”，而是软指令、模型先验和解析合同叠加：
+
+1. `short final answer` 只是自然语言要求，没有像 `<answer>...</answer>` 一样可机器校验的答案边界。
+2. Qwen 模板同时要求在不调用工具时 `answer the question like normal`；后训练 chat 模型通常倾向完整句、Markdown 和解释，本轮轨迹也呈现这一特征。
+3. 工具 schema 只约束 `search(query)`，不约束普通 assistant 终局的字段、行数或 token 数。
+4. `enable_thinking=False` 关闭的是显式 thinking 模式，不是 verbose 模式；`max_response_length=500` 只是安全上限，也不是“生成 500 token”的目标。
+5. 除疑似 JSON tool call 外，native parser 会把普通的不含协议 marker 的非空回复整段接收为答案；final generation 又只在 EOS 或长度上限停止，模型即使多写一句，接口也不会拒绝。
+6. G2 是 0-update 门禁，模型尚未收到 strict EM 的训练反馈。论文第 5.3 节在 Qwen2.5-7B-Base 上观察到前 100 steps 先删除 `excessive filler words`，之后随着有效搜索增多，总轨迹长度再上升；这是与当前解释相容的训练动态证据，不是对 Qwen3.5-2B 长回答成因的直接证明。
+
+因此应区分“总轨迹长”和“最终答案长”：论文允许 reasoning、搜索结果和多轮轨迹很长，但只对一个很窄的最终答案字段评分。`top_k=20` 和 `presence_penalty=2.0` 可能影响措辞与多样性，但没有证据表明它们是长回答的主因。
+
+### 3.4 当前 native 的解析与奖励链
+
+当前链路是：
+
+```text
+普通 assistant 终局
+  -> _parse_qwen35_action(): 整段文本作为 ParsedAction("answer", ...)
+  -> generation.py: 整段写入 final_answer
+  -> main_ppo.py: qa_em.em_check(final_answer, gold)
+  -> reward 写到最后一个 response token
+```
+
+[`qa_em.py`](../verl/utils/reward_score/qa_em.py) 会转小写、去标点、去英语冠词并压缩空白，但最后仍要求两个完整规范化字符串相等。以已逐字确认的 G2 终局为例：
+
+```text
+sample_id:  hotpotqa:train:86102
+question:   Ryan Neates is currently listed with a football club whose
+            offical colours are what?
+gold:       navy blue and gold
+prediction: The official colours of the Claremont Football Club are
+            **navy blue and gold**.
+
+normalized prediction:
+official colours of claremont football club are navy blue and gold
+
+normalized gold:
+navy blue and gold
+
+strict EM: 0
+```
+
+Markdown 星号和句号会被去掉，但额外句子不会，所以内容正确仍判 0。G2 中 `2,526`、`1980` 被包在说明句里的样本属于同类；`Piers Sellers`/`Piers John Sellers` 和日期顺序差异则是另一类 alias 问题，单靠答案边界不能解决。
+
+## 4. 论文原版 prompt、循环与 EM
+
+### 4.1 论文的精确 prompt
+
+论文 [`2503.09516v5.pdf`](2503.09516v5.pdf) Table 1（PDF 第 5 页）给出的是一个完整模板，没有公开 system/user role 或 chat-template 拆分：
+
+```text
+Answer the given question. You must conduct reasoning inside <think> and </think>
+first every time you get new information. After reasoning, if you find you lack some
+knowledge, you can call a search engine by <search> query </search>, and it will
+return the top searched results between <information> and </information>. You
+can search as many times as you want. If you find no further external knowledge
+needed, you can directly provide the answer inside <answer> and </answer> without
+detailed illustrations. For example, <answer> xxx </answer>. Question: question.
+```
+
+这里的关键不是它比当前 prompt 更强调“短”，而是它同时给出了机器可解析的 `<answer>` 边界和短答案示例。文案虽说可搜索任意次数，Algorithm 1 实际受最大 action budget `B` 约束；Appendix B.2（PDF 第 16 页）明确 `B=4`、每次返回 top-3 passages、最大 response 500 tokens、retrieved content 500 tokens、总序列 4096 tokens。
+
+仓库 legacy 模板与论文合同相同，但不是逐字副本：它把示例改成 `<answer> Beijing </answer>`，并保留了 `as your want` 等小拼写差异。本文因此分别引用论文原文和仓库真实轨迹，不把两者混称为同一字符串。
+
+### 4.2 原版 rollout 和奖励怎样工作
+
+论文 Algorithm 1（PDF 第 6 页）的循环为：
+
+```text
+<think>...</think><search>query</search>
+  -> 环境检索
+  -> 追加 <information>...</information>
+  -> 模型继续生成下一 action
+  -> <answer>short answer</answer> 后终止
+```
+
+每个 action 在生成到 `</search>`、`</answer>` 或 EOS 时停止；非法 action 会追加 `My action is not correct. Let me rethink.`。训练只有最终结果规则奖励：
+
+```text
+r_phi(x, y) = EM(a_pred, a_gold)
+```
+
+其中 `a_pred` 是从完整 response `y` 中抽出的最终答案，不是整段 reasoning、search 和 information。论文明确不加 format reward，也不训练 neural reward model。论文只声明 exact string matching/EM，没有给出大小写、冠词、标点等归一化细则；这些细节来自仓库代码，不能冒充论文原文。
+
+论文把 `a_pred` 定义为从 response 中抽取的最终答案。仓库 legacy 路径中的 [`qa_em.extract_solution()`](../verl/utils/reward_score/qa_em.py) 会找到全部 `<answer>...</answer>` 并取最后一个；之所以要求至少两个 match，是因为完整 prompt 自带一个 `<answer> Beijing </answer>` 示例，生成答案是第二个。抽取完成后才调用同一个 `em_check()`，所以该实现没有对“整段自然语言回复”做 EM。
+
+论文还同时研究 Qwen2.5-3B/7B 的 Base 与 Instruct：Instruct 初始表现更高、收敛更快，但两者都接受 RL 训练，最终表现接近。Appendix B.2 的 GRPO 参考配置是每 prompt 采样 5 条、500 steps、总 batch 512、8 张 H100、`temperature=1.0`、`top_p=1.0`。这与本项目的预算缩小版不能直接横比，也说明论文里的稳定多搜轨迹主要是训练结果，而不是要求未训练 parent 天然具备。
+
+### 4.3 三种合同的直接对照
+
+| 环节 | 论文/legacy XML | 当前 Qwen native v1 | 计划 native v2 |
+| --- | --- | --- | --- |
+| 搜索动作 | `<search>query</search>` | Qwen `<tool_call><function=search>...` | 保持 Qwen 原生 tool call |
+| 检索回填 | `<information>...</information>` | `<tool_response>...</tool_response>` 新回合 | 保持 native 回填 |
+| 最终答案 | `<answer>answer text</answer>`，示例/案例通常很短 | 无标记自由文本 | `FINAL_ANSWER: <short answer>` |
+| 答案抽取 | 取最后一个 `<answer>` 内容 | 合法 marker-free 终局的整段文本 | 只取固定前缀后的内容 |
+| 正确性奖励 | 抽取后 strict EM | 该整段文本 strict EM；invalid 为 0 | 抽取后 strict EM |
+| 对搜索/RL 核心的影响 | 原论文 | 已完成 Qwen 适配 | 只修终局接口，不改搜索状态机 |
+
+所以 native v2 不是放宽 EM，也不是为结果“改评分”；它只是为 Qwen 原生工具协议恢复与论文作用等价的窄答案抽取合同。
+
+## 5. 可复核的完整轨迹举例
+
+### 5.1 本轮 native G2 的证据边界
+
+本轮 native G2 原始文件仍在 AutoDL 持久盘：
+
+```text
+/root/autodl-tmp/search-r1/runs/eval/qwen_native_g2/attempts/
+20260724T041309Z-1728-2268/traces/eval_predictions.jsonl
+
+SHA-256:
+6da6f333b3c97a92d34b8b377bde4228ccf26827cfd513785c4d6f210b8f4755
+```
+
+当前本地仓库没有该 JSONL，且实例端口在本次写报告时不可达。因此上节只引用已经逐字核实的终局，不凭汇总补造 `group_slot`、query、tool response 或中间 reasoning。下一次 CPU 增量阶段必须先把原始 trace 与哈希归档到 `docs/results/`，再补入 native 完整轨迹；逐轨迹人工 ledger 作为并行分析产物生成，不阻塞 CPU handoff。这也是本轮暴露出的证据归档缺口。
+
+已经完成审计、可用于下次从原件快速定位的样本包括：
+
+| Sample ID | Gold | 已核实的诊断用途 |
+| --- | --- | --- |
+| `hotpotqa:train:86102` | `navy blue and gold` | 逐字终局见 3.4；内容正确但整句 strict EM 为 0 |
+| `hotpotqa:train:37266` | `2,526` | 三条终局均包含正确数字，仍因终局边界/格式失分 |
+| `hotpotqa:train:23105` | `1980` | slot 1、2 包含正确年份，可检查 mixed group |
+| `hotpotqa:train:47507` | `Piers John Sellers` | `Piers Sellers` 与全名的 alias 差异 |
+| `hotpotqa:train:25811` | `21 August 1765` | substantive answer 前回显 empty-think，触发 parser 误判 |
+
+这些定位信息只帮助找原始记录，不能替代原始 `generation_events`、`turns` 和 `retrieval_events`。
+
+### 5.2 本仓库真实完整二搜轨迹：legacy XML 成功例
+
+下面不是 native G2，而是本仓库已经归档、可逐字复算的历史 legacy probe。来源是 [`eval_predictions.jsonl`](results/grouped-probe-20260723/eval/traces/eval_predictions.jsonl)，`record_id=trace:dc9e45fc219270e6f172848f`、`sample_id=hotpotqa:train:80364`、slot 4、`executed_search_count=2`、`invalid_action_count=0`、`response_clipped=false`、`EM=1`。它展示模型如何在首搜写错 `JL/JT` 后改写第二个 query，并用 `<answer>` 保持短终局。
+
+<details>
+<summary>展开完整 raw trajectory</summary>
+
+```text
+<|im_start|>user
+Answer the given question. You must conduct reasoning inside <think> and </think> first every time you get new information. After reasoning, if you find you lack some knowledge, you can call a search engine by <search> query </search> and it will return the top searched results between <information> and </information>. You can search as many times as your want. If you find no further external knowledge needed, you can directly provide the answer inside <answer> and </answer>, without detailed illustrations. For example, <answer> Beijing </answer>. Question: What nationality is the manufacterer that partnered with JL racing in 2006?<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+<reasoning>
+The user is asking for the nationality of the manufacterer that partnered with JL racing in 2006. I need to search for information regarding this specific partnership.
+</reasoning>
+
+<search>
+Query: "JT racing c1 manufacterer 2006 partnership nationality"
+</search>
+
+<information>Doc 1(Title: "Cunningham Motorsports") Scherer signed on with Dodge to be a driver development program for the manufacterer in the ARCA Racing Series from 2001 to 2007. The team then announced a partnership with Team Penske (then Penske Racing) in June 2008, which would be effective for competition in the ARCA Racing Series (then ARCA ReMax Series), USAC Midgets, and the NASCAR Camping World Truck Series (then Craftsman Truck Series). Seven years later, Cunningham announced an ARCA-specific driver development program with Roush Fenway Racing to put Kyle Weatherman in a car. The team maintained both relationships until its closure, with Penske's Austin Cindric and
+Doc 2(Title: "JT McNamara") many others open to professionals after forming a hugely successful partnership with the Bolger yard. In his native Ireland, McNamara was ever-present at the National Hunt Festival at Punchestown for the duration of his career. His haul included five La Touche Cups (2010 L'Ami, 2007, 2004 Spot Thedifference, 2005 Good Step, 2002 Risk Of Thunder), three Ladies Cups (2011, Outlaw Pete, 2006 Abrams Bridge, 2003 Buailtes and Fadas), three Bishopscourt Cups (2004, 2003 Ever Onward, 1998 Master Julian), two Champion Hunters' Chases (2012, 2010 On The Fringe) and the Grade 1 Champion NH Flat Race (2001, Like-A-Butterfly, run at Leopardstown).
+</information>
+
+After a brief analysis, it seems that the specific detail about a manufacterer partnering with "JL racing" (which might refer to Johnline Racing or a typo for "A.L. Racing" as seen in Doc 1) in 2006 could require precise sports database knowledge. The provided snippets discuss "Cunningham Motorsports" (Doc 1) and "J.T. McNamara" (Doc 2), but neither explicitly matches the "manufacterer that partnered with JL racing in 2006" query. Given the potential ambiguity and the specific constraint to search, I will perform a dedicated search on "manufacterer partnered with JL racing 2006".
+</think>
+
+<search>
+Query: "manufacterer partnered with JL racing 2006 nationality"
+</search>
+
+<information>Doc 1(Title: "JL Racing") 2007 the team entered the Castrol Canadian Touring Car Championship. The month of September saw a win at the British Empire Motor Club (BEMC) Indian Summer War Bonnet three-hour endurance race. Another record was set as it was the first time a Saab 9-3 had won an endurance race in Canada. The final weekend of racing saw the team claim fifth position for the championship. JL Racing JL Racing is one of Canada's premier sport sedan racing teams. In 2006, JL Racing formed a partnership with Saab Canada to race and showcase Canada's only Saab 9-3 race car. The team
+Doc 2(Title: "JL Racing") JL Racing JL Racing is one of Canada's premier sport sedan racing teams. In 2006, JL Racing formed a partnership with Saab Canada to race and showcase Canada's only Saab 9-3 race car. The team made headlines several times with a first-race, first-place finish and subsequent podium finishes in the Saab 9-3. The team currently competes in the Castrol Canadian Touring Car Championship. In 2008 they will enter two Saab 9-3 MY 08 cars in the Super Touring class and will run North America's first Saab 9-3 BioPower race car in the Touring Class. The team's current full-time drivers are
+Doc 3(Title: "Cunningham Motorsports") Scherer signed on with Dodge to be a driver development program for the manufacterer in the ARCA Racing Series from 2001 to 2007. The team then announced a partnership with Team Penske (then Penske Racing) in June 2008, which would be effective for competition in the ARCA Racing Series (then ARCA ReMax Series), USAC Midgets, and the NASCAR Camping World Truck Series (then Craftsman Truck Series).
+</information>
+
+Based on the search results, the details about a manufacterer partnering specifically with "JL Racing" in 2006 refer to "JL Racing" itself. When searching for the details of the "manufacterer that partnered with JL Racing", the provided text indicates that "JL Racing" is a team of Canada's premier sport sedan racing teams. The context of the partnership involves "Saab 9-3". The Saab brand is Swedish. Therefore, the nationality of the manufacterer (Saab) is Swedish.
+
+<answer> Swedish </answer>
+```
+
+</details>
+
+这条轨迹也说明：模型可以在一条长 reasoning/search 轨迹末尾给出短答案。EM 成功并不是因为整段输出短，而是 scorer 只抽取 `Swedish`。
+
+### 5.3 论文完整三搜轨迹：第三搜用于自验证
+
+论文 Appendix I Table 9（PDF 第 20 页）给出 Qwen2.5-7B-Base 训练后的案例。以下省略号属于论文表格中的检索片段截断，不是本报告删除了 action：
+
+<details>
+<summary>展开论文 Search-R1 完整 action sequence</summary>
+
+```text
+Question: Curious is a women's fragrance by a singer born in what city and state?
+Ground Truth: McComb, Mississippi
+
+<think> I need to find out which city and state a singer, by whom the women's fragrance
+"Curious" was created, was born in. </think>
+<search> Curious fragrance information </search>
+<information> Doc 1(Title: "Curious (fragrance)") Curious (fragrance) Curious is a women's
+fragrance by Britney Spears for Elizabeth Arden, and is the first perfume to be endorsed by
+Britney Spears, preceding "Fantasy." Spears reportedly earned $52 million from the endorsement.
+"Curious" was released in September 2004, and was very successful internationally. It was the
+number one fragrance of 2004 in department stores, and in 2005, "Curious" was honored by the
+Fragrance Foundation as Best Women's Fragrance. The fragrance is a white floral scent. Its notes
+are Louisiana magnolia, golden Anjou pear, lotus flower, tuberose, star jasmine, pink cyclamen,
+vanilla-infused musk, sandalwood and blonde woods. Elizabeth Arden ... </information>
+
+<think> I need to find out which city and state Britney Spears, the singer behind
+"Curious" fragrance, was born in. </think>
+<search> Britney Spears birthplace </search>
+<information> Doc 1(Title: "Britney Spears") the best-selling female albums artist of the 2000s. In
+2004, she launched a perfume brand with Elizabeth Arden, Inc., from which sales exceeded US$1.5
+billion. Spears was born in McComb, Mississippi, the second child of Lynne Irene Bridges and
+James Parnell Spears. Her maternal grandmother, Lillian Portell, was English (born in London),
+and one of Spears's maternal great-great-grandfathers was Maltese. Her siblings are Bryan James
+and Jamie Lynn. Britney was born in the Bible Belt, where socially conservative evangelical
+Protestantism is a particularly strong religious influence. Spears was baptized into the Southern
+Baptist Convention, but later in life studied ... </information>
+
+<think> Since Britney Spears was born in McComb, Mississippi, I need to find out which
+city and state that is. </think>
+<search> McComb, Mississippi location </search>
+<information> Doc 1(Title: "McComb, Mississippi") McComb, Mississippi McComb is a city in
+Pike County, Mississippi, United States, approximately south of Jackson. As of the 2010 census,
+the city had a total population of 12,790. It is the principal city of the McComb, Mississippi
+Micropolitan Statistical Area. McComb was founded in 1872 after Henry Simpson McComb of the
+New Orleans, Jackson and Great Northern Railroad, a predecessor of the Illinois Central Railroad
+(now part of the Canadian National Railway), decided to move the railroad's maintenance shops
+away from New Orleans, Louisiana, to avoid the attractions of that city's saloons. The railroad
+purchased land in Pike County, ... </information>
+
+<think> I have found that Britney Spears was born in McComb, Mississippi. Since the
+question asks for the city and state, I just need to confirm the state, which I already
+know from the previous search. </think>
+<answer> McComb, Mississippi </answer>
+```
+
+</details>
+
+第二搜其实已经给出答案，第三搜用于 self-verification。这正是成本实验要研究的空间：B 可能保留第三搜，而 C 在不损失 EM 的前提下学会省掉它。无论是否省搜，最终 scorer 都只比较 `McComb, Mississippi`，不会把 preceding reasoning 算进答案。
+
+## 6. 当前问题清单
 
 ### P0-1：自由文本终局与 strict EM 的合同不匹配
 
@@ -96,9 +446,9 @@ G2 的注册目标是动作格式、query 和闭环健康，因此 `EM=0/96` 不
 
 当前 G0-G2 的 immutable evidence 仍只在 AutoDL 持久盘，尚未归档到本仓库 `docs/results/`。数据盘为 100 GB，最近检查约使用 75 GB、剩余 26 GB：足够进行 CPU 增量重封和门禁，但尚不能证明足够同时保存 R/B/C 的全参数 optimizer checkpoint。2-step smoke 后必须先记录实际 checkpoint 大小并注册顺序保留方案；R 至少保留到 B/C 均完成，先完成的分支应在校验 inference 权重、指标和 lineage 后再考虑释放 optimizer 状态。任何清理都需另行确认；若测得余量不足，则在长训前停止，不自动扩容或删除历史证据。
 
-## 4. 最小修复方案
+## 7. 最小修复方案
 
-### 4.1 建立 Qwen native v2 最终答案合同
+### 7.1 建立 Qwen native v2 最终答案合同
 
 搜索仍使用 Qwen3.5 原生 `search` tool call，不增加 `finish` 工具，不改 Agent 搜索状态机。只把普通 assistant 终局固定为一行：
 
@@ -111,14 +461,14 @@ FINAL_ANSWER: <short answer>
 1. 将 prompt version 提升为 v2，并明确要求唯一一行短答案，不增加 few-shot 或复杂模板。
 2. parser 先剥离至多一个完整、平衡且内容只含空白的 leading `<think></think>`；非空、重复、嵌套或不平衡 thinking 仍拒绝。
 3. 剩余内容只能是一个完整 tool call，或唯一 `FINAL_ANSWER:` 行；只把冒号后的短文本送入 strict EM。
-4. 原始回复、thinking prefix、抽取答案和 parse error 全部继续写入 trace。
-5. v1 parser 与旧 evidence 保持可读，不修改历史结果。
+4. 原始回复、thinking prefix、抽取答案和 parse error 全部继续保留在现有 trace 事件中。
+5. 不维护双 parser；旧 commit、prompt version 和原始 evidence 足以复算 v1 历史，新主路径只保留 v2 parser。
 
-### 4.2 保留 strict EM，补齐诊断指标
+### 7.2 保留 strict EM，补齐诊断指标
 
 训练正确性 reward 默认仍为抽取后 strict EM。每条 trace 同时保存：
 
-- `raw_final_response`；
+- 从现有终局 `generation_events` 派生的 `raw_final_response`，不新增顶层 trace 字段；
 - `extracted_answer`；
 - strict EM；
 - 仅报告用的 normalized containment/subEM；
@@ -127,7 +477,7 @@ FINAL_ANSWER: <short answer>
 
 分析器必须从 `extracted_answer + gold_answers` 独立复算 strict EM，并核对 trace、Parquet 和 catalog 的 gold 一致性。这样既避免再次把格式问题误判为能力问题，也不通过宽松 reward 美化正式结果。
 
-### 4.3 注册最小 on-policy 训练采样合同
+### 7.3 注册最小 on-policy 训练采样合同
 
 所有新的 readiness gate、2-step smoke 和 native 训练统一使用：
 
@@ -140,11 +490,11 @@ presence_penalty=0.0, repetition_penalty=1.0
 
 这会牺牲上一轮为提高生成多样性加入的 top-k/presence 参数，但避免实现大范围 processed-log-prob 张量链路，符合本项目的最小复现原则。由于采样分布改变，旧 G2 的良好工具行为不能直接外推，必须用相同训练分布重跑低成本门禁。
 
-### 4.4 只做增量 CPU 重封
+### 7.4 只做增量 CPU 重封
 
 新 prompt version、parser 和训练配置会使旧 handoff 失效，但不需要重新下载或构建全部资产。CPU 无卡阶段只执行：
 
-1. 将现有 G0-G2 evidence 归档并校验哈希；同时把人工答案审计物化为逐轨迹 ledger，绑定 rubric、source trace digest 和 SHA-256。两者都不改变正式结论或门禁。
+1. 将现有 G0-G2 原始 evidence 归档并校验哈希；人工答案审计并行物化为逐轨迹 ledger，绑定 rubric、source trace digest 和 SHA-256，但 ledger 未完成不阻塞 handoff。两者都不改变正式结论或门禁。
 2. 用相同 760 条样本、sample ID、顺序和配额重新物化 native v2 prompt。
 3. 运行 parser/reward golden tests、完整 pytest、shell 语法和 Hydra 配置展开。
 4. 重新校验模型、语料、BM25、数据 manifest 和依赖 freeze。
@@ -152,7 +502,7 @@ presence_penalty=0.0, repetition_penalty=1.0
 
 不重新下载模型，不重建 Wiki/BM25，不重新筛选 NQ/Hotpot，也不改变数据配比。
 
-## 5. 验证与训练顺序
+## 8. 验证与训练顺序
 
 ```text
 本地实现与测试
@@ -166,7 +516,7 @@ presence_penalty=0.0, repetition_penalty=1.0
   -> B/C-native-v2 对称分叉
 ```
 
-### 5.1 G0/G1 与 G2 readiness
+### 8.1 G0/G1 与 G2 readiness
 
 新 G0/G1/G2 必须使用和训练完全相同的 `top_k=0/presence_penalty=0` 采样。G2 保留原有门槛：
 
@@ -182,7 +532,7 @@ presence_penalty=0.0, repetition_penalty=1.0
 
 任何一项为零都停止，不进入 G3 或训练。
 
-### 5.2 G3 capability gate
+### 8.2 G3 capability gate
 
 在新的 exact attempt 中复用原 G3 固定的 held-out Hotpot-64、group-5、320 条规模和保守阈值。native-v2 答案合同与训练兼容采样是本文新注册的实验修订，不追溯声称为旧 G3 的事前设置：
 
@@ -193,7 +543,7 @@ presence_penalty=0.0, repetition_penalty=1.0
 
 若 G3 `NO-GO`，保留完整证据并停止。只有在确认检索链可用、但仍缺乏正确探索时，才另立小规模 oracle trajectory SFT warm-start 假设；不能把它混入当前 GRPO 复现。
 
-### 5.3 两步训练 smoke
+### 8.3 两步训练 smoke
 
 G3 `GO` 后只运行 2 个更新 step。必须同时满足：
 
@@ -205,7 +555,7 @@ G3 `GO` 后只运行 2 个更新 step。必须同时满足：
 
 smoke 不通过则停止，不通过降门槛、盲降 batch 或直接跑 60 steps 掩盖问题。
 
-### 5.4 R/B/C 分支关系与奖励公式不变
+### 8.4 R/B/C 分支关系与奖励公式不变
 
 2-step smoke 通过后才启动全参数 `R-mix60-native-v2`。R 完成后重新通过能力门，并要求至少 8/64 个 cost-contrast group；只有此时才从同一个 R checkpoint 对称训练：
 
@@ -216,7 +566,7 @@ C-gated-mix20-native-v2: r = EM * (1 - 0.10 * n_search / 4)
 
 B/C 继续共享 parent digest、数据顺序、seed、batch、group、长度、协议、检索器和步数。最终比较 strict EM、搜索次数、统一 utility、共同答对题搜索差，以及代表性完整轨迹。
 
-## 6. 明确不改的内容
+## 9. 明确不改的内容
 
 为避免再次扩大实验空间，本轮固定：
 
@@ -232,7 +582,7 @@ B/C 继续共享 parent digest、数据顺序、seed、batch、group、长度、
 
 不做模型 sweep、参数 sweep、多 seed、LLM judge、dense retriever、processed-proposal PPO 或通用训练平台。
 
-## 7. GO/NO-GO 与停止条件
+## 10. GO/NO-GO 与停止条件
 
 | 检查点 | GO | NO-GO / 工程失败后的动作 |
 | --- | --- | --- |
@@ -243,7 +593,7 @@ B/C 继续共享 parent digest、数据顺序、seed、batch、group、长度、
 | R 后复测 | 能力门和 cost-contrast 门均通过 | 只报告 R，不启动 B/C |
 | B/C 完成 | 同一 parent 下完成配对评测 | 无论正负结果均归档，不通过继续调参制造成功 |
 
-## 8. 为什么仍然有希望
+## 11. 为什么仍然有希望
 
 本轮最重要的正面证据不是“门槛只差两条”，而是问题已经从模糊的“模型不搜索”收敛为可验证接口：
 
@@ -255,7 +605,7 @@ B/C 继续共享 parent digest、数据顺序、seed、batch、group、长度、
 
 剩余不确定性是：关闭 top-k/presence 后工具行为是否仍稳定、canonical 短答案遵循率是否足够，以及 2B 模型能否在预注册 G3 门槛下形成充足的正确多搜探索。因此当前判断应表述为“值得按最小修复继续验证”，而不是“已经保证训练成功”。
 
-## 9. 证据位置与文档关系
+## 12. 证据位置与文档关系
 
 当前 AutoDL immutable evidence：
 
