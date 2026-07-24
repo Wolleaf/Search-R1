@@ -12,6 +12,28 @@
 
 因此，“模型不会搜索”这一假设已基本排除；但“已有可直接用于 strict-EM GRPO 的自动奖励信号”尚未成立。现在没有 native 训练 checkpoint，下一步是解阻后启动新训练，而不是续跑一个已开始的训练。
 
+### 1.1 复现原则：论文合同优先
+
+后续修改采用“论文明确内容优先、官方仓库补实现细节、所有例外单独登记”的原则。论文明确给出的科学语义和超参数直接保留；论文没有展开的代码细节才以官方仓库为准。若论文、官方 recipe 和当前预算三者冲突，不再用“原版”一词合并，而是在下表逐项说明取舍。只有 Qwen3.5 接口、两卡/100 GB/付费预算和成本感知研究问题要求的差异才允许修改；已存在但不准备修补的上游差异也必须明示。
+
+| 项目 | 论文 | 官方仓库 | 本项目 | 结论 |
+| --- | --- | --- | --- | --- |
+| 搜索/回填 | `<search>` / `<information>` | 同论文 | Qwen 原生 `<tool_call>` / `<tool_response>` | Qwen3.5 必要适配 |
+| 最终答案 | `<answer>answer text</answer>` | 同论文 | native v2 恢复同一标签 | 保留论文合同 |
+| R/B reward | 抽取答案后 EM；无 format reward/neural RM | 同论文 | 原样保留 | 不改目标函数 |
+| C reward | 无 | 无 | correctness-gated 搜索成本 | 唯一算法研究变量 |
+| RL 与采样 | 默认 PPO，也报告 GRPO；GRPO group 5、temperature/top-p 1.0 | 提供 GRPO recipe，个别默认值与论文有差异 | 采用论文 GRPO 值；额外采样处理关闭 | 低成本论文变体 |
+| 检索器 | Wiki-2018 + E5 dense、top-3 | 默认 E5/FAISS、top-3 | 同语料 BM25、top-3 | 100 GB/预算偏差，影响高 |
+| action budget | `B=4` 个总 action | `max_turns` 个可检索 turn 后另有 terminal；不同 recipe 出现过 2/4 | 保留上游循环，固定 `max_turns=4` | 已登记语义差异 |
+| 长度 | response/retrieved 500，total sequence 4096 | 以 `max_turns` 组合容量 | response 500、observation 384 | 当前循环的容量适配 |
+| rollout 后端 | vLLM | vLLM/FSDP 路径 | HF + SDPA/FSDP | 冻结已验证工程链路 |
+| 模型与规模 | Qwen2.5-3B/7B，8×H100、500 steps、batch 512 | recipe 的步数/turn 值并非全部与论文一致 | Qwen3.5-2B、2×5090、R60/B20/C20、batch 8 | 模型与预算缩放 |
+| 数据 | 完整 NQ + HotpotQA train | 提供合并处理脚本 | train-512/val-128 与固定配比 | 预算及成本对照缩放 |
+
+`enable_thinking=False` 作为已经通过 G0-G2 的固定模板选择保留，不在修答案边界时同时改变 thinking 模式；它不是模型或显卡的硬限制。实际 prompt 不照抄论文/仓库答案示例中的 `xxx` 或 `Beijing`，因为既有轨迹已证明该模型会复制字面占位符；这项删除只消除已观测的接口干扰，不改变 `<answer>` 合同。
+
+384-token observation 是官方代码“4 个可检索 turn + terminal generation”路径下的显式容量偏差：policy right side 上界为 `4*(500+384)+500=4036`；若 observation 也取 500，则为 4500。native rolling state 还可保留最多 1024-token initial left side，因此这里的 4036 不能冒充论文的 4096-token total-sequence 口径。除上表和第 9.2 节登记的项目外，不新增答案语法、宽松 reward、额外工具、模型 sweep、参数 sweep 或新的训练阶段。任何后续偏离必须先单独说明必要性和影响，不能在排错时顺手加入。
+
 ## 2. 已完成证据
 
 | 阶段 | 工程结果 | 科学结果 |
@@ -218,9 +240,9 @@ needed, you can directly provide the answer inside <answer> and </answer> withou
 detailed illustrations. For example, <answer> xxx </answer>. Question: question.
 ```
 
-这里的关键不是它比当前 prompt 更强调“短”，而是它同时给出了机器可解析的 `<answer>` 边界和短答案示例。文案虽说可搜索任意次数，Algorithm 1 实际受最大 action budget `B` 约束；Appendix B.2（PDF 第 16 页）明确 `B=4`、每次返回 top-3 passages、最大 response 500 tokens、retrieved content 500 tokens、总序列 4096 tokens。
+这里的关键不是它比当前 prompt 更强调“短”，而是它同时给出了机器可解析的 `<answer>` 边界和短答案示例。文案虽说可搜索任意次数，Algorithm 1 实际受最大 action budget `B` 约束；Appendix B.2（PDF 第 15-16 页）明确使用 Wiki-2018 + E5 dense retriever、top-3 passages、`B=4`、最大 response 500 tokens、retrieved content 500 tokens 和总序列 4096 tokens。当前 BM25 不能再被写成论文原值。
 
-仓库 legacy 模板与论文合同相同，但不是逐字副本：它把示例改成 `<answer> Beijing </answer>`，并保留了 `as your want` 等小拼写差异。本文因此分别引用论文原文和仓库真实轨迹，不把两者混称为同一字符串。
+仓库原版 prompt 可直接在 [`qa_search_train_merge.py`](../scripts/data_process/qa_search_train_merge.py) 和 [`search_mix.py`](../scripts/data_process/search_mix.py) 的 `make_prefix()` 中核对。legacy 模板与论文合同相同，但不是逐字副本：它把示例改成 `<answer> Beijing </answer>`，并保留了 `as your want` 等小拼写差异。本文因此分别引用论文原文和仓库真实轨迹，不把两者混称为同一字符串；此前“本地缺失”的对象仅指本轮 native G2 原始 JSONL，不是原版 prompt。
 
 ### 4.2 原版 rollout 和奖励怎样工作
 
@@ -244,6 +266,8 @@ r_phi(x, y) = EM(a_pred, a_gold)
 
 论文把 `a_pred` 定义为从 response 中抽取的最终答案。仓库 legacy 路径中的 [`qa_em.extract_solution()`](../verl/utils/reward_score/qa_em.py) 会找到全部 `<answer>...</answer>` 并取最后一个；之所以要求至少两个 match，是因为完整 prompt 自带一个 `<answer> Beijing </answer>` 示例，生成答案是第二个。抽取完成后才调用同一个 `em_check()`，所以该实现没有对“整段自然语言回复”做 EM。
 
+需要区分论文伪代码、官方控制流与本项目配置。Algorithm 1 在 `while b < B` 内生成 action，search、answer 和 invalid 都占一次预算，`B=4` 后没有额外生成；官方初始提交的 [`generation.py`](../search_r1/llm_agent/generation.py) 则先运行 `max_turns` 个可检索 turn，对仍未终止的样本再给一个 `do_search=False` 的 terminal generation。官方顶层 recipe 使用过 `max_turns=2`，版本化 recipe 也有 `max_turns=4`；本项目明确注册的是 4。因此当前语义是“最多 4 次真实检索，必要时再生成第 5 个收尾 action”，不是论文 `B=4` 的字面同义词。本项目保留上游控制流和已注册值，不把预算语义差异误算成 Qwen3.5 改动；terminal 中再次生成 search 不执行检索、不计成本，且没有合法终局答案时 EM 为 0。
+
 论文还同时研究 Qwen2.5-3B/7B 的 Base 与 Instruct：Instruct 初始表现更高、收敛更快，但两者都接受 RL 训练，最终表现接近。Appendix B.2 的 GRPO 参考配置是每 prompt 采样 5 条、500 steps、总 batch 512、8 张 H100、`temperature=1.0`、`top_p=1.0`。这与本项目的预算缩小版不能直接横比，也说明论文里的稳定多搜轨迹主要是训练结果，而不是要求未训练 parent 天然具备。
 
 ### 4.3 三种合同的直接对照
@@ -252,12 +276,13 @@ r_phi(x, y) = EM(a_pred, a_gold)
 | --- | --- | --- | --- |
 | 搜索动作 | `<search>query</search>` | Qwen `<tool_call><function=search>...` | 保持 Qwen 原生 tool call |
 | 检索回填 | `<information>...</information>` | `<tool_response>...</tool_response>` 新回合 | 保持 native 回填 |
-| 最终答案 | `<answer>answer text</answer>`，示例/案例通常很短 | 无标记自由文本 | `FINAL_ANSWER: <short answer>` |
-| 答案抽取 | 取最后一个 `<answer>` 内容 | 合法 marker-free 终局的整段文本 | 只取固定前缀后的内容 |
+| 最终答案 | `<answer>answer text</answer>`，示例/案例通常很短 | 无标记自由文本 | 恢复严格 `<answer>answer text</answer>` |
+| 答案抽取 | reasoning 后取最终 `<answer>` 内容 | 合法 marker-free 终局的整段文本 | 允许安全 reasoning prefix；只取唯一且位于末尾的 `<answer>` 内容 |
 | 正确性奖励 | 抽取后 strict EM | 该整段文本 strict EM；invalid 为 0 | 抽取后 strict EM |
-| 对搜索/RL 核心的影响 | 原论文 | 已完成 Qwen 适配 | 只修终局接口，不改搜索状态机 |
+| rollout budget | 论文 `B=4` 总 action；官方代码为 `max_turns` 个可检索 turn + terminal | 沿用官方代码和本项目已注册的 `max_turns=4` | v2 不再改预算状态机 |
+| 对搜索/RL 核心的影响 | 原论文/仓库基线 | 已完成 Qwen 适配 | 恢复论文终局抽取合同，并加 current-turn fail-closed 边界 |
 
-所以 native v2 不是放宽 EM，也不是为结果“改评分”；它只是为 Qwen 原生工具协议恢复与论文作用等价的窄答案抽取合同。
+因此 native v2 采用混合但边界清晰的最小适配：搜索交互使用 Qwen 原生协议，最终答案继续使用 Search-R1 原版 `<answer>` 合同。它不是放宽 EM，也不是为结果“改评分”，更不引入新的答案语法。
 
 ## 5. 可复核的完整轨迹举例
 
@@ -448,21 +473,40 @@ G2 的注册目标是动作格式、query 和闭环健康，因此 `EM=0/96` 不
 
 ## 7. 最小修复方案
 
-### 7.1 建立 Qwen native v2 最终答案合同
+### 7.1 恢复论文原版 `<answer>` 最终答案合同
 
-搜索仍使用 Qwen3.5 原生 `search` tool call，不增加 `finish` 工具，不改 Agent 搜索状态机。只把普通 assistant 终局固定为一行：
+搜索仍使用 Qwen3.5 原生 `search` tool call，不增加 `finish` 工具，不改官方仓库的 Agent 搜索状态机。普通 assistant 终局恢复为论文和原仓库已有的格式：
 
 ```text
-FINAL_ANSWER: <short answer>
+<answer>...</answer>
 ```
 
-对应改动仅包括：
+上面的省略号仅是文档元语法，不会作为字面占位符写入模型 prompt。上一轮已有模型照抄 `query` 占位符的直接证据，因此 v2 不在答案标签内部放 `short answer`、`xxx` 或 `Beijing` 示例。
 
-1. 将 prompt version 提升为 v2，并明确要求唯一一行短答案，不增加 few-shot 或复杂模板。
-2. parser 先剥离至多一个完整、平衡且内容只含空白的 leading `<think></think>`；非空、重复、嵌套或不平衡 thinking 仍拒绝。
-3. 剩余内容只能是一个完整 tool call，或唯一 `FINAL_ANSWER:` 行；只把冒号后的短文本送入 strict EM。
-4. 原始回复、thinking prefix、抽取答案和 parse error 全部继续保留在现有 trace 事件中。
-5. 不维护双 parser；旧 commit、prompt version 和原始 evidence 足以复算 v1 历史，新主路径只保留 v2 parser。
+为把新 G2 的 prompt 变量限制在最终答案边界，native v2 原样保留 v1 已验证的四句搜索文案，只替换最后一句 marker-free 终局要求。这里的 `Use at most four searches` 对应本项目已注册的 `max_turns=4`，是 Qwen adapter 的现状，不冒充论文 Table 1 原句；本轮不再同时试验另一套搜索决策 prompt：
+
+```text
+Call at most one tool per assistant turn. Use search when external evidence is
+needed. After each search result, decide whether another search is needed. Use at
+most four searches. When you have enough evidence, output the opening tag
+<answer>, then only the short final answer text, then the closing tag </answer>,
+and end the response. Do not combine a tool call with a final answer in the same
+assistant response, and do not output any text after the closing tag.
+```
+
+user message 仍只是 `Question: <question>\n`；tool schema 与固定 Qwen chat template 不变。Qwen3.5-2B 的已验证链路继续冻结在 non-thinking 模板，允许模型在 action 前保留普通 marker-free reasoning，但不再强迫它生成论文的 XML thinking 协议。该选择是为避免同时更换 thinking 模式，不是声称 Qwen3.5 或 5090 无法运行 thinking。
+
+对应改动严格限制为：
+
+1. 将 prompt version 提升为 `qwen35-native-search-v2-answer-tag`，不增加 few-shot、反思模板或新的搜索策略提示。
+2. answer 和 search 先共用同一个 safe-prefix 规范化：允许 marker-free reasoning，并可在最前面容忍至多一个内容仅含空白的完整 `<think>...</think>` echo；非空、重复、嵌套或不平衡 thinking、其他协议 marker，以及现有 `_looks_like_json_tool_call()` 可识别的 JSON-style tool call，全部拒绝。该窄规则只修复 G2 已观测的 empty-think 误判，不为 non-thinking 模式再引入第二套隐藏协议。
+3. 在 tool-call 判断之前识别唯一、非空且位于当前 assistant 回复末尾的 `<answer>...</answer>`；只把标签内部写入 `ParsedAction("answer", content)`，并像 search 分支一样单独保留前置 reasoning 供 trace 审计。
+4. answer content 内不得出现任何保留 marker 或可识别的 JSON-style tool call。空答案、多个或嵌套 answer、answer/tool-call 混合、`</answer>` 后非空正文以及旧 marker-free 自由文本终局全部判 invalid，不为通过门禁保留宽松 fallback。answer 不要求从回复第一个字符开始，避免把允许的 marker-free reasoning 错判为非法。
+5. 搜索分支继续使用现有 Qwen 原生 tool-call fullmatch，但改用第 2 条同一 prefix 规则；不重新启用 legacy `<search>`。
+6. native reward 继续读取现有 batch-aligned `final_answer` 并调用 `qa_em.em_check()`；不复用 legacy `qa_em.extract_solution()`，因为后者针对“含 prompt 示例的完整轨迹”并要求至少两个 answer match。
+7. native 路径不把 `</answer>` 注册成 stop string，也不复制 legacy 的 decode-truncate-reencode。HF generation 仍由 EOS 或 500-token 上限终止；parser 只能验证 decoded response 在 `</answer>` 后没有非空文本，不能反推模型一定生成了 EOS。尾随正文判 invalid，`response_clipped` 独立记录并纳入门禁，从而不改写 sampled token 与 PPO log-prob。
+8. 原始回复、thinking prefix、抽取答案和 parse error 全部继续保留在现有 trace 事件中，不修改 reward placement 或 trace schema。
+9. 不维护双 parser；旧 commit、prompt version 和原始 evidence 足以复算 v1 历史，新主路径只保留 v2 严格 parser。
 
 ### 7.2 保留 strict EM，补齐诊断指标
 
@@ -490,13 +534,15 @@ presence_penalty=0.0, repetition_penalty=1.0
 
 这会牺牲上一轮为提高生成多样性加入的 top-k/presence 参数，但避免实现大范围 processed-log-prob 张量链路，符合本项目的最小复现原则。由于采样分布改变，旧 G2 的良好工具行为不能直接外推，必须用相同训练分布重跑低成本门禁。
 
+native-v2 exact attempt 还必须锁定 group 5、train batch 8、response 500 和 observation 384。现有通用脚本中的 batch 4 或 response 384 OOM fallback 不得在同一实验身份下静默启用；若 2-step smoke 仍 OOM，则归档并停止，任何降配都要另立配置版本后重新走 readiness gate。
+
 ### 7.4 只做增量 CPU 重封
 
 新 prompt version、parser 和训练配置会使旧 handoff 失效，但不需要重新下载或构建全部资产。CPU 无卡阶段只执行：
 
 1. 将现有 G0-G2 原始 evidence 归档并校验哈希；人工答案审计并行物化为逐轨迹 ledger，绑定 rubric、source trace digest 和 SHA-256，但 ledger 未完成不阻塞 handoff。两者都不改变正式结论或门禁。
 2. 用相同 760 条样本、sample ID、顺序和配额重新物化 native v2 prompt。
-3. 运行 parser/reward golden tests、完整 pytest、shell 语法和 Hydra 配置展开。
+3. 运行 parser/reward golden tests、完整 pytest、shell 语法和 Hydra 配置展开；golden tests 必须覆盖 JSON tool call 出现在 answer prefix/content 的两个拒绝分支。
 4. 重新校验模型、语料、BM25、数据 manifest 和依赖 freeze。
 5. 发布绑定新 commit 与 prompt version 的 `cpu_handoff.json` 和 `cpu.ok`。
 
@@ -528,7 +574,9 @@ presence_penalty=0.0, repetition_penalty=1.0
 
 - 至少出现 1 条 strict-EM 正样本；
 - 至少出现 1 个 strict-EM mixed group；
-- `FINAL_ANSWER:` 抽取、trace 对齐和 reward 重放完全一致。
+- 唯一 terminal `<answer>...</answer>` 在带/不带安全 reasoning prefix 时均能严格抽取，trace 对齐和 reward 重放完全一致；
+- answer/search 对同一 empty-think echo 和 marker-free prefix 给出一致判定；
+- 不出现 marker-free 终局被静默当成合法答案的兼容路径。
 
 任何一项为零都停止，不进入 G3 或训练。
 
@@ -557,7 +605,7 @@ smoke 不通过则停止，不通过降门槛、盲降 batch 或直接跑 60 ste
 
 ### 8.4 R/B/C 分支关系与奖励公式不变
 
-2-step smoke 通过后才启动全参数 `R-mix60-native-v2`。R 完成后重新通过能力门，并要求至少 8/64 个 cost-contrast group；只有此时才从同一个 R checkpoint 对称训练：
+2-step smoke 通过后才启动全参数 `R-mix60-native-v2`。smoke 只保留验证证据；正式 R 必须从封存的 Qwen3.5-2B revision 全新启动，不继承 smoke 的模型权重、optimizer 或 scheduler，因为 2-step 与 60-step 的 scheduler horizon 不同。R 完成后重新通过能力门，并要求至少 8/64 个 cost-contrast group；只有此时才从同一个 R checkpoint 对称训练：
 
 ```text
 B-mix20-native-v2:       r = EM
@@ -566,21 +614,32 @@ C-gated-mix20-native-v2: r = EM * (1 - 0.10 * n_search / 4)
 
 B/C 继续共享 parent digest、数据顺序、seed、batch、group、长度、协议、检索器和步数。最终比较 strict EM、搜索次数、统一 utility、共同答对题搜索差，以及代表性完整轨迹。
 
-## 9. 明确不改的内容
+## 9. 论文不变量与必要适配
 
-为避免再次扩大实验空间，本轮固定：
+### 9.1 保持不变的论文合同与官方实现
 
-- 已后训练的 Qwen3.5-2B，全参数微调，不改 LoRA；
-- 两张 5090 级 GPU；
-- response 500、最多搜索 4 次；
-- train batch 8、GRPO group 5；
-- 固定 train-512/val-128 样本集合、NQ/Hotpot `37.5%/62.5%` 配比、既定 Hotpot comparison/bridge 配额和 seed；
-- Wiki-18 BM25 top-3、现有 corpus/index；
-- 学习率 `1e-6`、warmup 0.285 和已有显存配置；
-- G3、R 后能力门和 B/C 成功标准；
-- 每个 paid attempt 的 exact evidence、原始 exit code 与 watchdog 关机合同。
+- 最终答案严格使用 `<answer>...</answer>`，只对抽取内容计算 strict EM。
+- R 和 B 使用纯 outcome reward `r=EM`，不增加 format reward、substring reward 或 neural reward model。
+- 采用论文正式报告的 GRPO variant，而不是自创 RL 算法：每 prompt 采样 5 条，`temperature=1.0`、`top_p=1.0`、学习率 `1e-6`、warmup 0.285。
+- 每次检索返回 top-3，单轮 response 上限为 500 tokens；论文的 E5/BM25 差异和 retrieved-content 长度单独登记，不能混写成不变量。
+- 保留 retrieved-token loss mask、全参数微调、`KL=0.001`、clip ratio `0.2`、strict EM 规范化实现和官方仓库 Agent 主循环。
 
-不做模型 sweep、参数 sweep、多 seed、LLM judge、dense retriever、processed-proposal PPO 或通用训练平台。
+### 9.2 必要适配与显式保留的差异
+
+- **模型与工具接口**：用户指定已后训练的 Qwen3.5-2B；搜索和检索回填使用其原生 tool-call/chat-template。`enable_thinking=False` 不是模型或显卡硬限制，而是冻结已经通过 G0-G2 的 non-thinking 链路，避免在修答案边界时再改变 thinking 模式；普通 marker-free reasoning prefix 仍由 parser 和 trace 保留。
+- **答案示例**：保留论文 `<answer>` 语法，但实际 prompt 不放 `xxx`、`Beijing` 或 `short answer` 字面示例。历史轨迹已出现大量 `query`/`and` 占位符复制，删除示例是有直接证据的最小防干扰适配，不是新答案格式。
+- **native answer parser**：论文只规定从 response 抽取 final answer；官方 legacy `qa_em.extract_solution()` 才是在含 prompt 示例的完整轨迹中取最后一个 answer。native 当前 assistant 回合不再含该示例，因此只接受唯一、非空、位于末尾且 content 无保留 marker/JSON tool call 的 answer，并让 search/answer 共用同一 safe-prefix 规则。这是角色化回合所需的 fail-closed 适配，比 legacy last-match regex 更严格，不能称为逐字复用原 extractor。
+- **检索器**：论文和官方 [`retrieval_launch.sh`](../retrieval_launch.sh) 默认入口使用 Wiki-2018 + E5 dense；本项目因 100 GB 持久盘、既有资产和付费预算固定使用同语料 BM25 top-3。该差异可能影响绝对 EM、证据召回和搜索次数，是必须披露的高影响混杂；B/C 使用同一封存索引，只保证内部成本对照公平，不宣称复现论文榜单。
+- **保留的上游实现差异**：论文 Algorithm 1 的 `B=4` 是 search/answer/invalid 共用的总 action budget；官方主循环在当前 `max_turns=4` 配置下是 4 个允许真实检索的 turn，再给未终止样本 1 个 `do_search=False` terminal turn。本项目为避免改 Agent 核心循环而显式保留该差异：真实检索 `0..4` 次、generation action 最多 5 次；terminal search 不执行、不计成本。这不是 Qwen/硬件必需，也不是论文伪代码的同义改写。
+- **终止语义**：论文 XML rollout 检测闭标签即停止；native HF 路径不新增 stop string，也不做 decode-truncate-reencode。generation 由 EOS 或 500-token 上限结束；parser 要求 `</answer>` 后无非空文本，`response_clipped` 另行检查，不能声称 parser 验证了 EOS。
+- **上下文容量**：论文 retrieved content 和 total sequence 上限分别为 500/4096 tokens；本项目 observation 固定 384，使当前上游四搜加 terminal 路径的 policy right side 为 `4036`，initial left side 另按最多 1024 保存。它是当前代码路径的容量适配，不是论文 4096 total-sequence 的等价实现。
+- **rollout 后端与中性采样**：论文使用 vLLM；HF + SDPA 也不是 Qwen3.5/5090 硬限制，本项目只为复用已验证链路、避免新增后端变量而冻结它。`top_k=0`、`min_p=0.0`、`presence_penalty=0.0`、`repetition_penalty=1.0` 关闭论文未登记、且当前 HF 路径无法与 actor log-prob 一致重放的额外处理。GRPO loss、policy mask、KL 和 clip 公式不改。
+- **资源缩放**：论文为 8 张 H100、500 steps、总 batch 512、mini/micro batch 256/64；本项目计划锁定两张 5090 级 GPU、group 5、train batch 8、PPO mini/micro batch 40/2、R 60 steps、B/C 各 20 steps，不宣称等规模复现。native-v2 训练入口当前尚未解禁，这些是实现和 smoke 必须验证的计划值，不是已经生成的 resolved config。
+- **数据缩放**：固定 train-512/val-128、NQ/Hotpot `37.5%/62.5%`、既定 Hotpot comparison/bridge 配额和 seed；这是预算下提高多跳与成本对照密度的预注册子集，B/C 完全共享。
+- **研究变量**：C 分支仅把 B 的 `r=EM` 改为 `r=EM*(1-0.10*n_search/4)`；B/C 从同一个 R checkpoint 对称分叉，其余配置和样本顺序完全一致。
+- **付费运行安全**：G2/G3、2-step smoke、exact evidence、原始 exit code 和 watchdog 关机只用于止损与复算，不改变模型目标函数。
+
+除以上必要适配外，不做 LoRA、模型 sweep、参数 sweep、多 seed、LLM judge、临时切换 dense retriever、宽松答案匹配、processed-proposal PPO、额外 SFT 或通用训练平台。若新 G3 不通过，只归档结果；任何新训练阶段必须另立文档，不隐式并入本轮。
 
 ## 10. GO/NO-GO 与停止条件
 
@@ -628,8 +687,8 @@ G2 trace SHA-256:
 
 文档职责：
 
-- [`qwen35_native_tool_adaptation_plan.md`](qwen35_native_tool_adaptation_plan.md)：运行前的协议适配与 G0-G3 预注册计划；
-- [`qwen35_native_tool_adaptation_implementation_report.md`](qwen35_native_tool_adaptation_implementation_report.md)：运行前实现快照与 fail-closed 原因；
+- [`qwen35_native_tool_adaptation_plan.md`](qwen35_native_tool_adaptation_plan.md)：运行前的协议适配与 G0-G3 预注册计划；其中 marker-free 最终答案是 v1 历史设计，已由本文的严格 `<answer>` v2 合同取代；
+- [`qwen35_native_tool_adaptation_implementation_report.md`](qwen35_native_tool_adaptation_implementation_report.md)：运行前 v1 实现快照与 fail-closed 原因，不作为 v2 最终答案设计；
 - 本文：G0-G2 运行后的问题清单、新实验假设与训练解阻顺序；
 - [`autodl_search_r1_reproduction_plan.md`](autodl_search_r1_reproduction_plan.md)：R/B/C 总体实验不变量与最终比较标准；
 - [`成本感知坍缩分析与改进建议.md`](成本感知坍缩分析与改进建议.md)：提供历史坍缩证据与 correctness-gated 奖励设计依据；其中旧 parent、数据和三路回填安排不直接套用于 native-v2，当前执行顺序以本文和总体复现计划为准。
