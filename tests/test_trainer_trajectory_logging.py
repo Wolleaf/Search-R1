@@ -10,7 +10,9 @@ from search_r1.trajectory_trace import TraceJsonlWriter
 from verl import DataProto
 from verl.trainer.ppo.ray_trainer import (RayPPOTrainer,
                                           _compute_group_metrics,
-                                          _event_aligned_trace_turns)
+                                          _event_aligned_trace_turns,
+                                          _validate_qwen35_native_training_batch,
+                                          _validate_qwen35_native_training_contract)
 
 
 class _Tokenizer:
@@ -55,24 +57,231 @@ def test_native_protocol_requires_search_agent_loop_at_trainer_setup():
         )
 
 
-def test_native_protocol_rejects_unregistered_training_at_trainer_setup():
+def _native_training_config(variant='reproduce'):
+    variant_contracts = {
+        'smoke': (2, 0.0, 'linear'),
+        'reproduce': (60, 0.0, 'linear'),
+        'control': (20, 0.0, 'linear'),
+        'cost_aware_gated': (20, 0.10, 'correct_only'),
+    }
+    steps, cost_lambda, cost_mode = variant_contracts[variant]
+    return OmegaConf.create({
+        'tool_protocol': 'qwen35_native',
+        'do_search': True,
+        'qwen35_prompt_version': 'qwen35-native-search-v2-answer-tag',
+        'trainer': {
+            'val_only': False,
+            'native_training_variant': variant,
+            'total_training_steps': steps,
+        },
+        'algorithm': {
+            'adv_estimator': 'grpo',
+            'cost_lambda': cost_lambda,
+            'cost_reward_mode': cost_mode,
+        },
+        'actor_rollout_ref': {
+            'actor': {
+                'state_masking': True,
+                'ppo_mini_batch_size': 40,
+                'ppo_micro_batch_size': 2,
+            },
+            'rollout': {
+                'name': 'hf',
+                'do_sample': True,
+                'temperature': 1.0,
+                'top_p': 1.0,
+                'top_k': 0,
+                'min_p': 0.0,
+                'presence_penalty': 0.0,
+                'repetition_penalty': 1.0,
+                'n': 1,
+                'n_agent': 5,
+                'log_prob_micro_batch_size': 2,
+            },
+            'ref': {
+                'log_prob_micro_batch_size': 2,
+            },
+        },
+        'data': {
+            'train_batch_size': 8,
+            'return_raw_chat': True,
+            'max_prompt_length': 4096,
+            'max_response_length': 500,
+            'max_start_length': 1024,
+            'max_obs_length': 384,
+        },
+        'max_turns': 4,
+        'retriever': {
+            'topk': 3,
+        },
+    })
+
+
+@pytest.mark.parametrize('variant', [
+    'smoke', 'reproduce', 'control', 'cost_aware_gated'
+])
+def test_native_protocol_accepts_registered_training_contract(variant):
+    _validate_qwen35_native_training_contract(
+        _native_training_config(variant))
+
+
+def test_native_val_only_does_not_require_training_contract():
     config = OmegaConf.create({
         'tool_protocol': 'qwen35_native',
         'do_search': True,
         'trainer': {
-            'val_only': False,
+            'val_only': True,
         },
     })
 
-    with pytest.raises(ValueError, match=(
-            'qwen35_native training is disabled until its '
-            'sampling/log-prob contract is registered')):
-        RayPPOTrainer(
-            config=config,
-            tokenizer=None,
-            role_worker_mapping={},
-            resource_pool_manager=None,
-        )
+    _validate_qwen35_native_training_contract(config)
+
+
+@pytest.mark.parametrize(('path', 'value'), [
+    ('qwen35_prompt_version', 'qwen35-native-search-v1'),
+    ('trainer.native_training_variant', 'cost_aware'),
+    ('algorithm.adv_estimator', 'gae'),
+    ('actor_rollout_ref.rollout.name', 'vllm'),
+    ('actor_rollout_ref.rollout.do_sample', False),
+    ('actor_rollout_ref.rollout.temperature', 0.9),
+    ('actor_rollout_ref.rollout.top_p', 0.95),
+    ('actor_rollout_ref.rollout.top_k', 20),
+    ('actor_rollout_ref.rollout.min_p', 0.1),
+    ('actor_rollout_ref.rollout.presence_penalty', 2.0),
+    ('actor_rollout_ref.rollout.repetition_penalty', 1.1),
+    ('actor_rollout_ref.rollout.n', 2),
+    ('actor_rollout_ref.rollout.n_agent', 4),
+    ('actor_rollout_ref.actor.state_masking', False),
+    ('actor_rollout_ref.actor.ppo_mini_batch_size', 20),
+    ('actor_rollout_ref.actor.ppo_micro_batch_size', 1),
+    ('actor_rollout_ref.rollout.log_prob_micro_batch_size', 1),
+    ('actor_rollout_ref.ref.log_prob_micro_batch_size', 1),
+    ('data.train_batch_size', 4),
+    ('data.return_raw_chat', False),
+    ('data.max_prompt_length', 4036),
+    ('data.max_response_length', 384),
+    ('data.max_start_length', 512),
+    ('data.max_obs_length', 500),
+    ('trainer.total_training_steps', 59),
+    ('max_turns', 3),
+    ('retriever.topk', 5),
+])
+def test_native_protocol_rejects_training_contract_drift(path, value):
+    config = _native_training_config()
+    OmegaConf.update(config, path, value, merge=False)
+
+    with pytest.raises(ValueError, match=path.replace('.', r'\.')):
+        _validate_qwen35_native_training_contract(config)
+
+
+def test_native_protocol_binds_reward_to_training_variant():
+    config = _native_training_config('cost_aware_gated')
+    config.algorithm.cost_lambda = 0.0
+
+    with pytest.raises(ValueError, match=r'algorithm\.cost_lambda'):
+        _validate_qwen35_native_training_contract(config)
+
+
+def _native_training_batch():
+    responses = torch.tensor([[10, 11, 12], [20, 21, 0]])
+    attention_mask = torch.tensor([[1, 1, 1, 1, 1],
+                                   [1, 1, 1, 1, 0]])
+    info_mask = torch.tensor([[1, 1, 1, 0, 1],
+                              [1, 1, 1, 1, 0]])
+    loss_mask = info_mask[:, -responses.shape[1]:].clone()
+    return DataProto.from_dict({
+        'responses': responses,
+        'old_log_probs': torch.tensor([[-1.0, -2.0, -3.0],
+                                       [-1.5, -2.5, 0.0]]),
+        'advantages': torch.tensor([[1.0, 0.0, -1.0],
+                                    [0.5, -0.5, 0.0]]),
+        'token_level_rewards': torch.tensor([[0.0, 0.0, 1.0],
+                                             [0.0, 0.0, 0.0]]),
+        'attention_mask': attention_mask,
+        'info_mask': info_mask,
+        'loss_mask': loss_mask,
+    })
+
+
+def test_native_training_batch_contract_returns_auditable_metrics():
+    metrics = _validate_qwen35_native_training_batch(_native_training_batch())
+
+    assert metrics['native_batch/contract_valid'] == 1.0
+    assert metrics['native_batch/trajectories'] == 2.0
+    assert metrics['native_batch/response_width'] == 3.0
+    assert metrics['native_batch/policy_tokens'] == 4.0
+    assert metrics['native_batch/policy_tokens_min_per_trajectory'] == 2.0
+    assert metrics['native_batch/old_log_prob_finite_ratio'] == 1.0
+    assert metrics['native_batch/advantage_finite_ratio'] == 1.0
+    assert metrics['native_batch/reward_finite_ratio'] == 1.0
+    assert metrics['native_batch/nonzero_advantage_tokens'] == 4.0
+
+
+@pytest.mark.parametrize('key', [
+    'old_log_probs', 'advantages', 'token_level_rewards', 'loss_mask'
+])
+def test_native_training_batch_contract_rejects_response_shape_drift(key):
+    batch = _native_training_batch()
+    batch.batch[key] = batch.batch[key][:, :-1]
+
+    with pytest.raises(ValueError, match=key):
+        _validate_qwen35_native_training_batch(batch)
+
+
+def test_native_training_batch_contract_rejects_mask_shape_drift():
+    batch = _native_training_batch()
+    batch.batch['info_mask'] = batch.batch['info_mask'][:, :-1]
+
+    with pytest.raises(ValueError, match='attention_mask and info_mask'):
+        _validate_qwen35_native_training_batch(batch)
+
+
+def test_native_training_batch_contract_rejects_info_loss_mask_drift():
+    batch = _native_training_batch()
+    batch.batch['loss_mask'][0, 1] = 1
+
+    with pytest.raises(ValueError, match='loss_mask must equal'):
+        _validate_qwen35_native_training_batch(batch)
+
+
+def test_native_training_batch_contract_rejects_policy_outside_response():
+    batch = _native_training_batch()
+    batch.batch['attention_mask'][0, -1] = 0
+
+    with pytest.raises(ValueError, match='not a subset'):
+        _validate_qwen35_native_training_batch(batch)
+
+
+def test_native_training_batch_contract_rejects_empty_policy_trajectory():
+    batch = _native_training_batch()
+    batch.batch['info_mask'][1, -3:] = 0
+    batch.batch['loss_mask'][1] = 0
+
+    with pytest.raises(ValueError, match='nonempty for every trajectory'):
+        _validate_qwen35_native_training_batch(batch)
+
+
+@pytest.mark.parametrize(('key', 'value'), [
+    ('old_log_probs', float('nan')),
+    ('advantages', float('inf')),
+    ('token_level_rewards', float('-inf')),
+])
+def test_native_training_batch_contract_rejects_nonfinite_policy_values(
+        key, value):
+    batch = _native_training_batch()
+    batch.batch[key][0, 0] = value
+
+    with pytest.raises(ValueError, match=f'non-finite {key}'):
+        _validate_qwen35_native_training_batch(batch)
+
+
+def test_native_training_batch_records_zero_advantage_without_aborting():
+    batch = _native_training_batch()
+    batch.batch['advantages'].zero_()
+
+    metrics = _validate_qwen35_native_training_batch(batch)
+    assert metrics['native_batch/nonzero_advantage_tokens'] == 0.0
+    assert metrics['native_batch/advantage_abs_max'] == 0.0
 
 
 @pytest.mark.parametrize(('decoded_query', 'trailing_output'), [

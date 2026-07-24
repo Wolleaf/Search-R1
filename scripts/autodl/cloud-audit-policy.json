@@ -102,6 +102,18 @@
           ]
         }
       ]
+    },
+    {
+      "id": "gpu-qwen-native-train",
+      "path": "scripts/autodl/09_gpu_qwen_native_train.sh",
+      "documentation": [
+        {
+          "path": "scripts/autodl/README.md",
+          "required_literals": [
+            "/root/autodl-tmp/search-r1/checkout/scripts/autodl/09_gpu_qwen_native_train.sh"
+          ]
+        }
+      ]
     }
   ],
   "shutdown": {

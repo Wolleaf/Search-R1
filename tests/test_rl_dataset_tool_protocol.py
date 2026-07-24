@@ -65,7 +65,7 @@ def _dataset(monkeypatch, tokenizer, chats, **kwargs):
     return RLHFDataset(
         parquet_files=["unused.parquet"],
         tokenizer=tokenizer,
-        max_prompt_length=512,
+        max_prompt_length=1024,
         **kwargs,
     )
 

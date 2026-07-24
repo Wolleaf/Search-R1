@@ -16,6 +16,14 @@ import tempfile
 from typing import Any, Iterable, Mapping, Sequence
 
 
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+REWARD_SCORE_DIR = REPOSITORY_ROOT / "verl" / "utils" / "reward_score"
+if str(REWARD_SCORE_DIR) not in sys.path:
+    sys.path.insert(0, str(REWARD_SCORE_DIR))
+
+import qa_em  # noqa: E402
+
+
 SCHEMA = "search-r1.qwen-native-gate"
 SCHEMA_VERSION = 1
 STAGE_SHAPES = {
@@ -91,8 +99,10 @@ def load_json(path: Path) -> dict[str, Any]:
     return value
 
 
-def load_data_contract(manifest_path: Path, catalog_path: Path,
-                       stage: str) -> tuple[list[str], dict[str, str], list[str]]:
+def load_data_contract(
+        manifest_path: Path, catalog_path: Path,
+        stage: str) -> tuple[list[str], dict[str, str],
+                             dict[str, list[str]], list[str]]:
     manifest = load_json(manifest_path)
     prompt_contract = manifest.get("prompt_contract")
     if (manifest.get("schema_version") != 3
@@ -113,6 +123,7 @@ def load_data_contract(manifest_path: Path, catalog_path: Path,
         raise ValueError("catalog digest does not match the data manifest")
 
     questions: dict[str, str] = {}
+    gold_answers: dict[str, list[str]] = {}
     for record in load_jsonl(catalog_path):
         sample_id = record.get("sample_id")
         question = record.get("question")
@@ -120,7 +131,13 @@ def load_data_contract(manifest_path: Path, catalog_path: Path,
             raise ValueError("catalog sample IDs must be unique non-empty strings")
         if not isinstance(question, str) or not question.strip():
             raise ValueError(f"catalog question is invalid for {sample_id!r}")
+        answers = record.get("golden_answers")
+        if (not isinstance(answers, list) or not answers
+                or not all(isinstance(answer, str) and answer.strip()
+                           for answer in answers)):
+            raise ValueError(f"catalog golden answers are invalid for {sample_id!r}")
         questions[sample_id] = question.strip()
+        gold_answers[sample_id] = list(answers)
 
     def artifact_ids(label: str, rows: int) -> list[str]:
         artifact = artifacts.get(label)
@@ -139,7 +156,7 @@ def load_data_contract(manifest_path: Path, catalog_path: Path,
     question_count, _ = STAGE_SHAPES[stage]
     expected_ids = artifact_ids(STAGE_ARTIFACTS[stage], question_count)
     g0_ids = artifact_ids("probe_g0", 8) if stage == "g0_g1" else []
-    return expected_ids, questions, g0_ids
+    return expected_ids, questions, gold_answers, g0_ids
 
 
 def ratio(numerator: int, denominator: int) -> float:
@@ -199,6 +216,106 @@ def validate_traces(records: list[dict[str, Any]], stage: str,
     for sample_id, slots in groups.items():
         if slots != expected_slots:
             raise ValueError(f"group slots mismatch for {sample_id}: {sorted(slots)}")
+
+
+def replay_strict_exact_match(
+        records: Sequence[Mapping[str, Any]],
+        expected_gold_answers: Mapping[str, Sequence[str]],
+) -> dict[tuple[str, int], dict[str, Any]]:
+    replayed: dict[tuple[str, int], dict[str, Any]] = {}
+    for record in records:
+        key = trace_key(record)
+        catalog_gold = list(expected_gold_answers.get(key[0], ()))
+        if not catalog_gold:
+            raise ValueError(f"catalog gold answers are missing for {key}")
+        if record.get("gold_answers") != catalog_gold:
+            raise ValueError(f"trace gold answers do not match the catalog for {key}")
+
+        answer_fields = [
+            name for name in ("extracted_answer", "final_answer") if name in record
+        ]
+        if not answer_fields:
+            raise ValueError(f"trace has no extracted or final answer for {key}")
+        answer = record.get(answer_fields[0])
+        if any(record.get(name) != answer for name in answer_fields[1:]):
+            raise ValueError(f"trace extracted and final answers disagree for {key}")
+        if answer is not None and not isinstance(answer, str):
+            raise ValueError(f"trace answer must be a string or null for {key}")
+
+        # Match the training reward: a missing/blank extracted answer is always
+        # wrong, even when a gold answer normalizes to the empty string.
+        if answer is None or not answer.strip():
+            strict_em = 0
+            subem = 0
+        else:
+            strict_em = int(qa_em.em_check(answer, catalog_gold))
+            subem = int(qa_em.subem_check(answer, catalog_gold))
+        trace_em = record.get("em")
+        if (isinstance(trace_em, bool) or not isinstance(trace_em, (int, float))
+                or not math.isfinite(float(trace_em))
+                or float(trace_em) not in (0.0, 1.0)):
+            raise ValueError(f"trace EM must be exactly 0 or 1 for {key}")
+        if int(trace_em) != strict_em:
+            raise ValueError(f"trace EM does not match strict replay for {key}")
+        replayed[key] = {
+            "answer_field": answer_fields[0],
+            "answer": answer,
+            "catalog_gold_answers": catalog_gold,
+            "strict_em": strict_em,
+            "subem": subem,
+        }
+    return replayed
+
+
+def verify_g3_registered_outputs(
+        args: argparse.Namespace,
+        reward_replay: Mapping[tuple[str, int], Mapping[str, Any]],
+) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
+    """Bind the legacy G3 report to independently replayed strict EM."""
+    summary = load_json(args.output_dir / "summary.json")
+    decision = load_json(args.output_dir / "go_no_go.json")
+    reports = load_jsonl(args.output_dir / "per_trajectory.jsonl")
+    trace_digest = sha256_file(args.trace)
+    catalog_digest = sha256_file(args.catalog)
+
+    summary_input = summary.get("input")
+    overall = summary.get("overall")
+    if not isinstance(summary_input, Mapping) or not isinstance(overall, Mapping):
+        raise ValueError("registered G3 summary is incomplete")
+    expected_positive = sum(int(item["strict_em"])
+                            for item in reward_replay.values())
+    checks = {
+        "stage": summary_input.get("stage") == "qwen_native_g3",
+        "trace": summary_input.get("trace_sha256") == trace_digest,
+        "catalog": summary_input.get("catalog_sha256") == catalog_digest,
+        "checkpoint": summary_input.get("checkpoint_digest")
+        == args.expected_checkpoint_digest,
+        "correct_count": overall.get("correct_count") == expected_positive,
+        "decision": summary.get("decision") == decision.get("decision"),
+        "decision_trace": decision.get("trace_sha256") == trace_digest,
+        "decision_catalog": decision.get("catalog_sha256") == catalog_digest,
+        "decision_checkpoint": decision.get("checkpoint_digest")
+        == args.expected_checkpoint_digest,
+    }
+    failed = sorted(name for name, passed in checks.items() if not passed)
+    if failed:
+        raise ValueError("registered G3 output disagrees with strict EM replay: "
+                         + ", ".join(failed))
+
+    seen: set[tuple[str, int]] = set()
+    for report in reports:
+        key = trace_key(report)
+        if key in seen or key not in reward_replay:
+            raise ValueError(f"registered G3 report has an invalid identity: {key}")
+        seen.add(key)
+        replay = reward_replay[key]
+        if report.get("em") != replay["strict_em"]:
+            raise ValueError(
+                f"registered G3 report EM disagrees with strict replay for {key}")
+        report["strict_em_replay"] = dict(replay)
+    if seen != set(reward_replay):
+        raise ValueError("registered G3 reports do not cover the replayed trajectories")
+    return summary, decision, reports
 
 
 def query_is_degenerate(value: Any) -> bool:
@@ -284,9 +401,9 @@ def analyze_protocol_probe(directory: Path, expected_sample_ids: Sequence[str],
     expected_sampling = {
         "temperature": 1.0,
         "top_p": 1.0,
-        "top_k": 20,
+        "top_k": 0,
         "min_p": 0.0,
-        "presence_penalty": 2.0,
+        "presence_penalty": 0.0,
         "repetition_penalty": 1.0,
     }
     if resolved.get("sampling") != expected_sampling:
@@ -345,7 +462,8 @@ def analyze_protocol_probe(directory: Path, expected_sample_ids: Sequence[str],
     }, records
 
 
-def per_question(records: list[dict[str, Any]], diagnostics: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def per_question(records: list[dict[str, Any]],
+                 diagnostics: list[dict[str, Any]]) -> list[dict[str, Any]]:
     grouped: dict[str, list[tuple[dict[str, Any], dict[str, Any]]]] = defaultdict(list)
     for record, diagnostic in zip(records, diagnostics):
         grouped[str(record["sample_id"])].append((record, diagnostic))
@@ -353,9 +471,20 @@ def per_question(records: list[dict[str, Any]], diagnostics: list[dict[str, Any]
     for sample_id in sorted(grouped):
         members = grouped[sample_id]
         searches = [int(record["executed_search_count"]) for record, _ in members]
+        has_reward_replay = all(
+            "strict_em" in diagnostic and "subem" in diagnostic
+            for _, diagnostic in members)
+        strict_scores = [
+            int(diagnostic.get("strict_em", record.get("em", 0)))
+            for record, diagnostic in members
+        ]
+        subem_scores = [
+            int(diagnostic.get("subem", strict_score))
+            for strict_score, (_, diagnostic) in zip(strict_scores, members)
+        ]
         clean_correct_multi = [
-            record for record, _ in members
-            if int(record.get("em", 0)) == 1
+            record for record, diagnostic in members
+            if int(diagnostic.get("strict_em", record.get("em", 0))) == 1
             and int(record["executed_search_count"]) >= 2
             and int(record.get("invalid_action_count", 0)) == 0
             and record.get("response_clipped") is not True
@@ -366,24 +495,43 @@ def per_question(records: list[dict[str, Any]], diagnostics: list[dict[str, Any]
             and int(record.get("invalid_action_count", 0)) == 0
             and record.get("response_clipped") is not True
         ]
-        output.append({
+        question = {
             "sample_id": sample_id,
             "question": members[0][0].get("question"),
             "trajectory_count": len(members),
-            "correct_count": sum(int(record.get("em", 0)) == 1 for record, _ in members),
+            "correct_count": sum(strict_scores),
             "search_counts": searches,
             "valid_correct_multi_search_count": len(clean_correct_multi),
             "covered": bool(clean_correct_multi),
             "learnable": bool(clean_correct_multi and clean_wrong),
             "complete_two_search_chain_count": sum(
                 diagnostic["complete_two_search_chain"] for _, diagnostic in members),
-        })
+        }
+        if has_reward_replay:
+            question.update({
+                "strict_em_mixed": 0 < sum(strict_scores) < len(strict_scores),
+                "subem_positive_count": sum(subem_scores),
+                "subem_mixed": 0 < sum(subem_scores) < len(subem_scores),
+            })
+        output.append(question)
     return output
 
 
-def analyze_trace_stage(stage: str, records: list[dict[str, Any]]) -> tuple[
-        dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
+def analyze_trace_stage(
+        stage: str, records: list[dict[str, Any]],
+        reward_replay: Mapping[tuple[str, int], Mapping[str, Any]] | None = None
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
+    if stage == "g2" and reward_replay is None:
+        raise ValueError("G2 analysis requires independent strict EM replay")
     diagnostics = [trace_diagnostics(record) for record in records]
+    if reward_replay is not None:
+        for record, diagnostic in zip(records, diagnostics):
+            key = trace_key(record)
+            replay = reward_replay.get(key)
+            if replay is None:
+                raise ValueError(f"strict EM replay is missing for {key}")
+            diagnostic["strict_em"] = int(replay["strict_em"])
+            diagnostic["subem"] = int(replay["subem"])
     questions = per_question(records, diagnostics)
     if stage == "g0_g1":
         legal = sum(item["first_action_legal"] for item in diagnostics)
@@ -413,10 +561,15 @@ def analyze_trace_stage(stage: str, records: list[dict[str, Any]]) -> tuple[
         searches = sum(item["search_turn_count"] for item in diagnostics)
         degenerate = sum(item["degenerate_search_count"] for item in diagnostics)
         max_degenerate = math.floor(searches * 0.02)
+        strict_em_count = sum(item["strict_em"] for item in diagnostics)
+        strict_em_mixed_groups = sum(item["strict_em_mixed"] for item in questions)
+        subem_count = sum(item["subem"] for item in diagnostics)
         criteria = {
             "invalid_trajectory_count": criterion(invalid, "<=", 5),
             "clipped_trajectory_count": criterion(clipped, "<=", 5),
             "degenerate_search_count": criterion(degenerate, "<=", max_degenerate),
+            "strict_em_positive_count": criterion(strict_em_count, ">=", 1),
+            "strict_em_mixed_group_count": criterion(strict_em_mixed_groups, ">=", 1),
         }
         overall = {
             "invalid_trajectory_count": invalid,
@@ -427,14 +580,24 @@ def analyze_trace_stage(stage: str, records: list[dict[str, Any]]) -> tuple[
             "query_relevant_count": sum(item["query_relevant_count"] for item in diagnostics),
             "complete_two_search_chain_count": sum(
                 item["complete_two_search_chain"] for item in diagnostics),
+            "strict_em_positive_count": strict_em_count,
+            "strict_em_mixed_group_count": strict_em_mixed_groups,
+            "subem_positive_count": subem_count,
+            "subem_mixed_group_count": sum(item["subem_mixed"] for item in questions),
         }
     overall["repeated_query_count"] = sum(item["repeated_query_count"] for item in diagnostics)
     overall["non_ascii_query_count"] = sum(item["non_ascii_query_count"] for item in diagnostics)
-    overall["em_count"] = sum(int(record.get("em", 0)) == 1 for record in records)
+    overall["em_count"] = sum(
+        int(diagnostic.get("strict_em", record.get("em", 0))) == 1
+        for record, diagnostic in zip(records, diagnostics))
     overall["em"] = ratio(overall["em_count"], len(records))
     overall["criteria"] = criteria
-    decorated = [{"trace": record, "diagnostics": diagnostic}
-                 for record, diagnostic in zip(records, diagnostics)]
+    decorated = []
+    for record, diagnostic in zip(records, diagnostics):
+        item = {"trace": record, "diagnostics": diagnostic}
+        if reward_replay is not None:
+            item["reward_replay"] = dict(reward_replay[trace_key(record)])
+        decorated.append(item)
     return overall, decorated, questions
 
 
@@ -451,24 +614,61 @@ def analyze_g3_with_registered_gate(args: argparse.Namespace) -> int:
 
 def write_outputs(args: argparse.Namespace, expected_ids: Sequence[str],
                   expected_questions: Mapping[str, str],
+                  expected_gold_answers: Mapping[str, Sequence[str]],
                   g0_ids: Sequence[str]) -> dict[str, Any]:
     if args.stage == "g3":
-        rc = analyze_g3_with_registered_gate(args)
-        if rc != 0:
-            raise ValueError(f"registered G3 analyzer failed with exit code {rc}")
-        summary = load_json(args.output_dir / "summary.json")
-        if summary.get("input", {}).get("stage") != "qwen_native_g3":
-            raise ValueError("registered G3 output has the wrong trace stage")
-        decision = load_json(args.output_dir / "go_no_go.json")
-        decision["stage"] = "g3"
-        atomic_write(args.output_dir / "go_no_go.json",
-                     canonical_bytes(decision))
+        records = load_jsonl(args.trace)
+        validate_traces(records, args.stage, args.expected_checkpoint_digest,
+                        expected_ids, expected_questions)
+        reward_replay = replay_strict_exact_match(records,
+                                                   expected_gold_answers)
+        output = args.output_dir
+        if output.exists() or output.is_symlink():
+            raise ValueError(f"refusing to overwrite output directory: {output}")
+        output.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(
+                prefix=f".{output.name}.verified-", dir=output.parent) as temporary:
+            staged_args = argparse.Namespace(**vars(args))
+            staged_args.output_dir = Path(temporary) / "registered-output"
+            rc = analyze_g3_with_registered_gate(staged_args)
+            if rc != 0:
+                raise ValueError(
+                    f"registered G3 analyzer failed with exit code {rc}")
+            summary, decision, reports = verify_g3_registered_outputs(
+                staged_args, reward_replay)
+            replay_summary = {
+                "schema": "search-r1.strict-em-replay",
+                "schema_version": 1,
+                "source": "catalog.golden_answers+trace.extracted_answer/final_answer",
+                "verified": True,
+                "trajectory_count": len(reward_replay),
+                "strict_em_positive_count": sum(
+                    int(item["strict_em"]) for item in reward_replay.values()),
+                "subem_positive_count": sum(
+                    int(item["subem"]) for item in reward_replay.values()),
+                "trace_sha256": sha256_file(args.trace),
+                "catalog_sha256": sha256_file(args.catalog),
+            }
+            summary["strict_em_replay"] = replay_summary
+            decision["stage"] = "g3"
+            decision["strict_em_replay"] = replay_summary
+            atomic_write(staged_args.output_dir / "summary.json",
+                         canonical_bytes(summary))
+            atomic_write(staged_args.output_dir / "go_no_go.json",
+                         canonical_bytes(decision))
+            atomic_write(
+                staged_args.output_dir / "per_trajectory.jsonl",
+                b"".join(canonical_bytes(report) for report in reports))
+            os.replace(staged_args.output_dir, output)
         return decision
 
     records = load_jsonl(args.trace)
     validate_traces(records, args.stage, args.expected_checkpoint_digest,
                     expected_ids, expected_questions)
-    overall, decorated, questions = analyze_trace_stage(args.stage, records)
+    reward_replay = (replay_strict_exact_match(records, expected_gold_answers)
+                     if args.stage == "g2" else None)
+    overall, decorated, questions = analyze_trace_stage(
+        args.stage, records, reward_replay)
     protocol = None
     protocol_records: list[dict[str, Any]] = []
     if args.stage == "g0_g1":
@@ -527,6 +727,11 @@ def write_outputs(args: argparse.Namespace, expected_ids: Sequence[str],
         "## Criteria",
         "",
     ]
+    if args.stage == "g2":
+        lines.insert(
+            7,
+            f"- SubEM (diagnostic only): {overall['subem_positive_count']}/{len(records)}",
+        )
     for name, item in all_criteria.items():
         lines.append(
             f"- {name}: {item['observed']} {item['comparison']} {item['threshold']} "
@@ -552,11 +757,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if not re.fullmatch(r"[0-9a-f]{64}", args.expected_checkpoint_digest):
             raise ValueError("expected checkpoint digest must be 64 lowercase hex")
-        expected_ids, expected_questions, g0_ids = load_data_contract(
-            args.data_manifest, args.catalog, args.stage)
+        (expected_ids, expected_questions, expected_gold_answers,
+         g0_ids) = load_data_contract(args.data_manifest, args.catalog,
+                                      args.stage)
         if args.stage != "g3":
             args.output_dir.mkdir(parents=True, exist_ok=False)
-        result = write_outputs(args, expected_ids, expected_questions, g0_ids)
+        result = write_outputs(args, expected_ids, expected_questions,
+                               expected_gold_answers, g0_ids)
     except (OSError, ValueError, json.JSONDecodeError) as error:
         print(f"Qwen native gate analysis error: {error}", file=sys.stderr)
         return 1

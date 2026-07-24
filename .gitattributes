@@ -18,4 +18,7 @@ docs/results/grouped-probe-20260723/results/** -text -diff
 docs/results/grouped-probe-20260723/eval/** -text -diff
 docs/results/grouped-probe-20260723/failed-phase/** -text -diff
 docs/results/grouped-probe-20260723/analysis/** -text -diff
+docs/results/qwen35-native-gates-v1-20260724/README.md text eol=lf
+docs/results/qwen35-native-gates-v1-20260724/archive.sha256 text eol=lf
+docs/results/qwen35-native-gates-v1-20260724/raw/** -text -diff
 docs/*.pdf -text -diff

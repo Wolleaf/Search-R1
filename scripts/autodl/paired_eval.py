@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate and pair B/C-old/C-gated per-question evaluation traces."""
+"""Validate and pair control with one or two cost-aware evaluation traces."""
 
 from __future__ import annotations
 
@@ -10,8 +10,17 @@ import hashlib
 import json
 import math
 from pathlib import Path
+import re
 import sys
 from typing import Any
+
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+REWARD_SCORE_DIR = REPOSITORY_ROOT / "verl" / "utils" / "reward_score"
+if str(REWARD_SCORE_DIR) not in sys.path:
+    sys.path.insert(0, str(REWARD_SCORE_DIR))
+
+import qa_em  # noqa: E402
 
 
 REQUIRED_FIELDS = frozenset({
@@ -36,6 +45,11 @@ CATEGORY_ORDER = (
     "baseline_wrong_candidate_correct",
     "both_wrong",
 )
+FORMAL_STAGE_NAMES = {
+    "control": "qwen_native_b",
+    "cost_aware_gated": "qwen_native_c",
+}
+SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _sample_key(sample_id: str | int) -> tuple[str, str | int]:
@@ -47,6 +61,135 @@ def _sample_key(sample_id: str | int) -> tuple[str, str | int]:
             raise ValueError("sample_id must not be empty")
         return ("str", sample_id)
     return ("int", sample_id)
+
+
+def _require_sha256(value: Any, field: str) -> str:
+    if not isinstance(value, str) or SHA256_PATTERN.fullmatch(value) is None:
+        raise ValueError(f"{field} must be a lowercase 64-character SHA-256 digest")
+    return value
+
+
+def _load_formal_contract(args: argparse.Namespace) -> dict[str, Any] | None:
+    values = {
+        "data_manifest": getattr(args, "data_manifest", None),
+        "control_digest": getattr(
+            args, "expected_control_checkpoint_digest", None
+        ),
+        "cost_digest": getattr(
+            args, "expected_cost_aware_gated_checkpoint_digest", None
+        ),
+    }
+    supplied = {name: value is not None for name, value in values.items()}
+    if any(supplied.values()) and not all(supplied.values()):
+        missing = sorted(name for name, present in supplied.items() if not present)
+        raise ValueError(
+            "formal paired evaluation arguments are all-or-none; missing "
+            + ", ".join(missing)
+        )
+    if not any(supplied.values()):
+        return None
+    if getattr(args, "cost_aware_old", None) is not None:
+        raise ValueError("formal paired evaluation accepts only control and cost_aware_gated")
+    if args.expected_rows != 128:
+        raise ValueError("formal paired evaluation is fixed to sealed val_128")
+
+    control_digest = _require_sha256(
+        values["control_digest"], "expected control checkpoint digest"
+    )
+    cost_digest = _require_sha256(
+        values["cost_digest"], "expected cost-aware-gated checkpoint digest"
+    )
+    manifest_path = Path(values["data_manifest"])
+    try:
+        manifest = json.loads(manifest_path.read_bytes())
+    except json.JSONDecodeError as error:
+        raise ValueError(
+            f"invalid data manifest JSON in {manifest_path}: {error.msg}"
+        ) from error
+    if not isinstance(manifest, dict):
+        raise ValueError("formal data manifest must be a JSON object")
+    if manifest.get("schema_version") != 3:
+        raise ValueError("formal data manifest schema_version must be 3")
+    prompt_contract = manifest.get("prompt_contract")
+    if (
+        not isinstance(prompt_contract, dict)
+        or prompt_contract.get("tool_protocol") != "qwen35_native"
+    ):
+        raise ValueError(
+            "formal data manifest must bind tool_protocol qwen35_native"
+        )
+
+    artifacts = manifest.get("artifacts")
+    if not isinstance(artifacts, dict):
+        raise ValueError("formal data manifest artifacts must be an object")
+    catalog_artifact = artifacts.get("catalog")
+    if not isinstance(catalog_artifact, dict):
+        raise ValueError("formal data manifest has no catalog artifact")
+    if catalog_artifact.get("file") != "catalog.jsonl":
+        raise ValueError("formal catalog artifact file must be catalog.jsonl")
+    catalog_digest = _require_sha256(
+        catalog_artifact.get("sha256"), "formal catalog artifact sha256"
+    )
+    catalog_argument = getattr(args, "catalog", None)
+    if catalog_argument is None:
+        raise ValueError("formal paired evaluation requires --catalog")
+    catalog_path = Path(catalog_argument).resolve()
+    expected_catalog_path = manifest_path.resolve().parent / "catalog.jsonl"
+    if catalog_path != expected_catalog_path:
+        raise ValueError(
+            "catalog path does not match the catalog bound by the data manifest"
+        )
+    actual_catalog_digest = _file_sha256(catalog_path)
+    if actual_catalog_digest != catalog_digest:
+        raise ValueError(
+            "catalog digest does not match the catalog bound by the data manifest"
+        )
+
+    val_artifact = artifacts.get("val")
+    if not isinstance(val_artifact, dict):
+        raise ValueError("formal data manifest has no val artifact")
+    if val_artifact.get("file") != "val_128.parquet":
+        raise ValueError("formal val artifact file must be val_128.parquet")
+    if val_artifact.get("rows") != args.expected_rows:
+        raise ValueError(
+            "formal val artifact row count does not match expected_rows"
+        )
+    _require_sha256(val_artifact.get("sha256"), "formal val artifact sha256")
+    sample_ids = val_artifact.get("sample_ids")
+    if not isinstance(sample_ids, list) or len(sample_ids) != args.expected_rows:
+        raise ValueError(
+            "formal val artifact sample_ids must contain exactly expected_rows IDs"
+        )
+    sample_keys = [_sample_key(sample_id) for sample_id in sample_ids]
+    if len(set(sample_keys)) != len(sample_keys):
+        raise ValueError("formal val artifact sample_ids must be unique by type and value")
+    sample_ids_digest = hashlib.sha256(
+        json.dumps(
+            sample_ids, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
+    return {
+        "manifest_path": manifest_path.resolve(),
+        "manifest_sha256": _file_sha256(manifest_path),
+        "catalog_path": catalog_path,
+        "catalog_sha256": catalog_digest,
+        "sample_keys": frozenset(sample_keys),
+        "sample_ids_sha256": sample_ids_digest,
+        "control_digest": control_digest,
+        "cost_digest": cost_digest,
+    }
+
+
+def _active_role_arguments(args: argparse.Namespace) -> tuple[tuple[str, str], ...]:
+    if getattr(args, "control", None) is None:
+        raise ValueError("control trace is required")
+    if getattr(args, "cost_aware_gated", None) is None:
+        raise ValueError("cost_aware_gated trace is required")
+    roles = [ROLE_ARGUMENTS[0]]
+    if getattr(args, "cost_aware_old", None) is not None:
+        roles.append(ROLE_ARGUMENTS[1])
+    roles.append(ROLE_ARGUMENTS[2])
+    return tuple(roles)
 
 
 def _number(value: Any, field: str, location: str) -> float:
@@ -174,6 +317,99 @@ def read_stage(
         raise ValueError(f"expected one stage value in {path}, found {sorted(stages)}")
     assert schema is not None
     return records, schema, next(iter(stages))
+
+
+def read_catalog(
+    path: Path, expected_rows: int
+) -> dict[tuple[str, str | int], dict[str, Any]]:
+    catalog: dict[tuple[str, str | int], dict[str, Any]] = {}
+    with path.open(encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, 1):
+            if not line.strip():
+                raise ValueError(f"blank JSONL record in {path}:{line_number}")
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise ValueError(
+                    f"invalid JSON in {path}:{line_number}: {error.msg}"
+                ) from error
+            location = f"{path}:{line_number}"
+            if not isinstance(record, dict):
+                raise ValueError(f"catalog record must be an object in {location}")
+            missing = sorted(
+                {"sample_id", "question", "golden_answers"} - record.keys()
+            )
+            if missing:
+                raise ValueError(
+                    f"missing catalog fields in {location}: {', '.join(missing)}"
+                )
+            key = _sample_key(record["sample_id"])
+            if key in catalog:
+                raise ValueError(
+                    f"duplicate catalog sample_id {record['sample_id']!r} in {path}"
+                )
+            question = record["question"]
+            if not isinstance(question, str) or not question.strip():
+                raise ValueError(f"catalog question must be non-empty in {location}")
+            answers = record["golden_answers"]
+            if (
+                not isinstance(answers, list)
+                or not answers
+                or not all(
+                    isinstance(answer, str) and answer.strip() for answer in answers
+                )
+            ):
+                raise ValueError(
+                    f"catalog golden_answers must be a non-empty string list in {location}"
+                )
+            catalog[key] = {
+                "sample_id": record["sample_id"],
+                "question": question,
+                "golden_answers": list(answers),
+            }
+    if len(catalog) < expected_rows:
+        raise ValueError(
+            f"expected at least {expected_rows} rows in {path}, "
+            f"found {len(catalog)}"
+        )
+    return catalog
+
+
+def validate_catalog_replay(
+    records_by_role: dict[
+        str, dict[tuple[str, str | int], dict[str, Any]]
+    ],
+    catalog: dict[tuple[str, str | int], dict[str, Any]],
+) -> None:
+    catalog_ids = set(catalog)
+    for role, records in records_by_role.items():
+        role_ids = set(records)
+        if not role_ids.issubset(catalog_ids):
+            missing = sorted(role_ids - catalog_ids)[:5]
+            catalog_only = sorted(catalog_ids - role_ids)[:5]
+            raise ValueError(
+                f"sample-set mismatch between catalog and {role}; "
+                f"missing_from_catalog={missing}, catalog_only={catalog_only}"
+            )
+        for sample_key in sorted(role_ids):
+            record = records[sample_key]
+            expected = catalog[sample_key]
+            sample_id = record["sample_id"]
+            if record["question"] != expected["question"]:
+                raise ValueError(
+                    f"question mismatch with catalog for sample_id {sample_id!r} in {role}"
+                )
+            if record["gold_answers"] != expected["golden_answers"]:
+                raise ValueError(
+                    f"gold_answers mismatch with catalog for sample_id {sample_id!r} in {role}"
+                )
+            prediction = record["extracted_answer"] or ""
+            strict_em = int(qa_em.em_check(prediction, expected["golden_answers"]))
+            if record["em"] != strict_em:
+                raise ValueError(
+                    f"strict EM mismatch with catalog replay for sample_id "
+                    f"{sample_id!r} in {role}: trace={record['em']}, replay={strict_em}"
+                )
 
 
 def _file_sha256(path: Path) -> str:
@@ -325,7 +561,8 @@ def _summary_markdown(summary: dict[str, Any]) -> str:
     lines = [
         "# Paired Evaluation Summary",
         "",
-        f"All three stages contain the same {summary['expected_rows']} test samples. "
+        f"All {len(summary['stages'])} active stages contain the same "
+        f"{summary['expected_rows']} test samples. "
         f"Utility is `EM - {summary['cost_lambda']:.2f} * searches / "
         f"{summary['max_searches']}`.",
         "",
@@ -334,8 +571,7 @@ def _summary_markdown(summary: dict[str, Any]) -> str:
         "| Role | Stage | N | K | S | EM | Mean searches | E[S|correct] | E[S|wrong] | Utility |",
         "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
-    for role, _ in ROLE_ARGUMENTS:
-        stage = summary["stages"][role]
+    for role, stage in summary["stages"].items():
         lines.append(
             f"| {role} | {stage['stage']} | {stage['N']} | {stage['K_correct']} | "
             f"{stage['S_total_searches']} | {stage['EM']:.4f} | "
@@ -351,8 +587,7 @@ def _summary_markdown(summary: dict[str, Any]) -> str:
         "baseline_wrong_candidate_correct": "B wrong, candidate correct",
         "both_wrong": "Both wrong",
     }
-    for candidate_role in ("cost_aware_old", "cost_aware_gated"):
-        comparison = summary["comparisons"][candidate_role]
+    for candidate_role, comparison in summary["comparisons"].items():
         lines.extend([
             "",
             f"## Control vs {candidate_role}",
@@ -398,11 +633,15 @@ def analyze(args: argparse.Namespace) -> None:
     if not math.isfinite(args.utility_tolerance) or args.utility_tolerance < 0:
         raise ValueError("utility_tolerance must be finite and non-negative")
 
-    paths = {role: Path(getattr(args, role)) for role, _ in ROLE_ARGUMENTS}
+    formal_contract = _load_formal_contract(args)
+    role_arguments = _active_role_arguments(args)
+    active_roles = tuple(role for role, _ in role_arguments)
+    candidate_roles = active_roles[1:]
+    paths = {role: Path(getattr(args, role)) for role in active_roles}
     records_by_role: dict[str, dict[tuple[str, str | int], dict[str, Any]]] = {}
     schemas: dict[str, frozenset[str]] = {}
     stage_names: dict[str, str] = {}
-    for role, _ in ROLE_ARGUMENTS:
+    for role in active_roles:
         records, schema, stage_name = read_stage(
             paths[role],
             args.expected_rows,
@@ -415,7 +654,7 @@ def analyze(args: argparse.Namespace) -> None:
         stage_names[role] = stage_name
 
     control_schema = schemas["control"]
-    for role, _ in ROLE_ARGUMENTS[1:]:
+    for role in candidate_roles:
         if schemas[role] != control_schema:
             raise ValueError(
                 f"schema mismatch between control and {role}; "
@@ -424,9 +663,27 @@ def analyze(args: argparse.Namespace) -> None:
             )
     if len(set(stage_names.values())) != len(stage_names):
         raise ValueError(f"stage values must be distinct across inputs: {stage_names}")
+    if formal_contract is not None:
+        for role, expected_stage in FORMAL_STAGE_NAMES.items():
+            if stage_names[role] != expected_stage:
+                raise ValueError(
+                    f"formal {role} stage must be {expected_stage}, "
+                    f"found {stage_names[role]}"
+                )
+        expected_digests = {
+            "control": formal_contract["control_digest"],
+            "cost_aware_gated": formal_contract["cost_digest"],
+        }
+        for role, expected_digest in expected_digests.items():
+            for record in records_by_role[role].values():
+                if record.get("checkpoint_digest") != expected_digest:
+                    raise ValueError(
+                        f"formal {role} checkpoint_digest does not match "
+                        f"the selected endpoint for sample_id {record['sample_id']!r}"
+                    )
 
     control_ids = set(records_by_role["control"])
-    for role, _ in ROLE_ARGUMENTS[1:]:
+    for role in candidate_roles:
         role_ids = set(records_by_role[role])
         if role_ids != control_ids:
             missing = sorted(control_ids - role_ids)[:5]
@@ -435,12 +692,28 @@ def analyze(args: argparse.Namespace) -> None:
                 f"sample-set mismatch between control and {role}; "
                 f"missing={missing}, extra={extra}"
             )
+    if (
+        formal_contract is not None
+        and control_ids != formal_contract["sample_keys"]
+    ):
+        missing = sorted(formal_contract["sample_keys"] - control_ids)[:5]
+        extra = sorted(control_ids - formal_contract["sample_keys"])[:5]
+        raise ValueError(
+            "formal trace sample-set does not exactly match manifest val_128; "
+            f"missing={missing}, extra={extra}"
+        )
+
+    catalog_argument = getattr(args, "catalog", None)
+    catalog_path = Path(catalog_argument) if catalog_argument is not None else None
+    if catalog_path is not None:
+        catalog = read_catalog(catalog_path, args.expected_rows)
+        validate_catalog_replay(records_by_role, catalog)
 
     paired: list[dict[str, dict[str, Any]]] = []
     for sample_key in sorted(control_ids):
-        row = {role: records_by_role[role][sample_key] for role, _ in ROLE_ARGUMENTS}
+        row = {role: records_by_role[role][sample_key] for role in active_roles}
         baseline = row["control"]
-        for role, _ in ROLE_ARGUMENTS[1:]:
+        for role in candidate_roles:
             candidate = row[role]
             if candidate["question"] != baseline["question"]:
                 raise ValueError(
@@ -454,7 +727,7 @@ def analyze(args: argparse.Namespace) -> None:
 
     optional_fields = [field for field in PASSTHROUGH_FIELDS if field in control_schema]
     paired_fields = ["sample_id", "question", "gold_answers"]
-    for role, _ in ROLE_ARGUMENTS:
+    for role in active_roles:
         paired_fields.extend([
             f"{role}_stage",
             f"{role}_extracted_answer",
@@ -463,14 +736,12 @@ def analyze(args: argparse.Namespace) -> None:
             f"{role}_posthoc_utility",
         ])
         paired_fields.extend(f"{role}_{field}" for field in optional_fields)
-    paired_fields.extend([
-        "cost_aware_old_category_vs_control",
-        "cost_aware_old_search_delta_vs_control",
-        "cost_aware_old_utility_delta_vs_control",
-        "cost_aware_gated_category_vs_control",
-        "cost_aware_gated_search_delta_vs_control",
-        "cost_aware_gated_utility_delta_vs_control",
-    ])
+    for candidate_role in candidate_roles:
+        paired_fields.extend([
+            f"{candidate_role}_category_vs_control",
+            f"{candidate_role}_search_delta_vs_control",
+            f"{candidate_role}_utility_delta_vs_control",
+        ])
     paired_csv_rows = []
     for row in paired:
         baseline = row["control"]
@@ -479,7 +750,7 @@ def analyze(args: argparse.Namespace) -> None:
             "question": baseline["question"],
             "gold_answers": _csv_value("gold_answers", baseline["gold_answers"]),
         }
-        for role, _ in ROLE_ARGUMENTS:
+        for role in active_roles:
             record = row[role]
             for field in (
                 "stage",
@@ -490,7 +761,7 @@ def analyze(args: argparse.Namespace) -> None:
                 *optional_fields,
             ):
                 output[f"{role}_{field}"] = _csv_value(field, record[field])
-        for candidate_role in ("cost_aware_old", "cost_aware_gated"):
+        for candidate_role in candidate_roles:
             candidate = row[candidate_role]
             output[f"{candidate_role}_category_vs_control"] = _category(
                 baseline["em"], candidate["em"]
@@ -516,7 +787,7 @@ def analyze(args: argparse.Namespace) -> None:
     ]
     correctness_rows: dict[int, list[dict[str, Any]]] = {0: [], 1: []}
     for row in paired:
-        for role, _ in ROLE_ARGUMENTS:
+        for role in active_roles:
             record = row[role]
             output = {
                 "role": role,
@@ -531,7 +802,7 @@ def analyze(args: argparse.Namespace) -> None:
     transition_counts: Counter[tuple[str, str, int, int]] = Counter()
     for row in paired:
         baseline = row["control"]
-        for candidate_role in ("cost_aware_old", "cost_aware_gated"):
+        for candidate_role in candidate_roles:
             candidate = row[candidate_role]
             transition_counts[
                 (
@@ -542,7 +813,7 @@ def analyze(args: argparse.Namespace) -> None:
                 )
             ] += 1
     transition_rows = []
-    for candidate_role in ("cost_aware_old", "cost_aware_gated"):
+    for candidate_role in candidate_roles:
         for category in CATEGORY_ORDER:
             keys = sorted(
                 key
@@ -575,15 +846,53 @@ def analyze(args: argparse.Namespace) -> None:
                 "path": str(paths[role].resolve()),
                 "sha256": _file_sha256(paths[role]),
             }
-            for role, _ in ROLE_ARGUMENTS
+            for role in active_roles
         },
         "stages": {},
         "comparisons": {},
     }
-    for role, _ in ROLE_ARGUMENTS:
+    if catalog_path is not None:
+        summary["catalog"] = {
+            "path": str(catalog_path.resolve()),
+            "sha256": _file_sha256(catalog_path),
+            "row_count": len(catalog),
+            "matched_rows": len(control_ids),
+            "replay_status": "passed",
+            "strict_em_scorer": "qa_em.em_check",
+        }
+    if formal_contract is not None:
+        summary["formal_contract"] = {
+            "mode": "qwen35_native_v2_b_c",
+            "data_manifest": {
+                "path": str(formal_contract["manifest_path"]),
+                "sha256": formal_contract["manifest_sha256"],
+                "schema_version": 3,
+            },
+            "catalog": {
+                "path": str(formal_contract["catalog_path"]),
+                "sha256": formal_contract["catalog_sha256"],
+            },
+            "val": {
+                "file": "val_128.parquet",
+                "rows": args.expected_rows,
+                "sample_ids_sha256": formal_contract["sample_ids_sha256"],
+                "sample_set_status": "exact",
+            },
+            "endpoints": {
+                "control": {
+                    "stage": FORMAL_STAGE_NAMES["control"],
+                    "checkpoint_digest": formal_contract["control_digest"],
+                },
+                "cost_aware_gated": {
+                    "stage": FORMAL_STAGE_NAMES["cost_aware_gated"],
+                    "checkpoint_digest": formal_contract["cost_digest"],
+                },
+            },
+        }
+    for role in active_roles:
         stage_summary = _stage_summary([row[role] for row in paired], args.max_searches)
         summary["stages"][role] = {"stage": stage_names[role], **stage_summary}
-    for candidate_role in ("cost_aware_old", "cost_aware_gated"):
+    for candidate_role in candidate_roles:
         summary["comparisons"][candidate_role] = _comparison_summary(
             paired, candidate_role
         )
@@ -623,13 +932,17 @@ def analyze(args: argparse.Namespace) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Pair and summarize B, C-old, and C-gated test traces."
+        description="Pair and summarize control and cost-aware test traces."
     )
     parser.add_argument("--control", type=Path, required=True)
-    parser.add_argument("--cost-aware-old", dest="cost_aware_old", type=Path, required=True)
+    parser.add_argument("--cost-aware-old", dest="cost_aware_old", type=Path)
     parser.add_argument(
         "--cost-aware-gated", dest="cost_aware_gated", type=Path, required=True
     )
+    parser.add_argument("--catalog", type=Path)
+    parser.add_argument("--data-manifest", type=Path)
+    parser.add_argument("--expected-control-checkpoint-digest")
+    parser.add_argument("--expected-cost-aware-gated-checkpoint-digest")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--expected-rows", type=int, default=128)
     parser.add_argument("--cost-lambda", type=float, default=0.10)

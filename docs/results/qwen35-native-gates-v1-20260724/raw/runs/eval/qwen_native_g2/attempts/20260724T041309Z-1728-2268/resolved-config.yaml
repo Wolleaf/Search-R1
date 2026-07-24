@@ -1,0 +1,193 @@
+data:
+  tokenizer: null
+  train_files: /root/autodl-tmp/search-r1/data/search_mix_qwen35_native/train_512.parquet
+  val_files: /root/autodl-tmp/search-r1/data/search_mix_qwen35_native/probe_autonomous_32.parquet
+  train_data_num: null
+  val_data_num: null
+  prompt_key: prompt
+  max_prompt_length: 4096
+  max_response_length: 500
+  max_start_length: 1024
+  max_obs_length: 384
+  train_batch_size: 8
+  val_batch_size: 8
+  eval_group_size: 3
+  return_raw_input_ids: false
+  return_raw_chat: true
+  shuffle_train_dataloader: true
+actor_rollout_ref:
+  seed: 42
+  hybrid_engine: true
+  model:
+    path: /root/autodl-tmp/search-r1/models/Qwen3.5-2B
+    external_lib: null
+    override_config: {}
+    attn_implementation: sdpa
+    enable_gradient_checkpointing: true
+    use_remove_padding: false
+  actor:
+    strategy: fsdp
+    ppo_mini_batch_size: 40
+    ppo_micro_batch_size: 2
+    use_dynamic_bsz: false
+    ppo_max_token_len_per_gpu: 16384
+    grad_clip: 1.0
+    state_masking: true
+    clip_ratio: 0.2
+    entropy_coeff: 0.001
+    use_kl_loss: false
+    kl_loss_coef: 0.001
+    kl_loss_type: low_var_kl
+    ppo_epochs: 1
+    shuffle: false
+    ulysses_sequence_parallel_size: 1
+    optim:
+      lr: 1.0e-06
+      lr_warmup_steps_ratio: 0.285
+      min_lr_ratio: null
+      warmup_style: constant
+      total_training_steps: -1
+    fsdp_config:
+      wrap_policy:
+        min_num_params: 0
+        transformer_layer_cls_to_wrap:
+        - Qwen3_5DecoderLayer
+      param_offload: true
+      grad_offload: true
+      optimizer_offload: true
+      fsdp_size: -1
+  ref:
+    fsdp_config:
+      param_offload: true
+      wrap_policy:
+        min_num_params: 0
+        transformer_layer_cls_to_wrap:
+        - Qwen3_5DecoderLayer
+      fsdp_size: -1
+    log_prob_micro_batch_size: 2
+    log_prob_use_dynamic_bsz: false
+    log_prob_max_token_len_per_gpu: 16384
+    ulysses_sequence_parallel_size: 1
+  rollout:
+    name: hf
+    temperature: 1.0
+    top_k: 20
+    top_p: 1.0
+    min_p: 0.0
+    presence_penalty: 2.0
+    repetition_penalty: 1.0
+    prompt_length: 4096
+    response_length: 500
+    dtype: bfloat16
+    gpu_memory_utilization: 0.5
+    ignore_eos: false
+    enforce_eager: true
+    free_cache_engine: true
+    load_format: dummy_dtensor
+    tensor_model_parallel_size: 1
+    max_num_batched_tokens: 8192
+    max_num_seqs: 1024
+    log_prob_micro_batch_size: 2
+    log_prob_use_dynamic_bsz: false
+    log_prob_max_token_len_per_gpu: 16384
+    do_sample: true
+    'n': 1
+    n_agent: 5
+    micro_batch_size: 1
+critic:
+  strategy: fsdp
+  optim:
+    lr: 1.0e-05
+    lr_warmup_steps_ratio: 0.0
+    min_lr_ratio: null
+    warmup_style: constant
+    total_training_steps: -1
+  model:
+    path: ~/models/deepseek-llm-7b-chat
+    tokenizer_path: /root/autodl-tmp/search-r1/models/Qwen3.5-2B
+    override_config: {}
+    external_lib: null
+    attn_implementation: sdpa
+    enable_gradient_checkpointing: false
+    use_remove_padding: false
+    fsdp_config:
+      param_offload: false
+      grad_offload: false
+      optimizer_offload: false
+      wrap_policy:
+        min_num_params: 0
+      fsdp_size: -1
+  ppo_mini_batch_size: 40
+  ppo_micro_batch_size: 64
+  forward_micro_batch_size: 64
+  use_dynamic_bsz: false
+  ppo_max_token_len_per_gpu: 32768
+  forward_max_token_len_per_gpu: 32768
+  ulysses_sequence_parallel_size: 1
+  ppo_epochs: 1
+  shuffle: false
+  grad_clip: 1.0
+  cliprange_value: 0.5
+reward_model:
+  enable: false
+  strategy: fsdp
+  model:
+    input_tokenizer: /root/autodl-tmp/search-r1/models/Qwen3.5-2B
+    path: ~/models/FsfairX-LLaMA3-RM-v0.1
+    external_lib: null
+    attn_implementation: sdpa
+    use_remove_padding: false
+    fsdp_config:
+      min_num_params: 0
+      param_offload: false
+  micro_batch_size: 64
+  max_length: null
+  ulysses_sequence_parallel_size: 1
+  use_dynamic_bsz: false
+  forward_max_token_len_per_gpu: 32768
+  structure_format_score: 0
+  final_format_score: 0
+  retrieval_score: 0
+retriever:
+  url: http://127.0.0.1:8000/retrieve
+  topk: 3
+algorithm:
+  gamma: 1.0
+  lam: 1.0
+  adv_estimator: grpo
+  cost_lambda: 0.1
+  cost_reward_mode: linear
+  no_think_rl: false
+  kl_penalty: kl
+  kl_ctrl:
+    type: fixed
+    kl_coef: 0.001
+  state_masking:
+    start_state_marker: <information>
+    end_state_marker: </information>
+trainer:
+  seed: 42
+  total_epochs: 1
+  total_training_steps: 1
+  project_name: search-r1-small
+  experiment_name: qwen_native_g2-eval
+  logger:
+  - console
+  - wandb
+  nnodes: 1
+  n_gpus_per_node: 2
+  save_freq: -1
+  test_freq: -1
+  critic_warmup: 0
+  default_hdfs_dir: null
+  default_local_dir: /root/autodl-tmp/search-r1/runs/eval/qwen_native_g2/attempts/20260724T041309Z-1728-2268/checkpoints
+  val_only: true
+  val_before_train: true
+  trace_output_dir: /root/autodl-tmp/search-r1/runs/eval/qwen_native_g2/attempts/20260724T041309Z-1728-2268/traces
+  trace_stage: qwen_native_g2
+  trace_run_id: 20260724T041309Z-1728-2268
+  trace_checkpoint_digest: bc67be20efb353ba14d9c1b291a64410afec94f2310e94b59b6b76047b164e78
+  trace_parent_checkpoint_digest: ''
+max_turns: 4
+do_search: true
+tool_protocol: qwen35_native

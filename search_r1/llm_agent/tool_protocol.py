@@ -15,16 +15,16 @@ LEGACY_XML = "legacy_xml"
 QWEN35_NATIVE = "qwen35_native"
 SUPPORTED_TOOL_PROTOCOLS = (LEGACY_XML, QWEN35_NATIVE)
 
-QWEN35_PROMPT_VERSION = "qwen35-native-search-v1"
+QWEN35_PROMPT_VERSION = "qwen35-native-search-v2-answer-tag"
 QWEN35_MODEL_REVISION = "15852e8c16360a2fea060d615a32b45270f8a8fc"
 QWEN35_CHAT_TEMPLATE_SHA256 = (
     "273d8e0e683b885071fb17e08d71e5f2a5ddfb5309756181681de4f5a1822d80"
 )
 QWEN35_FORCE_SEARCH_INSTRUCTION = "Call search at least once before answering. "
 QWEN35_RETRY_PROMPT = (
-    "The previous response was not executable. Either call the available "
-    "search function once with specific search terms, or return only the "
-    "short final answer."
+    "Invalid response. Call search once with specific terms, or output the "
+    "opening tag <answer>, only the short final answer text, and the closing "
+    "tag </answer>."
 )
 
 _QWEN35_TOOLS = ({
@@ -76,6 +76,14 @@ _NATIVE_SEARCH_CALL = re.compile(
     r"<parameter=(?P<parameter>[A-Za-z_][A-Za-z0-9_.-]*)>\s*"
     r"(?P<content>.*?)\s*"
     r"</parameter>\s*</function>\s*</tool_call>\s*\Z",
+    flags=re.DOTALL,
+)
+_NATIVE_ANSWER = re.compile(
+    r"\A(?P<prefix>.*?)<answer>(?P<content>.*?)</answer>\s*\Z",
+    flags=re.DOTALL,
+)
+_EMPTY_THINK_PREFIX = re.compile(
+    r"\A<think>(?P<content>.*?)</think>",
     flags=re.DOTALL,
 )
 _LEGACY_ACTION = re.compile(r"<(search|answer)>(.*?)</\1>", re.DOTALL)
@@ -130,8 +138,11 @@ def qwen35_system_prompt() -> str:
         "Call at most one tool per assistant turn. Use search when external "
         "evidence is needed. After each search result, decide whether another "
         "search is needed. Use at most four searches. "
-        "When you have enough evidence, answer with only the short final "
-        "answer, without a tool call or explanation."
+        "When you have enough evidence, output the opening tag <answer>, then "
+        "only the short final answer text, then the closing tag </answer>, and "
+        "end the response. Do not combine a tool call with a final answer in "
+        "the same assistant response, and do not output any text after the "
+        "closing tag."
     )
 
 
@@ -213,11 +224,32 @@ def _parse_qwen35_action(text: str) -> ParsedAction:
     if not candidate:
         return ParsedAction(None, "", "empty_response")
 
+    has_answer_marker = ("<answer" in candidate
+                         or "</answer>" in candidate)
+    if has_answer_marker:
+        if (candidate.count("<answer>") != 1
+                or candidate.count("</answer>") != 1):
+            return ParsedAction(None, "", "multiple_or_unbalanced_answers")
+        match = _NATIVE_ANSWER.fullmatch(candidate)
+        if match is None:
+            return ParsedAction(None, "", "malformed_answer")
+        prefix, prefix_error = _normalize_qwen35_prefix(match.group("prefix"))
+        if prefix_error is not None:
+            return ParsedAction(None, "", prefix_error)
+        answer = match.group("content").strip()
+        if not answer:
+            return ParsedAction(None, "", "empty_answer")
+        if any(marker in answer for marker in _PROTOCOL_MARKERS):
+            return ParsedAction(None, "", "nested_protocol_marker")
+        if _looks_like_json_tool_call(answer):
+            return ParsedAction(None, "", "json_tool_call_not_supported")
+        return ParsedAction("answer", answer, prefix=prefix)
+
     has_marker = any(marker in candidate for marker in _PROTOCOL_MARKERS)
     if not has_marker:
         if _looks_like_json_tool_call(candidate):
             return ParsedAction(None, "", "json_tool_call_not_supported")
-        return ParsedAction("answer", candidate)
+        return ParsedAction(None, "", "missing_native_action")
 
     if (candidate.count("<tool_call>") != 1
             or candidate.count("</tool_call>") != 1
@@ -238,14 +270,33 @@ def _parse_qwen35_action(text: str) -> ParsedAction:
         return ParsedAction(None, "", "empty_search_query")
     if any(marker in query for marker in _PROTOCOL_MARKERS):
         return ParsedAction(None, "", "nested_protocol_marker")
+    if _looks_like_json_tool_call(query):
+        return ParsedAction(None, "", "json_tool_call_not_supported")
     if query.casefold() in {"query", "and"}:
         return ParsedAction(None, "", "placeholder_search_query")
-    prefix = match.group("prefix").strip()
-    if any(marker in prefix for marker in _PROTOCOL_MARKERS):
-        return ParsedAction(None, "", "invalid_search_prefix")
+    prefix, prefix_error = _normalize_qwen35_prefix(match.group("prefix"))
+    if prefix_error is not None:
+        return ParsedAction(None, "", prefix_error)
     return ParsedAction("search",
                         query,
                         prefix=prefix)
+
+
+def _normalize_qwen35_prefix(prefix: str) -> tuple[str, Optional[str]]:
+    """Accept one empty Qwen think echo, then marker-free reasoning."""
+    candidate = prefix.strip()
+    if candidate.startswith("<think"):
+        match = _EMPTY_THINK_PREFIX.match(candidate)
+        if match is None:
+            return "", "invalid_thinking_prefix"
+        if match.group("content").strip():
+            return "", "nonempty_thinking_prefix"
+        candidate = candidate[match.end():].strip()
+    if any(marker in candidate for marker in _PROTOCOL_MARKERS):
+        return "", "invalid_action_prefix"
+    if _looks_like_json_tool_call(candidate):
+        return "", "json_tool_call_not_supported"
+    return candidate, None
 
 
 def _looks_like_json_tool_call(candidate: str) -> bool:

@@ -43,12 +43,225 @@ from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seql
 
 import re
 from search_r1.llm_agent.generation import LLMGenerationManager, GenerationConfig
-from search_r1.llm_agent.tool_protocol import QWEN35_NATIVE
+from search_r1.llm_agent.tool_protocol import (QWEN35_NATIVE,
+                                               QWEN35_PROMPT_VERSION)
 from search_r1.trajectory_trace import (TraceJsonlWriter,
                                         parse_search_r1_transcript,
                                         stable_sample_id)
 
 WorkerType = Type[Worker]
+
+_CONFIG_MISSING = object()
+_QWEN35_NATIVE_TRAINING_VARIANTS = {
+    'smoke': {
+        'trainer.total_training_steps': 2,
+        'algorithm.cost_lambda': 0.0,
+        'algorithm.cost_reward_mode': 'linear',
+    },
+    'reproduce': {
+        'trainer.total_training_steps': 60,
+        'algorithm.cost_lambda': 0.0,
+        'algorithm.cost_reward_mode': 'linear',
+    },
+    'control': {
+        'trainer.total_training_steps': 20,
+        'algorithm.cost_lambda': 0.0,
+        'algorithm.cost_reward_mode': 'linear',
+    },
+    'cost_aware_gated': {
+        'trainer.total_training_steps': 20,
+        'algorithm.cost_lambda': 0.10,
+        'algorithm.cost_reward_mode': 'correct_only',
+    },
+}
+
+
+def _nested_config_value(config, path):
+    current = config
+    for key in path.split('.'):
+        if not hasattr(current, 'get'):
+            return _CONFIG_MISSING
+        current = current.get(key, _CONFIG_MISSING)
+        if current is _CONFIG_MISSING:
+            return _CONFIG_MISSING
+    return current
+
+
+def _config_value_matches(actual, expected):
+    if actual is _CONFIG_MISSING:
+        return False
+    if isinstance(expected, bool):
+        return isinstance(actual, bool) and actual is expected
+    return actual == expected
+
+
+def _format_config_value(value):
+    return '<missing>' if value is _CONFIG_MISSING else repr(value)
+
+
+def _validate_qwen35_native_training_contract(config):
+    """Fail closed unless native training uses the registered on-policy setup."""
+    if _nested_config_value(config, 'tool_protocol') != QWEN35_NATIVE:
+        return
+    if _nested_config_value(config, 'do_search') is not True:
+        raise ValueError(
+            'qwen35_native requires do_search=true for the agent loop')
+    if _nested_config_value(config, 'trainer.val_only') is True:
+        return
+
+    expected = {
+        'qwen35_prompt_version': QWEN35_PROMPT_VERSION,
+        'algorithm.adv_estimator': 'grpo',
+        'actor_rollout_ref.rollout.name': 'hf',
+        'actor_rollout_ref.rollout.do_sample': True,
+        'actor_rollout_ref.rollout.temperature': 1.0,
+        'actor_rollout_ref.rollout.top_p': 1.0,
+        'actor_rollout_ref.rollout.top_k': 0,
+        'actor_rollout_ref.rollout.min_p': 0.0,
+        'actor_rollout_ref.rollout.presence_penalty': 0.0,
+        'actor_rollout_ref.rollout.repetition_penalty': 1.0,
+        'actor_rollout_ref.rollout.n': 1,
+        'actor_rollout_ref.rollout.n_agent': 5,
+        'actor_rollout_ref.actor.state_masking': True,
+        'actor_rollout_ref.actor.ppo_mini_batch_size': 40,
+        'actor_rollout_ref.actor.ppo_micro_batch_size': 2,
+        'actor_rollout_ref.rollout.log_prob_micro_batch_size': 2,
+        'actor_rollout_ref.ref.log_prob_micro_batch_size': 2,
+        'data.train_batch_size': 8,
+        'data.return_raw_chat': True,
+        'data.max_prompt_length': 4096,
+        'data.max_response_length': 500,
+        'data.max_start_length': 1024,
+        'data.max_obs_length': 384,
+        'max_turns': 4,
+        'retriever.topk': 3,
+    }
+    variant = _nested_config_value(config,
+                                   'trainer.native_training_variant')
+    variant_contract = _QWEN35_NATIVE_TRAINING_VARIANTS.get(variant)
+    if variant_contract is not None:
+        expected.update(variant_contract)
+
+    mismatches = []
+    if variant_contract is None:
+        allowed = ', '.join(sorted(_QWEN35_NATIVE_TRAINING_VARIANTS))
+        mismatches.append(
+            'trainer.native_training_variant expected one of '
+            f'[{allowed}], got {_format_config_value(variant)}')
+    for path, expected_value in expected.items():
+        actual = _nested_config_value(config, path)
+        if not _config_value_matches(actual, expected_value):
+            mismatches.append(
+                f'{path} expected {expected_value!r}, got '
+                f'{_format_config_value(actual)}')
+    if mismatches:
+        raise ValueError('qwen35_native training contract mismatch: ' +
+                         '; '.join(mismatches))
+
+
+def _validate_qwen35_native_training_batch(batch):
+    """Validate the sampled policy tensors before a native actor update."""
+    required = (
+        'responses',
+        'old_log_probs',
+        'advantages',
+        'token_level_rewards',
+        'attention_mask',
+        'info_mask',
+        'loss_mask',
+    )
+    tensors = {}
+    for key in required:
+        if key not in batch.batch.keys():
+            raise ValueError(
+                f'qwen35_native training batch is missing {key}')
+        value = batch.batch[key]
+        if not isinstance(value, torch.Tensor):
+            raise ValueError(
+                f'qwen35_native training batch {key} must be a tensor')
+        tensors[key] = value
+
+    responses = tensors['responses']
+    if responses.ndim != 2 or responses.shape[0] == 0 or responses.shape[1] == 0:
+        raise ValueError(
+            'qwen35_native training batch responses must be nonempty and rank 2')
+    response_shape = responses.shape
+    for key in ('old_log_probs', 'advantages', 'token_level_rewards',
+                'loss_mask'):
+        if tensors[key].shape != response_shape:
+            raise ValueError(
+                'qwen35_native training batch shape mismatch: '
+                f'{key}={tuple(tensors[key].shape)}, '
+                f'responses={tuple(response_shape)}')
+
+    attention_mask = tensors['attention_mask']
+    info_mask = tensors['info_mask']
+    for key, mask in (('attention_mask', attention_mask),
+                      ('info_mask', info_mask)):
+        if (mask.ndim != 2 or mask.shape[0] != response_shape[0]
+                or mask.shape[1] < response_shape[1]):
+            raise ValueError(
+                'qwen35_native training batch shape mismatch: '
+                f'{key}={tuple(mask.shape)}, responses={tuple(response_shape)}')
+    if attention_mask.shape != info_mask.shape:
+        raise ValueError(
+            'qwen35_native training batch attention_mask and info_mask '
+            'must have identical shapes')
+
+    response_width = response_shape[1]
+    response_mask = attention_mask[:, -response_width:].bool()
+    info_response_mask = info_mask[:, -response_width:].bool()
+    policy_mask = tensors['loss_mask'].bool()
+    if not torch.equal(policy_mask, info_response_mask):
+        raise ValueError(
+            'qwen35_native training loss_mask must equal the response '
+            'slice of info_mask')
+    if torch.any(policy_mask & ~response_mask):
+        raise ValueError(
+            'qwen35_native training policy mask is not a subset of '
+            'the response mask')
+
+    policy_tokens_per_row = policy_mask.sum(dim=-1)
+    if torch.any(policy_tokens_per_row == 0):
+        raise ValueError(
+            'qwen35_native training policy mask must be nonempty for '
+            'every trajectory')
+    policy_token_count = int(policy_mask.sum().item())
+
+    finite_ratios = {}
+    for key in ('old_log_probs', 'advantages', 'token_level_rewards'):
+        selected = tensors[key][policy_mask]
+        finite = torch.isfinite(selected)
+        finite_ratios[key] = float(finite.float().mean().item())
+        if not bool(finite.all().item()):
+            raise ValueError(
+                'qwen35_native training batch has non-finite '
+                f'{key} on policy tokens')
+
+    policy_advantages = tensors['advantages'][policy_mask]
+    nonzero_advantages = int(torch.count_nonzero(policy_advantages).item())
+
+    return {
+        'native_batch/contract_valid': 1.0,
+        'native_batch/trajectories': float(response_shape[0]),
+        'native_batch/response_width': float(response_shape[1]),
+        'native_batch/response_tokens': float(response_mask.sum().item()),
+        'native_batch/policy_tokens': float(policy_token_count),
+        'native_batch/policy_tokens_min_per_trajectory': float(
+            policy_tokens_per_row.min().item()),
+        'native_batch/policy_coverage': float(
+            policy_token_count / response_mask.sum().item()),
+        'native_batch/info_loss_mask_match': 1.0,
+        'native_batch/policy_mask_subset': 1.0,
+        'native_batch/old_log_prob_finite_ratio': finite_ratios[
+            'old_log_probs'],
+        'native_batch/advantage_finite_ratio': finite_ratios['advantages'],
+        'native_batch/reward_finite_ratio': finite_ratios[
+            'token_level_rewards'],
+        'native_batch/nonzero_advantage_tokens': float(nonzero_advantages),
+        'native_batch/advantage_abs_max': float(
+            policy_advantages.abs().max().item()),
+    }
 
 
 def _next_training_step(completed_step, total_steps):
@@ -639,14 +852,7 @@ class RayPPOTrainer(object):
 
         # assert torch.cuda.is_available(), 'cuda must be available on driver'
 
-        if config.get('tool_protocol', 'legacy_xml') == QWEN35_NATIVE:
-            if not config.get('do_search', False):
-                raise ValueError(
-                    'qwen35_native requires do_search=true for the agent loop')
-            if not config.get('trainer', {}).get('val_only', False):
-                raise ValueError(
-                    'qwen35_native training is disabled until its '
-                    'sampling/log-prob contract is registered')
+        _validate_qwen35_native_training_contract(config)
 
         self.tokenizer = tokenizer
         self.config = config
@@ -1371,6 +1577,12 @@ class RayPPOTrainer(object):
                                                   lam=self.config.algorithm.lam,
                                                   num_repeat=self.config.actor_rollout_ref.rollout.n)
 
+                        if self.config.get('tool_protocol') == QWEN35_NATIVE:
+                            batch, metrics = self._create_loss_mask(
+                                batch, metrics)
+                            metrics.update(
+                                _validate_qwen35_native_training_batch(batch))
+
                     # update critic
                     if self.use_critic:
                         with _timer('update_critic', timing_raw):
@@ -1382,7 +1594,9 @@ class RayPPOTrainer(object):
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
                         with _timer('update_actor', timing_raw):
-                            if self.config.do_search and self.config.actor_rollout_ref.actor.state_masking:
+                            if (self.config.do_search
+                                    and self.config.actor_rollout_ref.actor.state_masking
+                                    and 'loss_mask' not in batch.batch.keys()):
                                 batch, metrics = self._create_loss_mask(batch, metrics)
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])

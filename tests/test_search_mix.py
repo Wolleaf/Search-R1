@@ -186,10 +186,12 @@ def test_registered_mix_uses_hotpot_majority_with_bridge_weighting():
 
     native = search_mix.parse_args([
         "materialize-native", "--source-manifest", "source/manifest.json",
-        "--output-dir", "native", "--model-dir", "model"
+        "--output-dir", "native", "--model-dir", "model",
+        "--no-reselection"
     ])
     assert native.source_manifest == Path("source/manifest.json")
     assert native.output_dir == Path("native")
+    assert native.no_reselection is True
     verify = search_mix.parse_args([
         "verify", "--manifest", "native/manifest.json", "--model-dir",
         "model", "--expected-tool-protocol", "qwen35_native",
@@ -197,6 +199,62 @@ def test_registered_mix_uses_hotpot_majority_with_bridge_weighting():
     ])
     assert verify.expected_tool_protocol == search_mix.QWEN35_NATIVE
     assert verify.source_manifest == Path("source/manifest.json")
+    verify_no_reselection = search_mix.parse_args([
+        "verify-no-reselection", "--manifest", "native/manifest.json",
+        "--model-dir", "model", "--expected-tool-protocol",
+        "qwen35_native", "--source-manifest", "source/manifest.json"
+    ])
+    assert verify_no_reselection.command == "verify-no-reselection"
+    assert verify_no_reselection.source_manifest == Path(
+        "source/manifest.json")
+
+
+def test_native_prompt_contract_registers_v2_answer_tags():
+    contract = search_mix.prompt_contract(search_mix.QWEN35_NATIVE)
+    messages = search_mix.make_prompt("Who wrote Hamlet?",
+                                      search_mix.QWEN35_NATIVE)
+
+    assert contract["prompt_version"] == "qwen35-native-search-v2-answer-tag"
+    assert contract["tool_protocol"] == search_mix.QWEN35_NATIVE
+    assert messages == search_mix.qwen35_messages("Who wrote Hamlet?")
+    system_prompt = messages[0]["content"]
+    assert "<answer>" in system_prompt
+    assert "</answer>" in system_prompt
+    assert "Beijing" not in system_prompt
+    assert "<answer>short answer</answer>" not in system_prompt
+
+
+def test_no_reselection_cli_dispatches_explicit_mode(tmp_path, monkeypatch):
+    calls = []
+
+    def record_verify(*args, reselect_catalog=True, **kwargs):
+        del args, kwargs
+        calls.append(("verify", reselect_catalog))
+
+    def record_materialize(source_manifest,
+                           output_dir,
+                           model_dir,
+                           eval_catalogs=(),
+                           eval_parquets=(),
+                           reselect_catalog=True):
+        del source_manifest, model_dir, eval_catalogs, eval_parquets
+        calls.append(("materialize-native", reselect_catalog))
+        return output_dir / search_mix.MANIFEST_FILE
+
+    monkeypatch.setattr(search_mix, "verify_manifest", record_verify)
+    monkeypatch.setattr(search_mix, "materialize_native", record_materialize)
+    assert search_mix.main([
+        "verify-no-reselection", "--manifest",
+        str(tmp_path / "native" / "manifest.json"), "--model-dir",
+        str(tmp_path / "model")
+    ]) == 0
+    assert search_mix.main([
+        "materialize-native", "--source-manifest",
+        str(tmp_path / "source" / "manifest.json"), "--output-dir",
+        str(tmp_path / "native"), "--model-dir",
+        str(tmp_path / "model"), "--no-reselection"
+    ]) == 0
+    assert calls == [("verify", False), ("materialize-native", False)]
 
 
 def test_candidate_accepts_nq_comparison_and_bridge():
@@ -1031,6 +1089,28 @@ def test_materialize_native_reselects_source_once_without_generic_materialize(
             source_snapshot)
 
 
+def test_materialize_native_no_reselection_skips_catalog_selection(
+        tmp_path, monkeypatch):
+    paths, source_snapshot, _ = _prepare_native_fixture_source(
+        tmp_path, monkeypatch)
+
+    def forbidden_select(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("no-reselection materialization selected a catalog")
+
+    monkeypatch.setattr(search_mix, "select_catalog", forbidden_select)
+    output_dir = tmp_path / "native"
+    manifest_path = search_mix.materialize_native(
+        paths["manifest"],
+        output_dir,
+        paths["model_dir"],
+        reselect_catalog=False)
+
+    assert manifest_path == output_dir / search_mix.MANIFEST_FILE
+    assert (_regular_file_snapshot(paths["manifest"].parent) ==
+            source_snapshot)
+
+
 def test_materialize_native_failure_does_not_publish_output(
         tmp_path, monkeypatch):
     paths, source_snapshot, _ = _prepare_native_fixture_source(
@@ -1154,6 +1234,16 @@ def test_materialize_native_is_prompt_only_and_preserves_source_and_selection(
             manifest_path,
             paths["model_dir"],
             expected_tool_protocol=search_mix.LEGACY_XML)
+    current_manifest = manifest_path.read_bytes()
+    stale = json.loads(current_manifest)
+    stale["prompt_contract"]["prompt_version"] = "qwen35-native-search-v1"
+    manifest_path.write_bytes(search_mix.canonical_json_bytes(stale))
+    search_mix.write_digest_sidecar(manifest_path)
+    with pytest.raises(ValueError, match="prompt contract mismatch"):
+        search_mix.verify_manifest(manifest_path, paths["model_dir"])
+
+    manifest_path.write_bytes(current_manifest)
+    search_mix.write_digest_sidecar(manifest_path)
     tampered = json.loads(manifest_path.read_bytes())
     tampered["prompt_contract"]["tool_schema_sha256"] = "0" * 64
     manifest_path.write_bytes(search_mix.canonical_json_bytes(tampered))
@@ -1214,6 +1304,85 @@ def test_verify_native_scans_every_materialized_prompt(tmp_path, monkeypatch):
     expected = sum(payload["artifacts"][label]["rows"] for label in (
         *search_mix.OUTPUT_FILES, *search_mix.NATIVE_PROBE_FILES))
     assert len(calls) == expected
+
+
+def test_verify_native_without_reselection_preserves_integrity_checks(
+        tmp_path, monkeypatch):
+    paths, output_dir, manifest_path, _ = _build_native_fixture(
+        tmp_path, monkeypatch)
+    tokenizer_calls = []
+    prompt_calls = []
+
+    class LocalOnlyAutoTokenizer:
+
+        @staticmethod
+        def from_pretrained(model_dir, local_files_only=False):
+            tokenizer_calls.append((Path(model_dir), local_files_only))
+            if local_files_only is not True:
+                raise AssertionError("tokenizer verification was not local-only")
+            return CharacterTokenizer()
+
+    transformers = ModuleType("transformers")
+    transformers.AutoTokenizer = LocalOnlyAutoTokenizer
+    monkeypatch.setitem(sys.modules, "transformers", transformers)
+
+    def forbidden_select(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("no-reselection verification selected a catalog")
+
+    def forbidden_retrieval_load(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("no-reselection verification loaded the evidence pool")
+
+    original_prompt_validator = search_mix._validate_native_prompt
+
+    def record_prompt_validation(tokenizer,
+                                 messages,
+                                 max_start_length=1024):
+        prompt_calls.append(messages)
+        return original_prompt_validator(tokenizer, messages,
+                                         max_start_length)
+
+    monkeypatch.setattr(search_mix, "select_catalog", forbidden_select)
+    monkeypatch.setattr(search_mix, "_load_retrieval_contract",
+                        forbidden_retrieval_load)
+    monkeypatch.setattr(search_mix, "_validate_native_prompt",
+                        record_prompt_validation)
+    payload = search_mix.verify_manifest(
+        manifest_path,
+        paths["model_dir"],
+        expected_tool_protocol=search_mix.QWEN35_NATIVE,
+        source_manifest=paths["manifest"],
+        reselect_catalog=False)
+
+    assert payload["schema_version"] == search_mix.MATERIALIZED_SCHEMA_VERSION
+    assert tokenizer_calls == [(paths["model_dir"], True)] * 2
+    expected_prompts = sum(payload["artifacts"][label]["rows"] for label in (
+        *search_mix.OUTPUT_FILES, *search_mix.NATIVE_PROBE_FILES))
+    assert len(prompt_calls) == expected_prompts
+
+    replay = paths["manifest"].parent / search_mix.REPLAY_FILE
+    replay_bytes = replay.read_bytes()
+    replay.write_bytes(replay_bytes + b"\n")
+    with pytest.raises(ValueError, match="Digest sidecar mismatch"):
+        search_mix.verify_manifest(
+            manifest_path,
+            paths["model_dir"],
+            expected_tool_protocol=search_mix.QWEN35_NATIVE,
+            source_manifest=paths["manifest"],
+            reselect_catalog=False)
+    replay.write_bytes(replay_bytes)
+
+    native_catalog = output_dir / search_mix.CATALOG_FILE
+    native_catalog.write_bytes(native_catalog.read_bytes() + b"\n")
+    _rewrite_manifest_artifact(manifest_path, "catalog", native_catalog)
+    with pytest.raises(ValueError, match="Native catalog does not match source"):
+        search_mix.verify_manifest(
+            manifest_path,
+            paths["model_dir"],
+            expected_tool_protocol=search_mix.QWEN35_NATIVE,
+            source_manifest=paths["manifest"],
+            reselect_catalog=False)
 
 
 def test_verify_native_requires_source_manifest(tmp_path, monkeypatch):

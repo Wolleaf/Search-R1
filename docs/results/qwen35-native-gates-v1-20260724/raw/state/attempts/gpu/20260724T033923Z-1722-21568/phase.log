@@ -1,0 +1,9 @@
+Verified retrieval-verified search mixture: /root/autodl-tmp/search-r1/data/search_mix_qwen35_native/manifest.json
+curl: (7) Failed to connect to 127.0.0.1 port 8000 after 0 ms: Connection refused
+Starting eval qwen_native_g1 (budget 1 RMB, timeout 521s); log: /root/autodl-tmp/search-r1/runs/eval/qwen_native_g1/attempts/20260724T034833Z-1771-19927/train.log
+Qwen native g0_g1 decision: GO
+Verified retrieval-verified search mixture: /root/autodl-tmp/search-r1/data/search_mix_qwen35_native/manifest.json
+Completed Qwen native g0_g1 gate: /root/autodl-tmp/search-r1/runs/qwen-native-gate/attempts/20260724T033923Z-1722-21568/summary.md
+GO or NO-GO is a scientific result; both complete successfully.
+Guest shutdown is only a dispatch; confirm stopped billing in AutoDL.
+AUTODL_PHASE_TERMINAL state=success exit_code=0

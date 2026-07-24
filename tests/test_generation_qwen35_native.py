@@ -282,7 +282,10 @@ def test_native_loop_keeps_tokens_masks_actions_and_reorder_alignment():
     tokenizer = _CharTokenizer()
     search = ("<tool_call>\n<function=search>\n<parameter=query>\n"
               "capital of France\n</parameter>\n</function>\n</tool_call>")
-    worker = _ScriptedWorker(tokenizer, [[search, "Lyon"], ["Paris"]])
+    direct_answer = "<answer>Lyon</answer>"
+    searched_answer = "Evidence is sufficient.\n<answer>Paris</answer>"
+    worker = _ScriptedWorker(tokenizer, [[search, direct_answer],
+                                         [searched_answer]])
     manager = _native_manager(tokenizer, worker)
     raw_messages = [
         qwen35_messages("Capital of France?"),
@@ -298,7 +301,8 @@ def test_native_loop_keeps_tokens_masks_actions_and_reorder_alignment():
 
     search_ids = (tokenizer(search, add_special_tokens=False)["input_ids"] +
                   [tokenizer.eos_token_id])
-    answer_ids = (tokenizer("Paris", add_special_tokens=False)["input_ids"] +
+    answer_ids = (tokenizer(searched_answer,
+                            add_special_tokens=False)["input_ids"] +
                   [tokenizer.eos_token_id])
     second_prompt = worker.prompts[1][0].tolist()
     suffix_ids = second_prompt[len(prompt_rows[0]) + len(search_ids):]
@@ -328,6 +332,12 @@ def test_native_loop_keeps_tokens_masks_actions_and_reorder_alignment():
         "content"] == "capital of France"
     assert output.non_tensor_batch["generation_events"][0][0][
         "parse_error"] is None
+    assert output.non_tensor_batch["generation_events"][0][1][
+        "text"] == searched_answer
+    assert output.non_tensor_batch["generation_events"][0][1][
+        "content"] == "Paris"
+    assert output.non_tensor_batch["generation_events"][0][1][
+        "reasoning_prefix"] == "Evidence is sufficient."
     assert [
         action["action"]
         for action in output.non_tensor_batch["parsed_actions"][0]
@@ -358,7 +368,9 @@ def test_native_loop_preserves_trimmed_noncanonical_sample_and_mask(
         tokenizer(after, add_special_tokens=False)["input_ids"])
     if sampled_eos:
         search_ids.append(tokenizer.eos_token_id)
-    answer_ids = (tokenizer("Paris", add_special_tokens=False)["input_ids"] +
+    tagged_answer = "<answer>Paris</answer>"
+    answer_ids = (tokenizer(tagged_answer,
+                            add_special_tokens=False)["input_ids"] +
                   [tokenizer.eos_token_id])
     worker = _RawScriptedWorker(tokenizer, [[search_ids], [answer_ids]])
     manager = _native_manager(tokenizer, worker)
@@ -393,7 +405,8 @@ def test_native_invalid_action_uses_native_retry_and_preserves_mask():
     tokenizer = _CharTokenizer()
     invalid = ("<tool_call><function=search><parameter=query>x</parameter>"
                "trailing</function></tool_call>")
-    worker = _ScriptedWorker(tokenizer, [[invalid], ["Paris"]])
+    worker = _ScriptedWorker(tokenizer,
+                             [[invalid], ["<answer>Paris</answer>"]])
     manager = _native_manager(tokenizer, worker)
     raw_messages = [qwen35_messages("Capital of France?")]
     gen_batch, prompt_rows = _generation_batch(tokenizer, raw_messages)
@@ -408,11 +421,15 @@ def test_native_invalid_action_uses_native_retry_and_preserves_mask():
                    [tokenizer.eos_token_id])
     retry_prompt = tokenizer.decode(worker.prompts[1][0])
     assert QWEN35_RETRY_PROMPT in retry_prompt
+    assert "opening tag <answer>" in retry_prompt
+    assert "closing tag </answer>" in retry_prompt
     assert "<information>" not in retry_prompt
     events = output.non_tensor_batch["generation_events"][0]
     assert events[0]["action"] is None
     assert events[0]["parse_error"] == "malformed_tool_call"
     assert events[1]["action"] == "answer"
+    assert events[1]["text"] == "<answer>Paris</answer>"
+    assert events[1]["content"] == "Paris"
     assert output.non_tensor_batch["final_answer"].tolist() == ["Paris"]
 
     suffix_length = len(worker.prompts[1][0]) - len(

@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 NATIVE_PROJECT_ROOT="${AUTODL_ROOT:-/root/autodl-tmp/search-r1}"
 NATIVE_STAGE="${QWEN_NATIVE_GATE_STAGE:-}"
 NATIVE_PREDECESSOR_EVIDENCE="${QWEN_NATIVE_PREDECESSOR_EVIDENCE:-}"
-NATIVE_DATA_DIR="$NATIVE_PROJECT_ROOT/data/search_mix_qwen35_native"
+NATIVE_DATA_DIR="$NATIVE_PROJECT_ROOT/data/search_mix_qwen35_native_v2"
 export DATA_DIR="$NATIVE_DATA_DIR"
 
 export AUTODL_RUN_BUDGET_PROFILE=gated_followup
@@ -628,8 +628,8 @@ sampling = {
     "tool_protocol": value("tool_protocol"),
 }
 expected_sampling = {
-    "temperature": 1.0, "top_p": 1.0, "top_k": 20, "min_p": 0.0,
-    "presence_penalty": 2.0, "repetition_penalty": 1.0,
+    "temperature": 1.0, "top_p": 1.0, "top_k": 0, "min_p": 0.0,
+    "presence_penalty": 0.0, "repetition_penalty": 1.0,
     "tool_protocol": "qwen35_native",
 }
 checks = {
@@ -665,9 +665,9 @@ expected_env = {
     "eval_group_size": str(expected_group),
     "max_response_length": "500",
     "tool_protocol": "qwen35_native",
-    "rollout_top_k": "20",
+    "rollout_top_k": "0",
     "rollout_min_p": "0.0",
-    "rollout_presence_penalty": "2.0",
+    "rollout_presence_penalty": "0.0",
     "rollout_repetition_penalty": "1.0",
 }
 if any(run_env.get(key) != expected for key, expected in expected_env.items()):

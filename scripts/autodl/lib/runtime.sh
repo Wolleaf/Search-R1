@@ -88,6 +88,15 @@ publish_terminal() {
     sync_path "$attempt"
 }
 
+run_phase_terminal_hook() {
+    local phase="$1" attempt="$2" rc="$3"
+    if declare -F phase_terminal_hook >/dev/null; then
+        if ! phase_terminal_hook "$phase" "$attempt" "$rc"; then
+            printf 'Phase terminal hook failed; durable phase state is unchanged.\n' >&2
+        fi
+    fi
+}
+
 phase_worker() {
     local phase="$1"
     local attempt="$2"
@@ -119,6 +128,7 @@ phase_worker() {
             wait "$child_pid" 2>/dev/null || true
         fi
         publish_terminal "$attempt" "$signal_rc"
+        run_phase_terminal_hook "$phase" "$attempt" "$signal_rc"
         exit "$signal_rc"
     }
     trap 'on_signal 130' INT
@@ -134,6 +144,7 @@ phase_worker() {
     set -e
     trap - INT TERM HUP
     publish_terminal "$attempt" "$rc"
+    run_phase_terminal_hook "$phase" "$attempt" "$rc"
     exit "$rc"
 }
 

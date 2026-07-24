@@ -7,7 +7,7 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$ROOT"' EXIT
 
-DATA_DIR="$ROOT/data/search_mix_qwen35_native"
+DATA_DIR="$ROOT/data/search_mix_qwen35_native_v2"
 LEGACY_DIR="$ROOT/data/search_mix"
 mkdir -p "$DATA_DIR" "$LEGACY_DIR" "$ROOT/data/nq_small" \
     "$ROOT/data/search_opportunity_gate" "$ROOT/envs/train/bin" \
@@ -36,7 +36,8 @@ root = Path(sys.argv[1])
 sample_ids = [f"hotpotqa:train:{index}" for index in range(64)]
 catalog = b"".join(
     (json.dumps({"sample_id": sample_id,
-                 "question": "What is the capital city?"},
+                 "question": "What is the capital city?",
+                 "golden_answers": ["Paris"]},
                 sort_keys=True, separators=(",", ":")) + "\n").encode()
     for sample_id in sample_ids
 )
@@ -76,7 +77,7 @@ QWEN_NATIVE_GATE_STAGE=g0_g1
 source "$AUTODL_DIR/08_gpu_qwen_native_gate.sh"
 require_native_gate
 [[ "$AUTODL_GPU_PIPELINE" == qwen_native_gate && "$TOOL_PROTOCOL" == qwen35_native ]]
-[[ "$DATA_DIR" == "$ROOT/data/search_mix_qwen35_native" ]]
+[[ "$DATA_DIR" == "$ROOT/data/search_mix_qwen35_native_v2" ]]
 [[ "$EVAL_EXPECTED_ROWS" == 16 && "$EVAL_GROUP_SIZE" == 2 ]]
 
 # GPU helpers must import the sealed checkout without relying on an editable install.
@@ -167,8 +168,8 @@ AUTODL_CONFIG_ONLY=1 AUTODL_ROOT="$ROOT" GPU_COUNT=2 \
 grep -Fxq "data.train_files=$DATA_DIR/train_512.parquet" "$CAPTURE"
 grep -Fxq 'data.return_raw_chat=true' "$CAPTURE"
 grep -Fxq 'data.eval_group_size=3' "$CAPTURE"
-grep -Fxq 'actor_rollout_ref.rollout.top_k=20' "$CAPTURE"
-grep -Fxq 'actor_rollout_ref.rollout.presence_penalty=2.0' "$CAPTURE"
+grep -Fxq 'actor_rollout_ref.rollout.top_k=0' "$CAPTURE"
+grep -Fxq 'actor_rollout_ref.rollout.presence_penalty=0.0' "$CAPTURE"
 grep -Fxq '++tool_protocol=qwen35_native' "$CAPTURE"
 
 FIXTURE="$ROOT/protocol-fixture.json"
@@ -181,8 +182,8 @@ import sys
 fixture_path, trace_path = map(Path, sys.argv[1:3])
 digest = sys.argv[3]
 sampling = {
-    "temperature": 1.0, "top_p": 1.0, "top_k": 20, "min_p": 0.0,
-    "presence_penalty": 2.0, "repetition_penalty": 1.0,
+    "temperature": 1.0, "top_p": 1.0, "top_k": 0, "min_p": 0.0,
+    "presence_penalty": 0.0, "repetition_penalty": 1.0,
 }
 records = []
 for mode in ("direct", "native_manager", "legacy_manager"):
@@ -345,9 +346,18 @@ with path.open("w", encoding="utf-8", newline="\n") as handle:
     for question in range(32):
         for slot in range(3):
             invalid = question < 2
+            if invalid:
+                answer = None
+            elif question == 2 and slot == 0:
+                answer = "Paris"
+            elif question == 3 and slot == 0:
+                answer = "The answer is Paris."
+            else:
+                answer = "London"
             trace = {
                 "sample_id": f"hotpotqa:train:{question}", "group_slot": slot,
                 "checkpoint_digest": digest, "question": "What is the capital city?",
+                "gold_answers": ["Paris"], "extracted_answer": answer,
                 "turns": [{
                     "action": "invalid" if invalid else "answer",
                     "valid_action": not invalid, "search_query": None,
@@ -355,7 +365,8 @@ with path.open("w", encoding="utf-8", newline="\n") as handle:
                     "retrieved_docs": [],
                 }],
                 "executed_search_count": 0, "generation_events": [{"clipped": False}],
-                "invalid_action_count": int(invalid), "response_clipped": False, "em": 0,
+                "invalid_action_count": int(invalid), "response_clipped": False,
+                "em": int(answer == "Paris"),
             }
             handle.write(json.dumps(trace, sort_keys=True) + "\n")
 PY
@@ -364,9 +375,101 @@ PY
     --data-manifest "$DATA_DIR/manifest.json" \
     --expected-checkpoint-digest "$DIGEST" --output-dir "$ROOT/g2-analysis"
 grep -Fq '"decision":"NO-GO"' "$ROOT/g2-analysis/go_no_go.json"
+"$PYTHON_BIN" - "$ROOT/g2-analysis/summary.json" <<'PY'
+import json
+from pathlib import Path
+import sys
 
-PYTHONPATH="$AUTODL_DIR${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON_BIN" - "$ROOT" <<'PY'
+summary = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+assert summary["failed_criteria"] == ["invalid_trajectory_count"]
+assert summary["overall"]["strict_em_positive_count"] == 1
+assert summary["overall"]["strict_em_mixed_group_count"] == 1
+assert summary["overall"]["subem_positive_count"] == 2
+assert "subem_positive_count" not in summary["criteria"]
+PY
+
+# G2 readiness is independently replayed from the catalog, not trusted from
+# trace EM or unlocked by diagnostic substring matches.
+G2_READY_TRACE="$ROOT/g2-ready-trace.jsonl"
+G2_SUBEM_TRACE="$ROOT/g2-subem-trace.jsonl"
+G2_BAD_EM_TRACE="$ROOT/g2-bad-em-trace.jsonl"
+G2_BAD_GOLD_TRACE="$ROOT/g2-bad-gold-trace.jsonl"
+"$PYTHON_BIN" - "$G2_TRACE" "$G2_READY_TRACE" "$G2_SUBEM_TRACE" \
+    "$G2_BAD_EM_TRACE" "$G2_BAD_GOLD_TRACE" <<'PY'
+import copy
+import json
+from pathlib import Path
+import sys
+
+source, ready_path, subem_path, bad_em_path, bad_gold_path = map(Path, sys.argv[1:])
+ready = [json.loads(line) for line in source.read_text(encoding="utf-8").splitlines()]
+for row in ready:
+    row["turns"][0]["action"] = "answer"
+    row["turns"][0]["valid_action"] = True
+    row["invalid_action_count"] = 0
+write = lambda path, rows: path.write_text(
+    "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
+    encoding="utf-8", newline="\n")
+write(ready_path, ready)
+
+subem = copy.deepcopy(ready)
+for row in subem:
+    row["extracted_answer"] = "The answer is Paris."
+    row["em"] = 0
+write(subem_path, subem)
+
+bad_em = copy.deepcopy(ready)
+bad_em[6]["em"] = 0
+write(bad_em_path, bad_em)
+
+bad_gold = copy.deepcopy(ready)
+bad_gold[0]["gold_answers"] = ["London"]
+write(bad_gold_path, bad_gold)
+PY
+
+"$PYTHON_BIN" "$AUTODL_DIR/qwen_native_gate_analysis.py" \
+    --stage g2 --trace "$G2_READY_TRACE" --catalog "$DATA_DIR/catalog.jsonl" \
+    --data-manifest "$DATA_DIR/manifest.json" \
+    --expected-checkpoint-digest "$DIGEST" --output-dir "$ROOT/g2-ready-analysis"
+grep -Fq '"decision":"GO"' "$ROOT/g2-ready-analysis/go_no_go.json"
+
+"$PYTHON_BIN" "$AUTODL_DIR/qwen_native_gate_analysis.py" \
+    --stage g2 --trace "$G2_SUBEM_TRACE" --catalog "$DATA_DIR/catalog.jsonl" \
+    --data-manifest "$DATA_DIR/manifest.json" \
+    --expected-checkpoint-digest "$DIGEST" --output-dir "$ROOT/g2-subem-analysis"
+"$PYTHON_BIN" - "$ROOT/g2-subem-analysis/summary.json" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+summary = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+assert summary["decision"] == "NO-GO"
+assert summary["overall"]["strict_em_positive_count"] == 0
+assert summary["overall"]["subem_positive_count"] == 96
+assert set(summary["failed_criteria"]) == {
+    "strict_em_positive_count", "strict_em_mixed_group_count",
+}
+PY
+
+for pair in "$G2_BAD_EM_TRACE:$ROOT/g2-bad-em-analysis" \
+    "$G2_BAD_GOLD_TRACE:$ROOT/g2-bad-gold-analysis"; do
+    trace="${pair%%:*}"
+    output="${pair#*:}"
+    if "$PYTHON_BIN" "$AUTODL_DIR/qwen_native_gate_analysis.py" \
+            --stage g2 --trace "$trace" --catalog "$DATA_DIR/catalog.jsonl" \
+            --data-manifest "$DATA_DIR/manifest.json" \
+            --expected-checkpoint-digest "$DIGEST" --output-dir "$output" \
+            >/dev/null 2>&1; then
+        printf 'G2 accepted trace EM or gold drift: %s\n' "$trace" >&2
+        exit 1
+    fi
+done
+
+PYTHONPATH="$AUTODL_DIR${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON_BIN" - \
+    "$ROOT" "$DATA_DIR/catalog.jsonl" <<'PY'
 import argparse
+import copy
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -374,36 +477,118 @@ import types
 
 import qwen_native_gate_analysis as analysis
 
-root = Path(sys.argv[1])
+root, catalog = map(Path, sys.argv[1:])
+digest = "a" * 64
+trace_path = root / "g3.jsonl"
+records = []
+for question in range(64):
+    for slot in range(5):
+        answer = "Paris" if question == 0 and slot == 0 else "London"
+        records.append({
+            "sample_id": f"hotpotqa:train:{question}",
+            "group_slot": slot,
+            "checkpoint_digest": digest,
+            "question": "What is the capital city?",
+            "gold_answers": ["Paris"],
+            "extracted_answer": answer,
+            "turns": [{
+                "action": "answer", "valid_action": True,
+                "search_query": None, "retrieval_executed": False,
+                "observation": None, "retrieved_docs": [],
+            }],
+            "executed_search_count": 0,
+            "invalid_action_count": 0,
+            "response_clipped": False,
+            "em": int(answer == "Paris"),
+        })
+
+def write(path, rows):
+    path.write_text(
+        "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
+        encoding="utf-8", newline="\n")
+
+write(trace_path, records)
+for name, mutation in (
+    ("g3-bad-em.jsonl", lambda row: row.update(em=0)),
+    ("g3-bad-gold.jsonl", lambda row: row.update(gold_answers=["London"])),
+    ("g3-bad-answer.jsonl", lambda row: row.update(final_answer="London")),
+):
+    bad = copy.deepcopy(records)
+    mutation(bad[0])
+    write(root / name, bad)
+
 captured = {}
 fake = types.ModuleType("probe_analysis")
 def delegated(argv):
     captured["argv"] = argv
+    trace = Path(argv[argv.index("--trace") + 1])
+    catalog_path = Path(argv[argv.index("--catalog") + 1])
+    checkpoint = argv[argv.index("--expected-checkpoint-digest") + 1]
     output = Path(argv[argv.index("--output-dir") + 1])
-    output.mkdir(parents=True, exist_ok=True)
+    rows = [json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines()]
+    trace_digest = hashlib.sha256(trace.read_bytes()).hexdigest()
+    catalog_digest = hashlib.sha256(catalog_path.read_bytes()).hexdigest()
+    output.mkdir(parents=True)
     (output / "summary.json").write_text(json.dumps({
-        "decision": "NO-GO", "input": {"stage": "qwen_native_g3"},
+        "decision": "NO-GO",
+        "input": {
+            "stage": "qwen_native_g3", "trace_sha256": trace_digest,
+            "catalog_sha256": catalog_digest, "checkpoint_digest": checkpoint,
+        },
+        "overall": {"correct_count": sum(row["em"] for row in rows)},
     }), encoding="utf-8")
     (output / "go_no_go.json").write_text(json.dumps({
-        "decision": "NO-GO", "trace_sha256": "b" * 64,
+        "decision": "NO-GO", "trace_sha256": trace_digest,
+        "catalog_sha256": catalog_digest, "checkpoint_digest": checkpoint,
     }), encoding="utf-8")
+    (output / "per_trajectory.jsonl").write_text("".join(
+        json.dumps({
+            "sample_id": row["sample_id"], "group_slot": row["group_slot"],
+            "em": row["em"],
+        }, sort_keys=True) + "\n" for row in rows
+    ), encoding="utf-8")
     return 0
 fake.main = delegated
 sys.modules["probe_analysis"] = fake
 args = argparse.Namespace(
     stage="g3",
-    trace=root / "g3.jsonl", catalog=root / "catalog.jsonl",
-    expected_checkpoint_digest="a" * 64, output_dir=root / "g3-output")
-assert analysis.analyze_g3_with_registered_gate(args) == 0
-assert captured["argv"] == [
+    trace=trace_path, catalog=catalog,
+    expected_checkpoint_digest=digest, output_dir=root / "g3-output")
+expected_ids = [f"hotpotqa:train:{question}" for question in range(64)]
+questions = {sample_id: "What is the capital city?" for sample_id in expected_ids}
+gold = {sample_id: ["Paris"] for sample_id in expected_ids}
+decision = analysis.write_outputs(args, expected_ids, questions, gold, [])
+assert captured["argv"][:6] == [
     "--trace", str(args.trace), "--catalog", str(args.catalog),
     "--expected-checkpoint-digest", args.expected_checkpoint_digest,
-    "--output-dir", str(args.output_dir),
 ]
-decision = analysis.write_outputs(args, [], {}, [])
+assert captured["argv"][6] == "--output-dir"
+staged_output = Path(captured["argv"][7])
+assert staged_output != args.output_dir
+assert staged_output.parent.parent == args.output_dir.parent
 assert decision["stage"] == "g3"
-assert json.loads((args.output_dir / "go_no_go.json").read_bytes())["stage"] == "g3"
+assert decision["strict_em_replay"]["strict_em_positive_count"] == 1
+summary = json.loads((args.output_dir / "summary.json").read_bytes())
+assert summary["strict_em_replay"]["trajectory_count"] == 320
+reports = [json.loads(line) for line in
+           (args.output_dir / "per_trajectory.jsonl").read_text().splitlines()]
+assert all(report["em"] == report["strict_em_replay"]["strict_em"]
+           for report in reports)
 PY
+
+for name in em gold answer; do
+    output="$ROOT/g3-bad-$name-analysis"
+    if "$PYTHON_BIN" "$AUTODL_DIR/qwen_native_gate_analysis.py" \
+            --stage g3 --trace "$ROOT/g3-bad-$name.jsonl" \
+            --catalog "$DATA_DIR/catalog.jsonl" \
+            --data-manifest "$DATA_DIR/manifest.json" \
+            --expected-checkpoint-digest "$DIGEST" --output-dir "$output" \
+            >/dev/null 2>&1; then
+        printf 'G3 accepted answer, gold, or trace EM drift: %s\n' "$name" >&2
+        exit 1
+    fi
+    [[ ! -e "$output" ]]
+done
 
 TRACE_CONTRACT="$ROOT/trace-contract"
 TRACE_CONTRACT_RESULTS="$ROOT/trace-contract-results"
@@ -491,8 +676,8 @@ config = {
         "max_obs_length": 384,
     },
     "actor_rollout_ref": {"rollout": {
-        "temperature": 1.0, "top_p": 1.0, "top_k": 20, "min_p": 0.0,
-        "presence_penalty": 2.0, "repetition_penalty": 1.0,
+        "temperature": 1.0, "top_p": 1.0, "top_k": 0, "min_p": 0.0,
+        "presence_penalty": 0.0, "repetition_penalty": 1.0,
     }},
 }
 path.write_text(json.dumps(config), encoding="utf-8")
@@ -503,16 +688,16 @@ printf '%s\n' \
     'eval_group_size=2' \
     'max_response_length=500' \
     'tool_protocol=qwen35_native' \
-    'rollout_top_k=20' \
+    'rollout_top_k=0' \
     'rollout_min_p=0.0' \
-    'rollout_presence_penalty=2.0' \
+    'rollout_presence_penalty=0.0' \
     'rollout_repetition_penalty=1.0' \
     'input_model=/sealed/model' \
     >"$EVAL_RUN/run.env"
 native_sampling_from_resolved_config "$EVAL_RUN/resolved-config.yaml" \
     "$EVAL_RUN/run.env" >"$RESULTS/sampling.json"
 cp "$EVAL_RUN/resolved-config.yaml" "$ROOT/resolved-config.saved"
-sed -i 's/"presence_penalty": 2.0/"presence_penalty": 0.0/' \
+sed -i 's/"presence_penalty": 0.0/"presence_penalty": 1.0/' \
     "$EVAL_RUN/resolved-config.yaml"
 if native_sampling_from_resolved_config "$EVAL_RUN/resolved-config.yaml" \
         "$EVAL_RUN/run.env" >/dev/null 2>&1; then
@@ -676,7 +861,7 @@ SEAL_RUN_ENV_DIGEST="$(sha256sum "$EVAL_RUN/run.env" | cut -d' ' -f1)"
 revalidate_native_eval_seal_inputs "$EVAL_RUN" "$SEAL_SAMPLING" \
     "$SEAL_CONFIG_DIGEST" "$SEAL_RUN_ENV_DIGEST" "$RESULTS/sampling.json"
 cp "$EVAL_RUN/resolved-config.yaml" "$ROOT/resolved-config.clean"
-sed -i 's/"presence_penalty": 2.0/"presence_penalty": 0.0/' \
+sed -i 's/"presence_penalty": 0.0/"presence_penalty": 1.0/' \
     "$EVAL_RUN/resolved-config.yaml"
 if revalidate_native_eval_seal_inputs "$EVAL_RUN" "$SEAL_SAMPLING" \
         "$SEAL_CONFIG_DIGEST" "$SEAL_RUN_ENV_DIGEST" \
@@ -686,7 +871,7 @@ if revalidate_native_eval_seal_inputs "$EVAL_RUN" "$SEAL_SAMPLING" \
 fi
 mv "$ROOT/resolved-config.clean" "$EVAL_RUN/resolved-config.yaml"
 cp "$EVAL_RUN/run.env" "$ROOT/run-env.clean"
-sed -i 's/rollout_top_k=20/rollout_top_k=19/' "$EVAL_RUN/run.env"
+sed -i 's/rollout_top_k=0/rollout_top_k=1/' "$EVAL_RUN/run.env"
 if revalidate_native_eval_seal_inputs "$EVAL_RUN" "$SEAL_SAMPLING" \
         "$SEAL_CONFIG_DIGEST" "$SEAL_RUN_ENV_DIGEST" \
         "$RESULTS/sampling.json" >/dev/null 2>&1; then
@@ -834,7 +1019,11 @@ if verify_native_predecessor >/dev/null 2>&1; then
 fi
 
 grep -Fq 'AUTODL_QWEN_NATIVE_INCREMENTAL' "$AUTODL_DIR/02_cpu_prepare.sh"
+grep -Fq 'QWEN_NATIVE_DATA_DIR="$DATA_ROOT/search_mix_qwen35_native_v2"' \
+    "$AUTODL_DIR/02_cpu_prepare.sh"
 grep -Fq 'search_mix.py" materialize-native' "$AUTODL_DIR/02_cpu_prepare.sh"
+grep -Fq -- '--no-reselection' "$AUTODL_DIR/02_cpu_prepare.sh"
+grep -Fq 'verify-no-reselection' "$AUTODL_DIR/02_cpu_prepare.sh"
 grep -Fq -- '--expected-tool-protocol qwen35_native' "$AUTODL_DIR/02_cpu_prepare.sh"
 grep -Fq -- '--source-manifest "$SEARCH_MIX_DATA_DIR/manifest.json"' \
     "$AUTODL_DIR/02_cpu_prepare.sh"
@@ -846,7 +1035,7 @@ grep -Fq 'QWEN35_CHAT_TEMPLATE_SHA256' "$AUTODL_DIR/02_cpu_prepare.sh"
 grep -Fq 'add_generation_prompt=True, tokenize=True, return_dict=False' \
     "$AUTODL_DIR/02_cpu_prepare.sh"
 [[ "$(grep -Fc 'if [[ "${AUTODL_QWEN_NATIVE_INCREMENTAL:-0}" != 1 ]]' \
-    "$AUTODL_DIR/02_cpu_prepare.sh")" == 2 ]]
+    "$AUTODL_DIR/02_cpu_prepare.sh")" == 4 ]]
 [[ "$(grep -Ec '^[[:space:]]*build_qwen_native=1$' \
     "$AUTODL_DIR/02_cpu_prepare.sh")" == 2 ]]
 grep -Fq 'elif [[ -f "$QWEN_NATIVE_DATA_DIR/manifest.json" &&' \
@@ -855,6 +1044,20 @@ grep -Fq 'elif [[ -f "$QWEN_NATIVE_DATA_DIR/manifest.json" &&' \
     "$AUTODL_DIR/02_cpu_prepare.sh"
 [[ "$(grep -Fc 'rm -f -- "$MANIFEST_DIR/cpu.ok"' \
     "$AUTODL_DIR/02_cpu_prepare.sh")" == 1 ]]
+for variant in smoke reproduce control cost_aware_gated; do
+    grep -Fq "config-2gpu-qwen-native-$variant-train.yaml" \
+        "$AUTODL_DIR/02_cpu_prepare.sh"
+    grep -Fq -- \
+        "--extra-file \"\$config_manifest_dir/config-2gpu-qwen-native-$variant-train.yaml\"" \
+        "$AUTODL_DIR/02_cpu_prepare.sh"
+done
+for variant in qwen_native_b qwen_native_c; do
+    grep -Fq "config-2gpu-$variant-eval.yaml" \
+        "$AUTODL_DIR/02_cpu_prepare.sh"
+    grep -Fq -- \
+        "--extra-file \"\$config_manifest_dir/config-2gpu-$variant-eval.yaml\"" \
+        "$AUTODL_DIR/02_cpu_prepare.sh"
+done
 PREFLIGHT_LINE="$(grep -n 'qwen_native_gate_preflight "$commit"' \
     "$AUTODL_DIR/03_gpu_run.sh" | cut -d: -f1)"
 RETRIEVER_LINE="$(grep -n 'setsid "$RETRIEVER_ENV/bin/python"' \

@@ -1696,6 +1696,7 @@ def materialize_native(
     model_dir: Path,
     eval_catalogs: Sequence[Path] = (),
     eval_parquets: Sequence[Path] = (),
+    reselect_catalog: bool = True,
 ) -> Path:
     """Re-materialize native prompts from a verified, sealed catalog."""
     source_manifest = source_manifest.resolve()
@@ -1834,7 +1835,8 @@ def materialize_native(
                         eval_catalogs,
                         eval_parquets,
                         expected_tool_protocol=QWEN35_NATIVE,
-                        source_manifest=source_manifest)
+                        source_manifest=source_manifest,
+                        reselect_catalog=reselect_catalog)
         os.replace(staging, output_dir)
     finally:
         if staging.exists():
@@ -2026,6 +2028,7 @@ def verify_manifest(
         eval_parquets: Sequence[Path] = (),
         expected_tool_protocol: Optional[str] = None,
         source_manifest: Optional[Path] = None,
+        reselect_catalog: bool = True,
 ) -> Mapping[str, Any]:
     manifest_path, manifest, protocol = _verify_manifest_artifacts(
         manifest_path, expected_tool_protocol)
@@ -2043,7 +2046,8 @@ def verify_manifest(
             model_dir,
             eval_catalogs,
             eval_parquets,
-            expected_tool_protocol=LEGACY_XML)
+            expected_tool_protocol=LEGACY_XML,
+            reselect_catalog=reselect_catalog)
         source_catalog_sha256 = sha256_file(source_manifest.parent /
                                             CATALOG_FILE)
         expected_lineage = {
@@ -2052,7 +2056,11 @@ def verify_manifest(
         }
         if manifest["derived_from"] != expected_lineage:
             raise ValueError("Native manifest lineage does not match source")
-        verify_replay_receipt(source_manifest)
+        if reselect_catalog:
+            verify_replay_receipt(source_manifest)
+    elif not reselect_catalog:
+        # Skipping selection never skips the sealed retrieval provenance.
+        verify_replay_receipt(manifest_path)
     if protocol == QWEN35_NATIVE:
         if sha256_file(local_dir / CATALOG_FILE) != source_catalog_sha256:
             raise ValueError("Native catalog does not match source catalog")
@@ -2085,7 +2093,7 @@ def verify_manifest(
         for filename in (EVIDENCE_FILE, RETRIEVAL_LEDGER_FILE,
                          SELECTION_FUNNEL_FILE):
             _verify_sidecar(local_dir / filename)
-    else:
+    elif reselect_catalog:
         ledger, evidence = _load_retrieval_contract(local_dir)
         funnel = _load_selection_funnel(local_dir, ledger, "complete")
 
@@ -2113,7 +2121,7 @@ def verify_manifest(
 
     tokenizer = AutoTokenizer.from_pretrained(model_dir, local_files_only=True)
     catalog = read_canonical_jsonl(local_dir / CATALOG_FILE)
-    if protocol == LEGACY_XML:
+    if protocol == LEGACY_XML and reselect_catalog:
         recomputed, rejection_counts, selection_stats = select_catalog(
             evidence, tokenizer, set(excluded_list))
         recomputed.sort(
@@ -2373,20 +2381,22 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         type=Path,
                         action="append",
                         default=[])
-    verify = subparsers.add_parser("verify")
-    verify.add_argument("--manifest", type=Path, required=True)
-    verify.add_argument("--model-dir", type=Path, required=True)
-    verify.add_argument("--eval-catalog",
-                        type=Path,
-                        action="append",
-                        default=[])
-    verify.add_argument("--eval-parquet",
-                        type=Path,
-                        action="append",
-                        default=[])
-    verify.add_argument("--expected-tool-protocol",
-                        choices=SUPPORTED_TOOL_PROTOCOLS)
-    verify.add_argument("--source-manifest", type=Path)
+    native.add_argument("--no-reselection", action="store_true")
+    for command in ("verify", "verify-no-reselection"):
+        verify = subparsers.add_parser(command)
+        verify.add_argument("--manifest", type=Path, required=True)
+        verify.add_argument("--model-dir", type=Path, required=True)
+        verify.add_argument("--eval-catalog",
+                            type=Path,
+                            action="append",
+                            default=[])
+        verify.add_argument("--eval-parquet",
+                            type=Path,
+                            action="append",
+                            default=[])
+        verify.add_argument("--expected-tool-protocol",
+                            choices=SUPPORTED_TOOL_PROTOCOLS)
+        verify.add_argument("--source-manifest", type=Path)
     replay = subparsers.add_parser("replay")
     replay.add_argument("--manifest", type=Path, required=True)
     replay.add_argument("--index-path", type=Path, required=True)
@@ -2413,13 +2423,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"Built retrieval-verified search mixture: {manifest}")
     elif args.command == "materialize-native":
         manifest = materialize_native(args.source_manifest, args.output_dir,
-                                      args.model_dir, args.eval_catalog,
-                                      args.eval_parquet)
+                                       args.model_dir, args.eval_catalog,
+                                       args.eval_parquet,
+                                       reselect_catalog=not args.no_reselection)
         print(f"Built Qwen3.5 native search mixture: {manifest}")
-    elif args.command == "verify":
+    elif args.command in ("verify", "verify-no-reselection"):
         verify_manifest(args.manifest, args.model_dir, args.eval_catalog,
-                        args.eval_parquet, args.expected_tool_protocol,
-                        args.source_manifest)
+                         args.eval_parquet, args.expected_tool_protocol,
+                         args.source_manifest,
+                         reselect_catalog=args.command == "verify")
         print(
             f"Verified retrieval-verified search mixture: {args.manifest.resolve()}"
         )

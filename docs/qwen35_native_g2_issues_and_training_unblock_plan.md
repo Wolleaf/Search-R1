@@ -298,7 +298,7 @@ SHA-256:
 6da6f333b3c97a92d34b8b377bde4228ccf26827cfd513785c4d6f210b8f4755
 ```
 
-当前本地仓库没有该 JSONL，且实例端口在本次写报告时不可达。因此上节只引用已经逐字核实的终局，不凭汇总补造 `group_slot`、query、tool response 或中间 reasoning。下一次 CPU 增量阶段必须先把原始 trace 与哈希归档到 `docs/results/`，再补入 native 完整轨迹；逐轨迹人工 ledger 作为并行分析产物生成，不阻塞 CPU handoff。这也是本轮暴露出的证据归档缺口。
+实现阶段已从实例校验两个原始 `evidence.sha256`、outer attempt 的 `success/0` 终态及上述 trace 哈希，并将完整 G0-G2 证据归档到 [`results/qwen35-native-gates-v1-20260724/`](results/qwen35-native-gates-v1-20260724/)。该归档保留 v1 的原始数据、配置、完整轨迹、分析结果和血缘，不用 v2 parser 追溯重写旧结论。逐轨迹人工 ledger 仍可作为并行分析产物生成，但不阻塞 CPU handoff。
 
 已经完成审计、可用于下次从原件快速定位的样本包括：
 
@@ -449,7 +449,7 @@ temperature=1.0, top_p=1.0, top_k=20, min_p=0.0,
 presence_penalty=2.0, repetition_penalty=1.0
 ```
 
-HF rollout 从经过 top-k 和 presence penalty 处理的 proposal 分布采样，但 actor old/current log-prob 仍按 temperature 后的完整词表分布重算。两者不能直接构成严格一致的 PPO ratio。为防止误训，[`ray_trainer.py`](../verl/trainer/ppo/ray_trainer.py) 已显式拒绝 `qwen35_native && !trainer.val_only`。
+HF rollout 从经过 top-k 和 presence penalty 处理的 proposal 分布采样，但 actor old/current log-prob 仍按 temperature 后的完整词表分布重算。两者不能直接构成严格一致的 PPO ratio。旧实现因此拒绝全部 `qwen35_native && !trainer.val_only`；native-v2 实现保留 fail-closed guard，只放行本方案精确注册的 smoke/R/B/C 四种训练合同和中性采样，其他 native 训练仍拒绝。
 
 直接删除该 guard 不可接受。按最小实现原则，不实现 processed-proposal log-prob 全链路，而是在训练及其 readiness gate 中关闭 top-k/presence penalty。
 
@@ -541,8 +541,8 @@ native-v2 exact attempt 还必须锁定 group 5、train batch 8、response 500 �
 新 prompt version、parser 和训练配置会使旧 handoff 失效，但不需要重新下载或构建全部资产。CPU 无卡阶段只执行：
 
 1. 将现有 G0-G2 原始 evidence 归档并校验哈希；人工答案审计并行物化为逐轨迹 ledger，绑定 rubric、source trace digest 和 SHA-256，但 ledger 未完成不阻塞 handoff。两者都不改变正式结论或门禁。
-2. 用相同 760 条样本、sample ID、顺序和配额重新物化 native v2 prompt。
-3. 运行 parser/reward golden tests、完整 pytest、shell 语法和 Hydra 配置展开；golden tests 必须覆盖 JSON tool call 出现在 answer prefix/content 的两个拒绝分支。
+2. 用相同 760 条样本、sample ID、顺序和配额，在独立的 `data/search_mix_qwen35_native_v2/` 中重新物化 native v2 prompt；旧 v1 目录不覆盖、不删除。
+3. 运行 parser/reward golden tests、完整 pytest、shell 语法、云端事务测试和 Hydra 配置展开；golden tests 必须覆盖 JSON tool call 出现在 answer prefix/content 的两个拒绝分支。
 4. 重新校验模型、语料、BM25、数据 manifest 和依赖 freeze。
 5. 发布绑定新 commit 与 prompt version 的 `cpu_handoff.json` 和 `cpu.ok`。
 
@@ -601,7 +601,7 @@ G3 `GO` 后只运行 2 个更新 step。必须同时满足：
 - 无 OOM、CUDA、NCCL、Ray 或 checkpoint 错误；
 - 保存 step-2 checkpoint、resolved config、完整 train log、WandB offline history 和逐轨迹 trace。
 
-smoke 不通过则停止，不通过降门槛、盲降 batch 或直接跑 60 steps 掩盖问题。
+smoke 分析器从 catalog 与 trajectory 独立重算 strict EM，并从两个 step 的 console/WandB 证据核验上述数值和 mask 条件；`smoke-decision.json` 为 NO-GO 时仍封存完整科学终态，但 main 拒绝该 marker。smoke 不通过则停止，不通过降门槛、盲降 batch 或直接跑 60 steps 掩盖问题。
 
 ### 8.4 R/B/C 分支关系与奖励公式不变
 
@@ -612,7 +612,7 @@ B-mix20-native-v2:       r = EM
 C-gated-mix20-native-v2: r = EM * (1 - 0.10 * n_search / 4)
 ```
 
-B/C 继续共享 parent digest、数据顺序、seed、batch、group、长度、协议、检索器和步数。最终比较 strict EM、搜索次数、统一 utility、共同答对题搜索差，以及代表性完整轨迹。
+B/C 继续共享 parent digest、数据顺序、seed、batch、group、长度、协议、检索器和步数。两个固定终点会在同一 sealed val-128 上分别运行 group-1 endpoint eval，再生成逐题配对的 strict EM、搜索次数、统一 utility、共同答对题搜索差，以及代表性完整轨迹；分析器独立重算 strict EM 并拒绝 catalog/trace 漂移。
 
 ## 9. 论文不变量与必要适配
 
@@ -634,7 +634,7 @@ B/C 继续共享 parent digest、数据顺序、seed、batch、group、长度、
 - **终止语义**：论文 XML rollout 检测闭标签即停止；native HF 路径不新增 stop string，也不做 decode-truncate-reencode。generation 由 EOS 或 500-token 上限结束；parser 要求 `</answer>` 后无非空文本，`response_clipped` 另行检查，不能声称 parser 验证了 EOS。
 - **上下文容量**：论文 retrieved content 和 total sequence 上限分别为 500/4096 tokens；本项目 observation 固定 384，使当前上游四搜加 terminal 路径的 policy right side 为 `4036`，initial left side 另按最多 1024 保存。它是当前代码路径的容量适配，不是论文 4096 total-sequence 的等价实现。
 - **rollout 后端与中性采样**：论文使用 vLLM；HF + SDPA 也不是 Qwen3.5/5090 硬限制，本项目只为复用已验证链路、避免新增后端变量而冻结它。`top_k=0`、`min_p=0.0`、`presence_penalty=0.0`、`repetition_penalty=1.0` 关闭论文未登记、且当前 HF 路径无法与 actor log-prob 一致重放的额外处理。GRPO loss、policy mask、KL 和 clip 公式不改。
-- **资源缩放**：论文为 8 张 H100、500 steps、总 batch 512、mini/micro batch 256/64；本项目计划锁定两张 5090 级 GPU、group 5、train batch 8、PPO mini/micro batch 40/2、R 60 steps、B/C 各 20 steps，不宣称等规模复现。native-v2 训练入口当前尚未解禁，这些是实现和 smoke 必须验证的计划值，不是已经生成的 resolved config。
+- **资源缩放**：论文为 8 张 H100、500 steps、总 batch 512、mini/micro batch 256/64；本项目锁定两张 5090 级 GPU、group 5、train batch 8、PPO mini/micro batch 40/2、R 60 steps、B/C 各 20 steps，不宣称等规模复现。CPU handoff 会封存 smoke/R/B/C 四份 native-v2 训练配置和 B/C 两份 endpoint eval 配置；只有门禁和 smoke 证据通过后，付费入口才按本节顺序放行。
 - **数据缩放**：固定 train-512/val-128、NQ/Hotpot `37.5%/62.5%`、既定 Hotpot comparison/bridge 配额和 seed；这是预算下提高多跳与成本对照密度的预注册子集，B/C 完全共享。
 - **研究变量**：C 分支仅把 B 的 `r=EM` 改为 `r=EM*(1-0.10*n_search/4)`；B/C 从同一个 R checkpoint 对称分叉，其余配置和样本顺序完全一致。
 - **付费运行安全**：G2/G3、2-step smoke、exact evidence、原始 exit code 和 watchdog 关机只用于止损与复算，不改变模型目标函数。

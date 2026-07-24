@@ -365,6 +365,879 @@ validate_legacy_success_artifacts() {
     sync_required "${CAP[attempt]}"
 }
 
+validate_qwen_native_training_evidence() {
+    local contract="$1" project="$2" results="$3" attempt_name="$4" expected_uid="$5"
+    command -v python3 >/dev/null 2>&1 || return 1
+    python3 - "$contract" "$project" "$results" "$attempt_name" "$expected_uid" <<'PY'
+import csv
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import sys
+
+contract, project_raw, results_raw, attempt_name, expected_uid_raw = sys.argv[1:]
+project = Path(project_raw).resolve(strict=True)
+results = Path(results_raw).resolve(strict=True)
+expected_uid = int(expected_uid_raw)
+digest_re = re.compile(r"[0-9a-f]{64}")
+attempt_re = re.compile(r"[0-9]{8}T[0-9]{6}Z-[0-9]+-[0-9]+")
+manifest_re = re.compile(r"([0-9a-f]{64})  ([A-Za-z0-9._/-]+)")
+smoke_check_names = frozenset({
+    "strict_em_positive",
+    "mixed_reward_group",
+    "nonzero_trace_advantage",
+    "finite_actor_pg_loss",
+    "finite_actor_kl_loss",
+    "finite_actor_entropy_loss",
+    "finite_actor_grad_norm",
+    "finite_actor_ppo_kl",
+    "native_batch_contract_valid",
+    "native_batch_info_loss_mask_match",
+    "native_batch_policy_mask_subset",
+    "native_batch_old_log_prob_finite_ratio",
+    "native_batch_advantage_finite_ratio",
+    "native_batch_reward_finite_ratio",
+    "native_batch_policy_tokens",
+    "native_batch_policy_tokens_min_per_trajectory",
+    "native_batch_policy_coverage",
+    "native_batch_nonzero_advantage_tokens",
+    "native_batch_advantage_abs_max",
+    "wandb_offline_history",
+})
+smoke_metric_names = frozenset({
+    "groups",
+    "mixed_groups",
+    "nonzero_trace_advantages",
+    "strict_em_positive_count",
+    "trajectories",
+    "wandb_files",
+})
+
+
+def fail(message):
+    raise SystemExit(message)
+
+
+def protected_file(path):
+    path = Path(path)
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        fail(f"missing protected evidence: {path}: {exc}")
+    if not stat.S_ISREG(info.st_mode) or path.is_symlink():
+        fail(f"evidence is not a regular non-symlink file: {path}")
+    if info.st_uid != expected_uid or info.st_mode & 0o022:
+        fail(f"unsafe evidence ownership or mode: {path}")
+    return path
+
+
+def sha256(path):
+    hasher = hashlib.sha256()
+    with protected_file(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def parse_checksum_manifest(path, verify_files=True):
+    entries = {}
+    previous = None
+    for line in protected_file(path).read_text(encoding="utf-8").splitlines():
+        match = manifest_re.fullmatch(line)
+        if match is None:
+            fail(f"malformed checksum entry: {path}")
+        digest, relative = match.groups()
+        if relative.startswith("/") or "//" in relative or ".." in Path(relative).parts:
+            fail(f"unsafe checksum path: {relative}")
+        if previous is not None and relative <= previous:
+            fail(f"checksum entries are not strictly sorted: {path}")
+        previous = relative
+        if relative in entries:
+            fail(f"duplicate checksum path: {relative}")
+        candidate = project / relative
+        try:
+            canonical = candidate.resolve(strict=True)
+            canonical.relative_to(project)
+        except (OSError, ValueError):
+            fail(f"checksum path escapes project: {relative}")
+        if canonical != candidate:
+            fail(f"checksum path is not canonical: {relative}")
+        protected_file(candidate)
+        if verify_files and sha256(candidate) != digest:
+            fail(f"checksum mismatch: {relative}")
+        entries[relative] = digest
+    if not entries:
+        fail(f"empty checksum manifest: {path}")
+    return entries
+
+
+# The shell caller has just hash-checked every top-level entry. Reparse its
+# structure here without paying for a second full trace read.
+entries = parse_checksum_manifest(results / "evidence.sha256", verify_files=False)
+if results.name != attempt_name:
+    fail("native training result directory does not match the outer attempt")
+
+
+def relative(path):
+    path = Path(path)
+    try:
+        canonical = path.resolve(strict=True)
+        value = canonical.relative_to(project).as_posix()
+    except (OSError, ValueError):
+        fail(f"evidence path escapes project: {path}")
+    if canonical != path:
+        fail(f"evidence path is not canonical: {path}")
+    return value
+
+
+def require_evidence(path):
+    item = relative(path)
+    if item not in entries:
+        fail(f"required file is absent from evidence.sha256: {item}")
+    protected_file(path)
+    return Path(path)
+
+
+def load_json(path, label):
+    path = require_evidence(path)
+    try:
+        value = json.loads(path.read_bytes())
+    except (OSError, json.JSONDecodeError) as exc:
+        fail(f"invalid {label}: {path}: {exc}")
+    if not isinstance(value, dict):
+        fail(f"{label} must be a JSON object: {path}")
+    return value
+
+
+def load_env(path, expected_keys):
+    values = {}
+    lines = require_evidence(path).read_text(encoding="utf-8").splitlines()
+    for line in lines:
+        if not line or "=" not in line:
+            fail(f"malformed env evidence: {path}")
+        key, value = line.split("=", 1)
+        if key in values:
+            fail(f"duplicate env evidence key: {key}")
+        values[key] = value
+    if list(values) != list(expected_keys):
+        fail(f"unexpected env evidence keys or ordering: {path}")
+    return values
+
+
+def load_tsv(path, expected_fields):
+    with require_evidence(path).open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        if reader.fieldnames != list(expected_fields):
+            fail(f"unexpected TSV header: {path}")
+        rows = list(reader)
+    if any(None in row or any(value in (None, "") for value in row.values()) for row in rows):
+        fail(f"empty or extra TSV field: {path}")
+    return rows
+
+
+def require_digest(value, label):
+    if digest_re.fullmatch(value) is None:
+        fail(f"invalid digest for {label}")
+
+
+def require_directory(path, label):
+    path = Path(path)
+    try:
+        info = path.lstat()
+        canonical = path.resolve(strict=True)
+        canonical.relative_to(project)
+    except (OSError, ValueError):
+        fail(f"invalid {label} directory: {path}")
+    if not stat.S_ISDIR(info.st_mode) or path.is_symlink() or canonical != path:
+        fail(f"unsafe {label} directory: {path}")
+    return path
+
+
+tree_digest_cache = {}
+
+
+def tree_sha256(path):
+    root = require_directory(path, "artifact tree")
+    cache_key = str(root)
+    if cache_key in tree_digest_cache:
+        return tree_digest_cache[cache_key]
+    files = []
+    for current_raw, directories, names in os.walk(root, topdown=True, followlinks=False):
+        current = Path(current_raw)
+        kept = []
+        for name in sorted(directories):
+            candidate = current / name
+            rel = candidate.relative_to(root)
+            if rel.parts == (".cache",):
+                continue
+            info = candidate.lstat()
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                fail(f"artifact tree contains an unsafe directory: {candidate}")
+            kept.append(name)
+        directories[:] = kept
+        for name in sorted(names):
+            candidate = current / name
+            protected_file(candidate)
+            rel = candidate.relative_to(root).as_posix()
+            if "\n" in rel or "\r" in rel:
+                fail(f"artifact tree contains an unsafe path: {candidate}")
+            files.append((rel, sha256(candidate)))
+    payload = "".join(
+        f"{digest}  ./{rel}\n" for rel, digest in sorted(files)
+    ).encode("utf-8")
+    digest = hashlib.sha256(payload).hexdigest()
+    tree_digest_cache[cache_key] = digest
+    return digest
+
+
+def wandb_tree(path):
+    path = Path(path)
+    if not path.is_dir() or path.is_symlink():
+        return 0, ""
+    root = path.resolve()
+    files = []
+    for item in sorted(path.rglob("*"), key=lambda value: value.as_posix()):
+        if item.is_symlink():
+            try:
+                target = item.resolve(strict=True)
+            except OSError as exc:
+                fail(f"broken WandB symlink: {item}: {exc}")
+            if target != root and root not in target.parents:
+                fail(f"WandB symlink escapes its run directory: {item}")
+            continue
+        if item.is_file():
+            protected_file(item)
+            files.append((item.relative_to(path).as_posix(), sha256(item)))
+    if not files or not any(name.endswith(".wandb") for name, _ in files):
+        return len(files), ""
+    payload = "".join(
+        f"{digest}  {name}\n" for name, digest in files
+    ).encode("utf-8")
+    return len(files), hashlib.sha256(payload).hexdigest()
+
+
+def validate_smoke_decision_shape(decision):
+    expected_keys = {
+        "checks", "decision", "inputs", "metrics", "schema", "schema_version",
+    }
+    if set(decision) != expected_keys or \
+            decision.get("schema") != "search-r1.qwen-native-smoke-decision" or \
+            decision.get("schema_version") != 1 or \
+            decision.get("decision") not in {"GO", "NO-GO"}:
+        fail("smoke-decision identity is invalid")
+    checks = decision.get("checks")
+    if not isinstance(checks, dict) or set(checks) != smoke_check_names:
+        fail("smoke-decision does not contain the fixed check set")
+    for name, item in checks.items():
+        if not isinstance(item, dict) or set(item) != {"observed", "passed"} or \
+                not isinstance(item["passed"], bool):
+            fail(f"malformed smoke check: {name}")
+    if all(item["passed"] for item in checks.values()) != \
+            (decision["decision"] == "GO"):
+        fail("smoke decision disagrees with its checks")
+    inputs = decision.get("inputs")
+    if not isinstance(inputs, dict) or set(inputs) != {
+            "catalog_sha256", "log_sha256", "trace_sha256",
+            "wandb_tree_sha256"}:
+        fail("smoke-decision input schema is invalid")
+    metrics = decision.get("metrics")
+    if not isinstance(metrics, dict) or set(metrics) != smoke_metric_names:
+        fail("smoke-decision metrics schema is invalid")
+    if any(isinstance(metrics[name], bool) or not isinstance(metrics[name], int) or
+           metrics[name] < 0 for name in smoke_metric_names):
+        fail("smoke-decision metrics must be non-negative integers")
+    expected_metrics = {
+        "groups": 16,
+        "trajectories": 80,
+    }
+    if any(metrics[name] != value for name, value in expected_metrics.items()):
+        fail("smoke-decision registered shape is invalid")
+    observed_pairs = {
+        "strict_em_positive": "strict_em_positive_count",
+        "mixed_reward_group": "mixed_groups",
+        "nonzero_trace_advantage": "nonzero_trace_advantages",
+        "wandb_offline_history": "wandb_files",
+    }
+    if any(checks[check]["observed"] != metrics[metric]
+           for check, metric in observed_pairs.items()):
+        fail("smoke check observations disagree with metrics")
+    return checks, metrics
+
+
+def validate_bound_predecessor(
+        marker_raw, namespace, result_parent, digest, expected_contract):
+    require_digest(digest, f"{namespace} predecessor")
+    marker = Path(marker_raw)
+    marker_id = marker.name.removesuffix(".ok")
+    expected_marker = project / "manifests" / namespace / f"{marker_id}.ok"
+    if attempt_re.fullmatch(marker_id) is None or marker != expected_marker:
+        fail(f"invalid {namespace} predecessor marker")
+    require_evidence(marker)
+    source_manifest = project / result_parent / marker_id / "evidence.sha256"
+    require_evidence(source_manifest)
+    if marker.read_text(encoding="utf-8").strip() != digest:
+        fail(f"{namespace} marker digest mismatch")
+    if sha256(source_manifest) != digest:
+        fail(f"{namespace} evidence digest mismatch")
+    source_entries = parse_checksum_manifest(source_manifest)
+    source_root = source_manifest.parent
+    outer = require_directory(
+        project / "state" / "attempts" / "gpu" / marker_id,
+        f"{namespace} outer attempt",
+    )
+    success = protected_file(outer / ".success")
+    if success.stat().st_size != 0:
+        fail(f"{namespace} predecessor success marker is not empty")
+    for name in (".failed", ".starting", ".running"):
+        path = outer / name
+        if path.exists() or path.is_symlink():
+            fail(f"{namespace} predecessor has a nonterminal marker: {name}")
+    bindings = {
+        "terminal": "success",
+        "exit-code": "0",
+        "result-contract": expected_contract,
+        "result-root": str(source_root),
+        "evidence-marker": str(marker),
+        "evidence-digest": digest,
+    }
+    for name, expected in bindings.items():
+        value = protected_file(outer / name).read_text(encoding="utf-8").strip()
+        if value != expected:
+            fail(f"{namespace} predecessor outer binding mismatch: {name}")
+    return source_manifest.parent, source_entries
+
+
+def require_run_evidence(run_dir_raw, kind):
+    run_dir = require_directory(run_dir_raw, "run")
+    common = ("train.log", "resolved-config.yaml", "run.env")
+    if kind == "train":
+        required = common + (
+            "lineage.tsv",
+            "native-training-contract.json",
+            "traces/train_trajectories.jsonl",
+            "traces/train_trajectories.manifest.json",
+            "traces/train_trajectories.manifest.json.sha256",
+        )
+    elif kind == "eval":
+        required = common + (
+            "traces/eval_predictions.jsonl",
+            "traces/eval_predictions.manifest.json",
+            "traces/eval_predictions.manifest.json.sha256",
+        )
+    else:
+        fail(f"unknown native run evidence kind: {kind}")
+    for item in required:
+        require_evidence(run_dir / item)
+    return run_dir
+
+
+smoke_lineage_fields = (
+    "stage", "role", "run_dir", "checkpoint", "checkpoint_digest",
+    "parent_checkpoint", "parent_checkpoint_digest", "checkout_commit",
+    "cpu_handoff_digest", "data_manifest_sha256", "resolved_config_sha256",
+    "trace_sha256", "trace_manifest_sha256", "run_contract_sha256",
+    "pretrain_g3_evidence", "pretrain_g3_evidence_sha256",
+)
+main_lineage_fields = smoke_lineage_fields[:-2] + ("predecessor_evidence_sha256",)
+index_fields = ("stage", "role", "run_dir")
+checkout_commit = require_evidence(project / "manifests/git.ok").read_text(
+    encoding="utf-8"
+).strip()
+handoff_digest = require_evidence(project / "manifests/cpu.ok").read_text(
+    encoding="utf-8"
+).strip()
+data_manifest = require_evidence(
+    project / "data/search_mix_qwen35_native_v2/manifest.json"
+)
+data_manifest_digest = sha256(data_manifest)
+if re.fullmatch(r"[0-9a-f]{40}", checkout_commit) is None:
+    fail("invalid sealed checkout commit")
+require_digest(handoff_digest, "sealed CPU handoff")
+
+
+def validate_common_lineage(row, stage, role, run_kind, predecessor_digest):
+    if row["stage"] != stage or row["role"] != role:
+        fail(f"unexpected lineage stage/role: {row['stage']}/{row['role']}")
+    run_dir = require_run_evidence(row["run_dir"], run_kind)
+    checkpoint = require_directory(row["checkpoint"], "checkpoint")
+    parent = require_directory(row["parent_checkpoint"], "parent checkpoint")
+    for key in (
+        "checkpoint_digest", "parent_checkpoint_digest", "cpu_handoff_digest",
+        "data_manifest_sha256", "resolved_config_sha256", "trace_sha256",
+        "trace_manifest_sha256",
+    ):
+        require_digest(row[key], f"{stage}.{key}")
+    if re.fullmatch(r"[0-9a-f]{40}", row["checkout_commit"]) is None:
+        fail(f"invalid checkout commit for {stage}")
+    run_contract = row["run_contract_sha256"]
+    if run_contract != "-":
+        require_digest(run_contract, f"{stage}.run_contract_sha256")
+    if row.get("predecessor_evidence_sha256") != predecessor_digest:
+        fail(f"wrong predecessor digest for {stage}")
+    if row["checkout_commit"] != checkout_commit or \
+            row["cpu_handoff_digest"] != handoff_digest or \
+            row["data_manifest_sha256"] != data_manifest_digest:
+        fail(f"sealed identity mismatch for {stage}")
+    if row["checkpoint_digest"] != tree_sha256(checkpoint) or \
+            row["parent_checkpoint_digest"] != tree_sha256(parent):
+        fail(f"checkpoint tree mismatch for {stage}")
+    if row["resolved_config_sha256"] != sha256(run_dir / "resolved-config.yaml"):
+        fail(f"resolved config digest mismatch for {stage}")
+    if run_kind == "train":
+        trace = run_dir / "traces/train_trajectories.jsonl"
+        trace_manifest = run_dir / "traces/train_trajectories.manifest.json"
+        if run_contract != sha256(run_dir / "native-training-contract.json"):
+            fail(f"run contract digest mismatch for {stage}")
+    else:
+        trace = run_dir / "traces/eval_predictions.jsonl"
+        trace_manifest = run_dir / "traces/eval_predictions.manifest.json"
+        if run_contract != "-":
+            fail(f"eval run unexpectedly declares a run contract for {stage}")
+    if row["trace_sha256"] != sha256(trace) or \
+            row["trace_manifest_sha256"] != sha256(trace_manifest):
+        fail(f"trace digest mismatch for {stage}")
+
+
+if contract == "qwen-native-training-smoke-v1":
+    env = load_env(
+        results / "contract.env",
+        (
+            "schema", "stage", "stage_order", "decision", "manual_review_required",
+            "pretrain_g3_evidence", "pretrain_g3_evidence_sha256",
+        ),
+    )
+    expected = {
+        "schema": contract,
+        "stage": "smoke",
+        "stage_order": "S2",
+        "manual_review_required": "true",
+    }
+    if any(env[key] != value for key, value in expected.items()):
+        fail("smoke contract.env identity mismatch")
+    if env["decision"] not in {"GO", "NO-GO"}:
+        fail("invalid smoke contract decision")
+    pretrain_root, pretrain_entries = validate_bound_predecessor(
+        env["pretrain_g3_evidence"],
+        "qwen-native-gate",
+        "runs/qwen-native-gate/attempts",
+        env["pretrain_g3_evidence_sha256"],
+        "qwen-native-gate-v1",
+    )
+    if any(relative(pretrain_root / name) not in pretrain_entries
+           for name in ("stage.txt", "go_no_go.json")):
+        fail("smoke predecessor omits its G3 decision evidence")
+    if (pretrain_root / "stage.txt").read_text(encoding="utf-8").strip() != "g3":
+        fail("smoke predecessor is not G3")
+    if json.loads((pretrain_root / "go_no_go.json").read_bytes()).get("decision") != "GO":
+        fail("smoke predecessor is not a G3 GO")
+    rows = load_tsv(results / "lineage.tsv", smoke_lineage_fields)
+    index = load_tsv(results / "run-index.tsv", index_fields)
+    if len(rows) != 1 or len(index) != 1:
+        fail("smoke evidence must contain exactly one S run")
+    row = rows[0]
+    if row["stage"] != "S" or row["role"] != "smoke":
+        fail("smoke lineage stage/role mismatch")
+    if index[0] != {"stage": "S", "role": "smoke", "run_dir": row["run_dir"]}:
+        fail("smoke run-index does not match lineage")
+    run_dir = require_run_evidence(row["run_dir"], "train")
+    checkpoint = require_directory(row["checkpoint"], "smoke checkpoint")
+    parent = require_directory(row["parent_checkpoint"], "smoke parent checkpoint")
+    for key in (
+        "checkpoint_digest", "parent_checkpoint_digest", "cpu_handoff_digest",
+        "data_manifest_sha256", "resolved_config_sha256", "trace_sha256",
+        "trace_manifest_sha256", "run_contract_sha256",
+    ):
+        require_digest(row[key], f"smoke.{key}")
+    if re.fullmatch(r"[0-9a-f]{40}", row["checkout_commit"]) is None:
+        fail("invalid smoke checkout commit")
+    if row["checkout_commit"] != checkout_commit or \
+            row["cpu_handoff_digest"] != handoff_digest or \
+            row["data_manifest_sha256"] != data_manifest_digest:
+        fail("smoke sealed identity mismatch")
+    if row["checkpoint_digest"] != tree_sha256(checkpoint) or \
+            row["parent_checkpoint_digest"] != tree_sha256(parent):
+        fail("smoke checkpoint tree mismatch")
+    smoke_artifact_digests = {
+        "resolved_config_sha256": sha256(run_dir / "resolved-config.yaml"),
+        "trace_sha256": sha256(run_dir / "traces/train_trajectories.jsonl"),
+        "trace_manifest_sha256": sha256(
+            run_dir / "traces/train_trajectories.manifest.json"
+        ),
+        "run_contract_sha256": sha256(run_dir / "native-training-contract.json"),
+    }
+    if any(row[key] != value for key, value in smoke_artifact_digests.items()):
+        fail("smoke run artifact digest mismatch")
+    if row["pretrain_g3_evidence"] != env["pretrain_g3_evidence"] or \
+            row["pretrain_g3_evidence_sha256"] != env["pretrain_g3_evidence_sha256"]:
+        fail("smoke lineage predecessor mismatch")
+    checkpoint_env = load_env(
+        results / "checkpoint-tree.env", ("checkpoint", "checkpoint_tree_sha256")
+    )
+    if checkpoint_env["checkpoint"] != row["checkpoint"] or \
+            checkpoint_env["checkpoint_tree_sha256"] != row["checkpoint_digest"]:
+        fail("smoke checkpoint-tree evidence mismatch")
+    smoke_decision = load_json(results / "smoke-decision.json", "smoke decision")
+    checks, metrics = validate_smoke_decision_shape(smoke_decision)
+    if smoke_decision["decision"] != env["decision"]:
+        fail("smoke-decision identity does not match contract.env")
+    inputs = smoke_decision.get("inputs")
+    if not isinstance(inputs, dict) or set(inputs) != {
+            "catalog_sha256", "log_sha256", "trace_sha256", "wandb_tree_sha256"}:
+        fail("malformed smoke decision inputs")
+    catalog = require_evidence(project / "data/search_mix_qwen35_native_v2/catalog.jsonl")
+    expected_inputs = {
+        "catalog_sha256": sha256(catalog),
+        "log_sha256": sha256(run_dir / "train.log"),
+        "trace_sha256": sha256(run_dir / "traces/train_trajectories.jsonl"),
+    }
+    wandb_files, wandb_digest = wandb_tree(run_dir / "wandb")
+    if any(inputs.get(key) != value for key, value in expected_inputs.items()) or \
+            inputs.get("wandb_tree_sha256") != wandb_digest or \
+            metrics["wandb_files"] != wandb_files:
+        fail("smoke decision input digest mismatch")
+    storage = load_env(
+        results / "storage.env",
+        ("checkpoint_bytes", "filesystem_available_bytes", "recorded_at"),
+    )
+    for key in ("checkpoint_bytes", "filesystem_available_bytes"):
+        if re.fullmatch(r"[0-9]+", storage[key]) is None:
+            fail(f"invalid smoke storage value: {key}")
+    if re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", storage["recorded_at"]) is None:
+        fail("invalid smoke storage timestamp")
+
+elif contract == "qwen-native-training-main-v1":
+    env = load_env(
+        results / "contract.env",
+        (
+            "schema", "stage", "stage_order", "analysis_decision",
+            "cost_contrast_group_count", "branch_authorized",
+            "pretrain_g3_evidence", "pretrain_g3_evidence_sha256",
+            "smoke_evidence", "smoke_evidence_sha256",
+        ),
+    )
+    if env["schema"] != contract or env["stage"] != "main":
+        fail("main contract.env identity mismatch")
+    if env["analysis_decision"] not in {"GO", "NO-GO"}:
+        fail("invalid main analysis decision")
+    if re.fullmatch(r"[0-9]+", env["cost_contrast_group_count"]) is None:
+        fail("invalid cost contrast group count")
+    contrast_count = int(env["cost_contrast_group_count"])
+    if env["branch_authorized"] not in {"true", "false"}:
+        fail("invalid branch authorization value")
+    authorized = env["branch_authorized"] == "true"
+    expected_authorized = env["analysis_decision"] == "GO" and contrast_count >= 8
+    if authorized != expected_authorized:
+        fail("branch authorization is inconsistent with the post-R gate")
+    expected_stage_order = "R60,G3,B20,C20,B-EVAL,C-EVAL" if authorized else "R60,G3"
+    if env["stage_order"] != expected_stage_order:
+        fail("main stage order is inconsistent with branch authorization")
+    pretrain_root, pretrain_entries = validate_bound_predecessor(
+        env["pretrain_g3_evidence"],
+        "qwen-native-gate",
+        "runs/qwen-native-gate/attempts",
+        env["pretrain_g3_evidence_sha256"],
+        "qwen-native-gate-v1",
+    )
+    if any(relative(pretrain_root / name) not in pretrain_entries
+           for name in ("stage.txt", "go_no_go.json")):
+        fail("main predecessor omits its G3 decision evidence")
+    if (pretrain_root / "stage.txt").read_text(encoding="utf-8").strip() != "g3" or \
+            json.loads((pretrain_root / "go_no_go.json").read_bytes()).get("decision") != "GO":
+        fail("main pretraining predecessor is not a G3 GO")
+    smoke_root, smoke_entries = validate_bound_predecessor(
+        env["smoke_evidence"],
+        "qwen-native-training-smoke",
+        "runs/qwen-native-training/attempts",
+        env["smoke_evidence_sha256"],
+        "qwen-native-training-smoke-v1",
+    )
+    if any(relative(smoke_root / name) not in smoke_entries
+           for name in ("contract.env", "smoke-decision.json")):
+        fail("main predecessor omits its smoke decision evidence")
+    smoke_env = load_env(
+        smoke_root / "contract.env",
+        (
+            "schema", "stage", "stage_order", "decision", "manual_review_required",
+            "pretrain_g3_evidence", "pretrain_g3_evidence_sha256",
+        ),
+    )
+    if (smoke_env["schema"] != "qwen-native-training-smoke-v1" or
+            smoke_env["stage"] != "smoke" or smoke_env["stage_order"] != "S2" or
+            smoke_env["decision"] != "GO" or smoke_env["manual_review_required"] != "true"):
+        fail("main smoke predecessor contract mismatch")
+    try:
+        smoke_decision = json.loads(
+            (smoke_root / "smoke-decision.json").read_bytes()
+        )
+    except (OSError, json.JSONDecodeError) as exc:
+        fail(f"invalid main smoke predecessor decision: {exc}")
+    if not isinstance(smoke_decision, dict):
+        fail("main smoke predecessor decision must be an object")
+    validate_smoke_decision_shape(smoke_decision)
+    if smoke_decision.get("decision") != "GO":
+        fail("main smoke predecessor decision is not GO")
+    if smoke_env["pretrain_g3_evidence"] != env["pretrain_g3_evidence"] or \
+            smoke_env["pretrain_g3_evidence_sha256"] != env["pretrain_g3_evidence_sha256"]:
+        fail("main predecessors do not share the same G3 evidence")
+    decision_path = require_evidence(results / "branch-decision.json")
+    decision = json.loads(decision_path.read_bytes())
+    expected_decision_keys = {
+        "analysis_decision", "branches_authorized", "cost_contrast_group_count",
+        "cost_contrast_group_minimum", "decision", "schema",
+    }
+    if set(decision) != expected_decision_keys:
+        fail("unexpected branch-decision schema")
+    expected_decision = {
+        "analysis_decision": env["analysis_decision"],
+        "branches_authorized": authorized,
+        "cost_contrast_group_count": contrast_count,
+        "cost_contrast_group_minimum": 8,
+        "decision": "GO" if authorized else "NO-GO",
+        "schema": "qwen-native-post-r-gate-v1",
+    }
+    if decision != expected_decision:
+        fail("branch-decision.json is inconsistent with contract.env")
+    analysis_root = results / "r-g3-analysis"
+    for name in (
+        "summary.json", "summary.md", "go_no_go.json", "per_trajectory.jsonl",
+        "per_question.jsonl",
+    ):
+        require_evidence(analysis_root / name)
+    analysis_decision = load_json(
+        analysis_root / "go_no_go.json", "R-G3 decision"
+    )
+    analysis_summary = load_json(
+        analysis_root / "summary.json", "R-G3 summary"
+    )
+    if analysis_decision.get("stage") != "g3" or \
+            analysis_decision.get("decision") != env["analysis_decision"]:
+        fail("R-G3 decision is inconsistent with main contract")
+    if analysis_summary.get("decision") != env["analysis_decision"] or \
+            analysis_summary.get("overall", {}).get("cost_contrast_group_count") != contrast_count:
+        fail("R-G3 summary is inconsistent with main contract")
+    rows = load_tsv(results / "lineage.tsv", main_lineage_fields)
+    index = load_tsv(results / "run-index.tsv", index_fields)
+    expected = [
+        ("R", "reproduced", "train"),
+        ("G3", "capability_gate", "eval"),
+    ]
+    if authorized:
+        expected.extend((
+            ("B", "control", "train"),
+            ("C", "cost_aware_gated", "train"),
+            ("B-EVAL", "control_eval", "eval"),
+            ("C-EVAL", "cost_aware_gated_eval", "eval"),
+        ))
+    if len(rows) != len(expected) or len(index) != len(expected):
+        fail("main lineage/run-index row count does not match branch decision")
+    by_stage = {}
+    for position, ((stage, role, kind), row, index_row) in enumerate(zip(expected, rows, index)):
+        validate_common_lineage(row, stage, role, kind, env["smoke_evidence_sha256"])
+        expected_index = {"stage": stage, "role": role, "run_dir": row["run_dir"]}
+        if index_row != expected_index:
+            fail(f"run-index does not match lineage at position {position}")
+        by_stage[stage] = row
+    r_row = by_stage["R"]
+    g3_row = by_stage["G3"]
+    if g3_row["checkpoint"] != r_row["checkpoint"] or \
+            g3_row["checkpoint_digest"] != r_row["checkpoint_digest"]:
+        fail("R-G3 does not evaluate the sealed R checkpoint")
+    if g3_row["parent_checkpoint"] != r_row["checkpoint"] or \
+            g3_row["parent_checkpoint_digest"] != r_row["checkpoint_digest"]:
+        fail("R-G3 evaluation lineage does not bind its input checkpoint")
+    g3_run = Path(g3_row["run_dir"])
+    g3_trace = g3_run / "traces/eval_predictions.jsonl"
+    g3_trace_digest = sha256(g3_trace)
+    catalog = require_evidence(
+        project / "data/search_mix_qwen35_native_v2/catalog.jsonl"
+    )
+    catalog_digest = sha256(catalog)
+    summary_input = analysis_summary.get("input")
+    summary_contract = analysis_summary.get("contract")
+    summary_gate = analysis_summary.get("go_no_go")
+    replay = analysis_summary.get("strict_em_replay")
+    if (analysis_summary.get("schema") != "search-r1.grouped-probe-analysis" or
+            analysis_summary.get("schema_version") != 2 or
+            not isinstance(summary_input, dict) or
+            not isinstance(summary_contract, dict) or
+            not isinstance(summary_gate, dict) or
+            not isinstance(replay, dict)):
+        fail("R-G3 summary schema is incomplete")
+    expected_summary_input = {
+        "trace_path": str(g3_trace),
+        "trace_sha256": g3_trace_digest,
+        "catalog_path": str(catalog),
+        "catalog_sha256": catalog_digest,
+        "checkpoint_digest": r_row["checkpoint_digest"],
+        "stage": "qwen_native_g3",
+    }
+    if any(summary_input.get(key) != value
+           for key, value in expected_summary_input.items()):
+        fail("R-G3 summary input is not bound to the G3 lineage")
+    expected_probe_contract = {
+        "expected_questions": 64,
+        "trajectories_per_question": 5,
+        "expected_trajectories": 320,
+        "max_searches": 4,
+    }
+    if any(summary_contract.get(key) != value
+           for key, value in expected_probe_contract.items()):
+        fail("R-G3 registered probe contract is invalid")
+    expected_replay = {
+        "schema": "search-r1.strict-em-replay",
+        "schema_version": 1,
+        "source": "catalog.golden_answers+trace.extracted_answer/final_answer",
+        "verified": True,
+        "trajectory_count": 320,
+        "trace_sha256": g3_trace_digest,
+        "catalog_sha256": catalog_digest,
+    }
+    if any(replay.get(key) != value for key, value in expected_replay.items()):
+        fail("R-G3 strict-EM replay binding is invalid")
+    for key in ("strict_em_positive_count", "subem_positive_count"):
+        value = replay.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 320:
+            fail(f"R-G3 strict-EM replay count is invalid: {key}")
+    expected_decision_binding = {
+        "schema": "search-r1.grouped-probe-analysis",
+        "schema_version": 2,
+        "stage": "g3",
+        "decision": env["analysis_decision"],
+        "trace_sha256": g3_trace_digest,
+        "catalog_sha256": catalog_digest,
+        "checkpoint_digest": r_row["checkpoint_digest"],
+    }
+    if any(analysis_decision.get(key) != value
+           for key, value in expected_decision_binding.items()) or \
+            analysis_decision.get("strict_em_replay") != replay or \
+            summary_gate.get("decision") != env["analysis_decision"]:
+        fail("R-G3 decision is not bound to its strict-EM summary")
+    if authorized:
+        for stage in ("B", "C"):
+            row = by_stage[stage]
+            if row["parent_checkpoint"] != r_row["checkpoint"] or \
+                    row["parent_checkpoint_digest"] != r_row["checkpoint_digest"]:
+                fail(f"{stage} does not descend from the sealed R checkpoint")
+        for eval_stage, train_stage in (("B-EVAL", "B"), ("C-EVAL", "C")):
+            eval_row = by_stage[eval_stage]
+            train_row = by_stage[train_stage]
+            if eval_row["checkpoint"] != train_row["checkpoint"] or \
+                    eval_row["checkpoint_digest"] != train_row["checkpoint_digest"]:
+                fail(f"{eval_stage} does not evaluate the matching branch checkpoint")
+            if eval_row["parent_checkpoint"] != train_row["checkpoint"] or \
+                    eval_row["parent_checkpoint_digest"] != train_row["checkpoint_digest"]:
+                fail(f"{eval_stage} lineage does not bind its input checkpoint")
+        paired = results / "paired"
+        for name in (
+            "summary.json", "summary.md", "paired_results.csv", "correct_questions.csv",
+            "wrong_questions.csv", "search_transition.csv",
+        ):
+            require_evidence(paired / name)
+        paired_summary = load_json(paired / "summary.json", "paired summary")
+        expected_paired_keys = {
+            "schema_version", "expected_rows", "cost_lambda", "max_searches",
+            "inputs", "stages", "comparisons", "catalog", "formal_contract",
+        }
+        if set(paired_summary) != expected_paired_keys or \
+                paired_summary["schema_version"] != 1 or \
+                paired_summary["expected_rows"] != 128 or \
+                paired_summary["cost_lambda"] != 0.10 or \
+                paired_summary["max_searches"] != 4:
+            fail("paired summary schema or fixed evaluation contract is invalid")
+        paired_inputs = paired_summary.get("inputs")
+        paired_stages = paired_summary.get("stages")
+        paired_comparisons = paired_summary.get("comparisons")
+        if not isinstance(paired_inputs, dict) or set(paired_inputs) != {
+                "control", "cost_aware_gated"} or \
+                not isinstance(paired_stages, dict) or set(paired_stages) != {
+                    "control", "cost_aware_gated"} or \
+                not isinstance(paired_comparisons, dict) or \
+                set(paired_comparisons) != {"cost_aware_gated"}:
+            fail("paired summary roles are invalid")
+        paired_runs = {
+            "control": (
+                Path(by_stage["B-EVAL"]["run_dir"]),
+                "qwen_native_b",
+            ),
+            "cost_aware_gated": (
+                Path(by_stage["C-EVAL"]["run_dir"]),
+                "qwen_native_c",
+            ),
+        }
+        for role, (run_dir, expected_stage) in paired_runs.items():
+            trace = run_dir / "traces/eval_predictions.jsonl"
+            expected_input = {
+                "path": str(trace),
+                "sha256": sha256(trace),
+            }
+            if paired_inputs[role] != expected_input or \
+                    not isinstance(paired_stages[role], dict) or \
+                    paired_stages[role].get("stage") != expected_stage:
+                fail(f"paired summary input mismatch for {role}")
+        paired_catalog = paired_summary.get("catalog")
+        catalog_rows = catalog.read_text(encoding="utf-8").splitlines()
+        if not isinstance(paired_catalog, dict) or paired_catalog != {
+                "path": str(catalog),
+                "sha256": catalog_digest,
+                "row_count": len(catalog_rows),
+                "matched_rows": 128,
+                "replay_status": "passed",
+                "strict_em_scorer": "qa_em.em_check",
+        }:
+            fail("paired summary catalog replay binding is invalid")
+        try:
+            data_contract = json.loads(data_manifest.read_bytes())
+        except json.JSONDecodeError as exc:
+            fail(f"invalid formal data manifest: {exc}")
+        artifacts = data_contract.get("artifacts", {}) \
+            if isinstance(data_contract, dict) else {}
+        val_artifact = artifacts.get("val", {}) \
+            if isinstance(artifacts, dict) else {}
+        sample_ids = val_artifact.get("sample_ids") \
+            if isinstance(val_artifact, dict) else None
+        if not isinstance(sample_ids, list) or len(sample_ids) != 128:
+            fail("formal data manifest does not bind val_128 sample IDs")
+        sample_ids_digest = hashlib.sha256(json.dumps(
+            sample_ids, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")).hexdigest()
+        expected_formal_contract = {
+            "mode": "qwen35_native_v2_b_c",
+            "data_manifest": {
+                "path": str(data_manifest),
+                "sha256": data_manifest_digest,
+                "schema_version": 3,
+            },
+            "catalog": {
+                "path": str(catalog),
+                "sha256": catalog_digest,
+            },
+            "val": {
+                "file": "val_128.parquet",
+                "rows": 128,
+                "sample_ids_sha256": sample_ids_digest,
+                "sample_set_status": "exact",
+            },
+            "endpoints": {
+                "control": {
+                    "stage": "qwen_native_b",
+                    "checkpoint_digest": by_stage["B"]["checkpoint_digest"],
+                },
+                "cost_aware_gated": {
+                    "stage": "qwen_native_c",
+                    "checkpoint_digest": by_stage["C"]["checkpoint_digest"],
+                },
+            },
+        }
+        if paired_summary.get("formal_contract") != expected_formal_contract:
+            fail("paired summary formal contract is invalid")
+else:
+    fail(f"unsupported native training contract: {contract}")
+PY
+}
+
 validate_followup_success_artifacts() {
     local project="${CAP[project_root]}" attempt="${CAP[attempt]}" expected_uid
     local contract_file result_root_file marker_file digest_file results expected_results_parent
@@ -419,6 +1292,24 @@ validate_followup_success_artifacts() {
                 per_question.jsonl lineage.tsv run-index.tsv stage.txt sampling.json
             )
             ;;
+        qwen-native-training-smoke-v1)
+            results_relative_parent='runs/qwen-native-training/attempts'
+            marker_relative_parent='manifests/qwen-native-training-smoke'
+            required=(
+                contract.env lineage.tsv run-index.tsv storage.env checkpoint-tree.env
+                smoke-decision.json
+            )
+            ;;
+        qwen-native-training-main-v1)
+            results_relative_parent='runs/qwen-native-training/attempts'
+            marker_relative_parent='manifests/qwen-native-training-main'
+            required=(
+                contract.env lineage.tsv run-index.tsv branch-decision.json
+                r-g3-analysis/summary.json r-g3-analysis/summary.md
+                r-g3-analysis/go_no_go.json r-g3-analysis/per_trajectory.jsonl
+                r-g3-analysis/per_question.jsonl
+            )
+            ;;
         *) return 1 ;;
     esac
 
@@ -455,6 +1346,12 @@ validate_followup_success_artifacts() {
     for file in "${required[@]}"; do
         [[ ${seen["$results_relative_parent/$(basename -- "$attempt")/$file"]+present} ]] || return 1
     done
+    case "$contract" in
+        qwen-native-training-smoke-v1|qwen-native-training-main-v1)
+            validate_qwen_native_training_evidence "$contract" "$project" "$results" \
+                "$(basename -- "$attempt")" "$expected_uid" || return 1
+            ;;
+    esac
 
     RESULTS_DIGEST="$(file_sha256 "$evidence")" || return 1
     recorded_digest="$(tr -d '\r\n' <"$marker")"

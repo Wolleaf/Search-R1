@@ -40,9 +40,9 @@ validate_gpu_inputs() {
         return 64
     }
     case "${AUTODL_GPU_PIPELINE:-legacy}" in
-        group_probe|qwen_native_gate)
+        group_probe|qwen_native_gate|qwen_native_train)
             [[ "$MAX_RESPONSE_LENGTH" == 500 ]] || {
-                printf 'The grouped and Qwen native probes require MAX_RESPONSE_LENGTH=500.\n' >&2
+                printf 'The grouped and Qwen native workflows require MAX_RESPONSE_LENGTH=500.\n' >&2
                 return 64
             }
             ;;
@@ -58,7 +58,7 @@ validate_gpu_inputs() {
             ;;
     esac
     case "${AUTODL_GPU_PIPELINE:-legacy}:$TOOL_PROTOCOL" in
-        qwen_native_gate:qwen35_native|legacy:legacy_xml|cost_aware_gated:legacy_xml|search_opportunity_gate:legacy_xml|group_probe:legacy_xml)
+        qwen_native_gate:qwen35_native|qwen_native_train:qwen35_native|legacy:legacy_xml|cost_aware_gated:legacy_xml|search_opportunity_gate:legacy_xml|group_probe:legacy_xml)
             ;;
         *)
             printf 'GPU pipeline and TOOL_PROTOCOL are inconsistent: %s:%s\n' \
@@ -196,11 +196,12 @@ finish_run_record() {
 "eval_expected_rows=$EVAL_EXPECTED_ROWS"$'\n'\
 "eval_group_size=$EVAL_GROUP_SIZE"$'\n'\
 "tool_protocol=$TOOL_PROTOCOL"$'\n'\
-"rollout_top_k=$([[ "$TOOL_PROTOCOL" == qwen35_native ]] && printf 20 || printf 0)"$'\n'\
+"rollout_top_k=0"$'\n'\
 "rollout_min_p=0.0"$'\n'\
-"rollout_presence_penalty=$([[ "$TOOL_PROTOCOL" == qwen35_native ]] && printf 2.0 || printf 0.0)"$'\n'\
+"rollout_presence_penalty=0.0"$'\n'\
 "rollout_repetition_penalty=1.0"$'\n'\
 "trace_output_dir=$trace_output_dir"$'\n'\
+"wandb_dir=$run_dir/wandb"$'\n'\
 "resolved_config_sha256=$resolved_config_sha256"$'\n'\
 "pytorch_cuda_alloc_conf=$ALLOCATOR_CONFIG"$'\n'\
 "price_per_hour=$PRICE_PER_HOUR"$'\n'\
@@ -284,6 +285,9 @@ run_job() {
         eval:qwen_native_g3)
             budget_rmb=10
             ;;
+        eval:qwen_native_b|eval:qwen_native_c)
+            budget_rmb=5
+            ;;
         eval:base|eval:reproduced|eval:control|eval:cost_aware|eval:cost_aware_gated)
             if [[ "$RUN_BUDGET_PROFILE" == gated_followup ]]; then
                 budget_rmb=5
@@ -366,6 +370,12 @@ run_job() {
                 printf 'Qwen native G3 requires 64 rows and EVAL_GROUP_SIZE=5.\n' >&2
                 return 64
             }
+        elif [[ "$variant" == qwen_native_b || "$variant" == qwen_native_c ]]; then
+            [[ "$TOOL_PROTOCOL" == qwen35_native && -z "$EVAL_DATA_FILE" &&
+                "$EVAL_EXPECTED_ROWS" == 128 && "$EVAL_GROUP_SIZE" == 1 ]] || {
+                printf 'Qwen native endpoint evaluation requires sealed val-128 with group size 1.\n' >&2
+                return 64
+            }
         elif [[ -n "$EVAL_DATA_FILE" ]]; then
             printf 'EVAL_DATA_FILE is reserved for a registered custom evaluation.\n' >&2
             return 64
@@ -419,6 +429,7 @@ run_job() {
         >"$run_dir/resolved-config.yaml" 2>>"$run_dir/train.log"
     rc=$?
     if ((rc == 0)); then
+        mkdir -p "$run_dir/wandb"
         OUTPUT_DIR="$run_dir/checkpoints" \
         GPU_COUNT="$GPU_COUNT" \
         TRAIN_BATCH_SIZE="$TRAIN_BATCH_SIZE" \
@@ -430,6 +441,7 @@ run_job() {
         TRACE_RUN_ID="$(basename -- "$run_dir")" \
         TRACE_CHECKPOINT_DIGEST="$trace_checkpoint_digest" \
             TRACE_PARENT_CHECKPOINT_DIGEST="$trace_parent_checkpoint_digest" \
+            WANDB_DIR="$run_dir/wandb" \
             TOOL_PROTOCOL="$TOOL_PROTOCOL" \
             AUTODL_ROOT="$PROJECT_ROOT" \
         timeout --signal=TERM --kill-after=120s "${timeout_seconds}s" \
@@ -641,6 +653,11 @@ gpu_action() {
     local comparison_checksums comparison_digest
     local -a handoff_verify_args=()
     validate_gpu_inputs
+    [[ ! -e "$MANIFEST_DIR/cpu-seal.pending.json" &&
+       ! -L "$MANIFEST_DIR/cpu-seal.pending.json" ]] || {
+        printf 'CPU seal transaction is unresolved; refusing paid GPU work.\n' >&2
+        return 1
+    }
     commit="$(expected_commit)"
     verify_checkout "$commit"
     [[ -f "$MANIFEST_DIR/cpu.ok" && ! -L "$MANIFEST_DIR/cpu.ok" &&
@@ -696,10 +713,19 @@ PY
     }
     python_version="$($TRAIN_ENV/bin/python -c 'import sys; print(".".join(map(str, sys.version_info[:3])))')"
     torch_version="$($TRAIN_ENV/bin/python -c 'import torch; print(torch.__version__)')"
-    if [[ "${AUTODL_GPU_PIPELINE:-legacy}" == qwen_native_gate ]]; then
+    if [[ "${AUTODL_GPU_PIPELINE:-legacy}" == qwen_native_gate ||
+          "${AUTODL_GPU_PIPELINE:-legacy}" == qwen_native_train ]]; then
         handoff_verify_args+=(
             --require-artifact data/search_mix/retrieval_replay.json
             --require-artifact data/search_mix/retrieval_replay.json.sha256
+        )
+    fi
+    if [[ "${AUTODL_GPU_PIPELINE:-legacy}" == qwen_native_train ]]; then
+        handoff_verify_args+=(
+            --require-artifact data/search_mix_qwen35_native_v2/manifest.json
+            --require-artifact data/search_mix_qwen35_native_v2/manifest.json.sha256
+            --require-artifact data/search_mix_qwen35_native_v2/train_512.parquet
+            --require-artifact data/search_mix_qwen35_native_v2/val_128.parquet
         )
     fi
     "$TRAIN_ENV/bin/python" "$CHECKOUT_DIR/scripts/autodl/handoff.py" verify \
@@ -726,6 +752,13 @@ PY
             return 1
         }
         qwen_native_gate_preflight "$commit" "$recorded_digest" \
+            "$base_model_digest"
+    elif [[ "${AUTODL_GPU_PIPELINE:-legacy}" == qwen_native_train ]]; then
+        declare -F qwen_native_train_preflight >/dev/null || {
+            printf 'The Qwen native training preflight callback is unavailable.\n' >&2
+            return 1
+        }
+        qwen_native_train_preflight "$commit" "$recorded_digest" \
             "$base_model_digest"
     fi
 
@@ -799,6 +832,16 @@ PY
             return 1
         }
         qwen_native_gate_pipeline "$_attempt" "$commit" "$recorded_digest" \
+            "$base_model" "$base_model_digest"
+        cleanup_retriever
+        trap - EXIT
+        return 0
+    elif [[ "${AUTODL_GPU_PIPELINE:-legacy}" == qwen_native_train ]]; then
+        declare -F qwen_native_train_pipeline >/dev/null || {
+            printf 'The Qwen native training pipeline callback is unavailable.\n' >&2
+            return 1
+        }
+        qwen_native_train_pipeline "$_attempt" "$commit" "$recorded_digest" \
             "$base_model" "$base_model_digest"
         cleanup_retriever
         trap - EXIT

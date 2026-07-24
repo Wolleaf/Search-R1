@@ -2,7 +2,7 @@
 
 本目录是 Search-R1-small 云端复现的唯一入口。固定镜像为 **PyTorch 2.8.0 / Python 3.12 / Ubuntu 22.04 / CUDA 12.8**，持久目录为 `/root/autodl-tmp/search-r1`。正常流程始终是 **Git -> CPU -> GPU**；脚本不扫描机器规格、不自动改配置、不自动重试。GPU phase 本身不关机；需要时显式绑定本次 attempt 启动独立 watchdog。
 
-`03/05/06/07` 保留此前 NQ、搜索机会门和 XML grouped probe 的可执行证据，不作为 Qwen3.5 原生协议入口。当前增量流程先重封 native CPU handoff，再由 `08_gpu_qwen_native_gate.sh` 依次执行 G0+G1、G2 和 G3；任一门禁未通过都不进入训练。
+`03/05/06/07` 保留此前 NQ、搜索机会门和 XML grouped probe 的可执行证据，不作为 Qwen3.5 原生协议入口。当前流程先重封 native-v2 CPU handoff，再由 `08_gpu_qwen_native_gate.sh` 依次执行 G0+G1、G2 和 G3；G3 GO 后，`09_gpu_qwen_native_train.sh` 将两步 smoke 与正式 R/B/C 训练拆成两个独立 attempt。任一门禁未通过都不进入下一付费阶段。
 
 ## 最短正常路径
 
@@ -66,7 +66,7 @@ AUTODL_QWEN_NATIVE_INCREMENTAL=1 \
 bash /root/autodl-tmp/search-r1/checkout/scripts/autodl/02_cpu_prepare.sh
 ```
 
-该模式不联网、不重装环境、不下载资产，也不重放整套 BM25 查询。它要求上一次成功 handoff 已封存语义校验通过的 `retrieval_replay.json` 及 sidecar，只从该 source、evidence、selection funnel 和固定 tokenizer 物化独立的 `data/search_mix_qwen35_native/`，保持相同 train/val/probe 样本 ID，并新增固定 G0-8、强制搜索 G1-16、自主搜索 G2-32 和 G3-64 Parquet。CPU 会用真实 tokenizer 扫描六个 Parquet 共 760 条 prompt，逐条检查 canonical messages、保留标记、模板 token 一致性和 1024-token 初始上限。原 `data/search_mix/` 不会被覆盖。随后运行测试、组合两卡 native resolved config，并把协议、tool schema、chat template、tokenizer revision、replay receipt、数据和配置 digest 纳入新 handoff。
+该模式不联网、不重装环境、不下载资产，也不重放整套 BM25 查询。它要求上一次成功 handoff 已封存语义校验通过的 `retrieval_replay.json` 及 sidecar，只从该 source、evidence、selection funnel 和固定 tokenizer 物化独立的 `data/search_mix_qwen35_native_v2/`，保持相同 train/val/probe 样本 ID，并新增固定 G0-8、强制搜索 G1-16、自主搜索 G2-32 和 G3-64 Parquet。CPU 会用真实 tokenizer 扫描六个 Parquet 共 760 条 prompt，逐条检查严格 `<answer>` 合同、canonical messages、保留标记、模板 token 一致性和 1024-token 初始上限。旧 `data/search_mix_qwen35_native/` 和原 `data/search_mix/` 都不会被覆盖。随后运行测试，组合 G1-G3、smoke/R/B/C-gated 训练及 B/C endpoint 评测的两卡 resolved config，并把协议、tool schema、chat template、tokenizer revision、replay receipt、数据和配置 digest 纳入新 handoff。候选配置与 handoff 全部验证成功后才原子替换旧 seal；中途失败仍可安全重跑同一增量命令。
 
 ### 3. GPU Qwen native 分层门禁
 
@@ -92,6 +92,29 @@ bash /root/autodl-tmp/search-r1/checkout/scripts/autodl/08_gpu_qwen_native_gate.
 ```
 
 G2 是 32 题 × 3 条自主搜索，G3 是 held-out 64 题 × group 5。三段 GPU action 的工作 timeout 额度分别为 2、3、10 元，外层 deadline 同时覆盖 handoff/数据校验、BM25、模型生成、分析和封存；内部生成 timeout 取注册额度与“剩余时间减 180 秒收尾预留”的较小值。BM25 不继承 phase lock，并由有界 TERM→KILL 清理。进程若不响应 TERM，GNU `timeout` 最多再保留 120 秒强杀宽限（按 5.76 元/小时最坏约 0.19 元），所以额度不是含该宽限的绝对账单上限。超时作为工程失败封存并交给 watchdog 请求关机，但 guest shutdown 不等于平台已停止计费，仍须在 AutoDL 控制台确认。协议、采样、数据、checkpoint 和前驱 digest 均进入证据。科学 NO-GO 会完整封存并正常结束，不会自动换 seed、重试或进入训练；其他工程/schema 错误保留原始非零 exit code。
+
+### 4. GPU Qwen native 训练与配对评测
+
+G3 的 exact marker 为唯一训练前驱。先只运行两步 smoke：
+
+```bash
+QWEN_NATIVE_TRAIN_STAGE=smoke \
+QWEN_NATIVE_PRETRAIN_G3_EVIDENCE=/root/autodl-tmp/search-r1/manifests/qwen-native-gate/<g3-attempt>.ok \
+GPU_COUNT=2 AUTODL_PRICE_PER_HOUR=5.76 \
+bash /root/autodl-tmp/search-r1/checkout/scripts/autodl/09_gpu_qwen_native_train.sh
+```
+
+smoke 自动复算 strict EM，并要求 mixed reward group、非零 policy advantage、mask/log-prob 对齐，以及两个 step 的 loss、KL、entropy、grad norm 全部存在且有限；同时封存 step-2 checkpoint、完整 trace、run-specific WandB offline history 和 `storage.env`。GO/NO-GO 都会作为完整科学终态封存并可交给 watchdog。只有 `contract.env` 与 `smoke-decision.json` 同为 `GO` 时才可继续；先人工查看 `storage.env`，确认剩余空间能容纳 R/B/C，再用传入 exact smoke marker 的动作明确批准 main：
+
+```bash
+QWEN_NATIVE_TRAIN_STAGE=main \
+QWEN_NATIVE_PRETRAIN_G3_EVIDENCE=/root/autodl-tmp/search-r1/manifests/qwen-native-gate/<g3-attempt>.ok \
+QWEN_NATIVE_SMOKE_EVIDENCE=/root/autodl-tmp/search-r1/manifests/qwen-native-training-smoke/<smoke-attempt>.ok \
+GPU_COUNT=2 AUTODL_PRICE_PER_HOUR=5.76 \
+bash /root/autodl-tmp/search-r1/checkout/scripts/autodl/09_gpu_qwen_native_train.sh
+```
+
+main 的 R60 始终从 sealed Qwen3.5-2B 全新启动，不继承 smoke。R 完成后先在固定 64×5 集合重跑 G3；只有 G3 GO 且 `cost_contrast_group_count >= 8` 才从同一个 R digest 对称启动 B20 与 C-gated20。若能力门 NO-GO，脚本以 `exit-code=0` 封存 R 负结果而不训练 B/C。若放行，B/C 完成后在同一 sealed val-128 上各评测一次，并生成 `paired/summary.json`、逐题结果、答对/答错清单、搜索转移和完整轨迹。脚本不自动重试、降配、删除 checkpoint 或关机。
 
 ### 历史 GPU Base grouped probe
 
@@ -149,15 +172,15 @@ GO 只表示值得进入下一阶段，不能直接在 NQ 上只重训一个 C�
 
 ## 固定配置与回退
 
-当前 `08` native gate 固定为两张 GPU、batch 8、最多 4 次搜索、retriever top-k 3、`start/observation/response/prompt=1024/384/500/4096`，并固定 `temperature/top-p/top-k/min-p/presence/repetition=1.0/1.0/20/0.0/2.0/1.0`。G1/G2/G3 的评测 group 分别为 2/3/5。历史 `07` 继续保持 XML group-5 配置，`03/05/06` 保持 response 256、prompt 3584；新实验不得复用历史入口。
+当前 native-v2 gate 与训练固定为两张 GPU、batch 8、最多 4 次搜索、retriever top-k 3、`start/observation/response/prompt=1024/384/500/4096`，并固定 `temperature/top-p/top-k/min-p/presence/repetition=1.0/1.0/0/0.0/0.0/1.0`。G1/G2/G3 的评测 group 分别为 2/3/5，训练 group 固定为 5。历史 `07` 继续保持 XML group-5 配置，`03/05/06` 保持 response 256、prompt 3584；新实验不得复用历史入口。
 
-只有新的两卡 2-step gate 在第二次 backward 明确 OOM 时才人工重跑：先保持 batch 8、group 5，将 `MAX_RESPONSE_LENGTH=384`，prompt cap 仍为 4096。当前各 GPU micro-batch 已为 1，降低总 batch 不能可靠解决单条长序列 OOM；只有证据表明问题来自批次级驻留时才考虑 batch 4。B/C 必须共享同一卡数和同一组回退参数。失败不会自动重试、不会覆盖旧 attempt，也不会采用早于固定终点的 checkpoint。
+native-v2 exact attempt 不接受 batch 4 或 response 384 的历史 OOM fallback。若两卡 2-step smoke 仍 OOM，保留失败 attempt 并停止；任何降配都必须另立配置版本、重新执行 readiness gate，而不是在同一实验身份下静默重跑。失败不会自动重试、不会覆盖旧 attempt，也不会采用早于固定终点的 checkpoint。
 
 ## 预算与存储
 
-两个 gate 各 15 元、R 100 元、B/C 各 40 元、A/R/B/C 评测各 10 元，GPU 分项硬上限合计 250 元；另留 50 元给 CPU、100 GB 存储和阶段间开销，总上限 300 元。脚本根据 `AUTODL_PRICE_PER_HOUR` 将每项上限换算成 timeout。硬上限用于防止失控，不是预计实际花费，也不保证能跑满目标步数。
+native-v2 三段 readiness gate 的分项硬上限为 2/3/10 元，两步 smoke 为 15 元。main 中 R60/G3/B20/C20/B-eval/C-eval 分别为 100/10/40/25/5/5 元：R 后科学 NO-GO 最多进入前 110 元，完整 GO 路径分项合计 185 元；从 G0 到最终配对评测的全部注册上限为 215 元。脚本根据 `AUTODL_PRICE_PER_HOUR` 将每项上限换算成 timeout。硬上限用于防止失控，不是预计实际花费；GNU timeout 的 120 秒强杀宽限和 CPU/存储费用另计。
 
-100 GB 盘预计最终使用 55-70 GB：环境、模型、BM25 与语料约 30-35 GB，R/B/C 权重约 12-18 GB，其余用于日志、Ray/WandB 缓存和 attempt 元数据。两个 gate checkpoint 会在成功后安全删除，当前无需继续扩容。异常 attempt 的大文件只能在确认其终态和精确路径后人工处理。
+100 GB 盘不预设“必然够用”。两步 smoke 会记录实际 `checkpoint_bytes` 和 `filesystem_available_bytes`；启动 main 前必须据此确认还能同时保留 R/B/C endpoint、日志、trace 和 WandB history。smoke checkpoint 在 main evidence 完整封存前不得删除，脚本也不会自动清理历史 checkpoint、扩容或覆盖证据。空间不足时保持停机并由人工决定精确清理对象或扩容，不能让脚本猜测路径。
 
 ## 状态、日志与停机
 
@@ -179,7 +202,7 @@ bash /root/autodl-tmp/search-r1/checkout/scripts/autodl/04_watch_and_shutdown.sh
 tail -f "$attempt/shutdown-watchdog.log"
 ```
 
-watchdog 同时支持成功和失败终态，但只有在 commit/checkout、持久盘、exact attempt、phase lock、原始 exit code、唯一终态 marker 和日志 sentinel 全部重新验证后才会调用 AutoDL 的 `/usr/bin/shutdown`（无参数）。旧流程成功时校验 `comparison.sha256`、results、`gpu.ok` 和 attempt digest；C-gated、搜索机会门与 grouped probe 分别校验自己的 result root、全部 `evidence.sha256` 条目、新 marker 和 attempt digest，不借用或改写旧 `gpu.ok`。锁冲突（包括 admission `exit 75` 后旧锁已经释放）、状态不完整、校验失败或 dry-run 都会保持开机并记录 `shutdown-skipped`；test mode 只记录模拟状态，绝不调用真实 backend。`shutdown-requested` 表示即将调用 backend，`shutdown-dispatched` 只表示 backend 已返回 0，两者都不能证明 AutoDL 控制平面已停止。无论 watchdog 结果如何，仍须在 AutoDL 控制台确认实例已停止且不再计费；SSH 断开本身不能证明停止计费。
+watchdog 同时支持成功和失败终态，但只有在 commit/checkout、持久盘、exact attempt、phase lock、原始 exit code、唯一终态 marker 和日志 sentinel 全部重新验证后才会调用 AutoDL 的 `/usr/bin/shutdown`（无参数）。旧流程成功时校验 `comparison.sha256`、results、`gpu.ok` 和 attempt digest；native gate、native smoke/main、C-gated、搜索机会门与 grouped probe 分别校验自己的 result root、全部 `evidence.sha256` 条目、新 marker 和 attempt digest，不借用或改写旧 `gpu.ok`。native smoke 的 GO/NO-GO、main 的 R-G3 科学 NO-GO 和完整六阶段 GO 都有独立结构复验。锁冲突（包括 admission `exit 75` 后旧锁已经释放）、状态不完整、校验失败或 dry-run 都会保持开机并记录 `shutdown-skipped`；test mode 只记录模拟状态，绝不调用真实 backend。`shutdown-requested` 表示即将调用 backend，`shutdown-dispatched` 只表示 backend 已返回 0，两者都不能证明 AutoDL 控制平面已停止。无论 watchdog 结果如何，仍须在 AutoDL 控制台确认实例已停止且不再计费；SSH 断开本身不能证明停止计费。
 
 ## 历史 CPU 后处理（仅旧 03 comparison）
 
