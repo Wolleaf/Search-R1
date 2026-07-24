@@ -66,14 +66,16 @@ class LLMGenerationManager:
                 f'{required_length} tokens, but max_prompt_length is '
                 f'{self.config.max_prompt_length}')
 
-    def _batch_tokenize(self, responses: List[str]) -> torch.Tensor:
+    def _batch_tokenize(self, responses: List[str],
+                        device=None) -> torch.Tensor:
         """Tokenize a batch of responses."""
-        return self.tokenizer(
+        input_ids = self.tokenizer(
             responses, 
             add_special_tokens=False, 
             return_tensors='pt', 
             padding="longest"
         )['input_ids']
+        return input_ids.to(device) if device is not None else input_ids
 
     def _current_tool_protocol(self) -> str:
         config = getattr(self, 'config', None)
@@ -153,7 +155,8 @@ class LLMGenerationManager:
             actions, _ = self.env.postprocess_predictions(responses_str)
             responses_str=[f"<answer>{envs[idx].ACTION_LOOKUP[action]}</answer>" for idx, action in enumerate(actions)]
             print("RESPONSES:", responses_str)
-        responses = self._batch_tokenize(responses_str)
+        responses = self._batch_tokenize(
+            responses_str, device=responses.device)
         return responses, responses_str
 
     def _prepare_native_conversations(self, gen_batch: DataProto,
@@ -236,7 +239,8 @@ class LLMGenerationManager:
                 visible_observations)
 
     def _process_next_obs(
-            self, next_obs: List[str]) -> Tuple[torch.Tensor, List[str]]:
+            self, next_obs: List[str],
+            device=None) -> Tuple[torch.Tensor, List[str]]:
         """Process next observations from environment."""
         
         next_obs_ids = self.tokenizer(
@@ -254,6 +258,8 @@ class LLMGenerationManager:
             next_obs_ids, skip_special_tokens=True)
         if len(visible_observations) != len(next_obs):
             raise ValueError('decoded observations are not batch-aligned')
+        if device is not None:
+            next_obs_ids = next_obs_ids.to(device)
         return next_obs_ids, visible_observations
 
     def _update_rolling_state(self, rollings: DataProto, cur_responses: torch.Tensor, 
@@ -491,7 +497,7 @@ class LLMGenerationManager:
                 )
             else:
                 next_obs_ids, visible_observations = self._process_next_obs(
-                    next_obs)
+                    next_obs, device=responses_ids.device)
             for index, event in enumerate(
                     self._last_execution_retrieval_events):
                 if event is not None:

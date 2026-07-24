@@ -222,6 +222,41 @@ def test_retrieval_trace_records_post_truncation_visible_observation():
     assert len(event['visible_observation'].split()) == 384
 
 
+def test_legacy_retokenized_responses_and_observations_follow_rollout_device():
+
+    class Tokenizer:
+
+        pad_token_id = 0
+
+        def __call__(self, _values, **_kwargs):
+            return {'input_ids': torch.tensor([[4, 5]])}
+
+        def batch_decode(self, rows, skip_special_tokens=True):
+            assert skip_special_tokens
+            return ['<answer>done</answer>'] * len(rows)
+
+    manager = _manager()
+    manager.tokenizer = Tokenizer()
+    manager.config = SimpleNamespace(
+        no_think_rl=False,
+        tool_protocol='legacy_xml',
+        max_obs_length=1,
+    )
+    generated = torch.empty((1, 2), dtype=torch.long, device='meta')
+
+    response_ids, _ = manager._postprocess_responses(generated)
+    observation_ids, _ = manager._process_next_obs(
+        ['retrieved document'], device=generated.device)
+
+    assert response_ids.device == generated.device
+    assert observation_ids.device == generated.device
+    assert observation_ids.shape == (1, 1)
+    combined = manager.tensor_fn.concatenate_with_padding([
+        generated, response_ids, observation_ids
+    ])
+    assert combined.device == generated.device
+
+
 def test_odd_active_validation_batch_keeps_deterministic_sampling_metadata():
     manager = _manager()
     manager.tokenizer.pad_token = '<pad>'
