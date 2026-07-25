@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+PYTHON_BIN="${PYTHON_BIN:-python3}"
 AUTODL_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 SOURCE_WATCHDOG="$AUTODL_DIR/04_watch_and_shutdown.sh"
 TEST_ROOT="$(mktemp -d)"
@@ -233,7 +234,7 @@ create_native_sealed_inputs() {
     local data_dir="$PROJECT_ROOT/data/search_mix_qwen35_native_v2"
     local handoff="$PROJECT_ROOT/manifests/cpu_handoff.json"
     mkdir -p "$data_dir"
-    python3 - "$data_dir" <<'PY'
+    "$PYTHON_BIN" - "$data_dir" <<'PY'
 import hashlib
 import json
 from pathlib import Path
@@ -283,7 +284,7 @@ PY
 write_smoke_decision() {
     local output="$1" decision="$2" catalog_digest="$3" log_digest="$4"
     local trace_digest="$5" wandb_digest="$6"
-    python3 - "$output" "$decision" "$catalog_digest" "$log_digest" \
+    "$PYTHON_BIN" - "$output" "$decision" "$catalog_digest" "$log_digest" \
         "$trace_digest" "$wandb_digest" <<'PY'
 import json
 from pathlib import Path
@@ -471,7 +472,7 @@ append_native_main_lineage() {
 write_native_g3_analysis() {
     local output_dir="$1" decision="$2" count="$3" trace="$4" catalog="$5"
     local checkpoint_digest="$6"
-    python3 - "$output_dir" "$decision" "$count" "$trace" "$catalog" \
+    "$PYTHON_BIN" - "$output_dir" "$decision" "$count" "$trace" "$catalog" \
         "$checkpoint_digest" <<'PY'
 import hashlib
 import json
@@ -541,7 +542,7 @@ PY
 write_native_paired_summary() {
     local output="$1" data_manifest="$2" catalog="$3"
     local control_trace="$4" cost_trace="$5" control_digest="$6" cost_digest="$7"
-    python3 - "$output" "$data_manifest" "$catalog" "$control_trace" "$cost_trace" \
+    "$PYTHON_BIN" - "$output" "$data_manifest" "$catalog" "$control_trace" "$cost_trace" \
         "$control_digest" "$cost_digest" <<'PY'
 import hashlib
 import json
@@ -996,7 +997,7 @@ assert_no_backend_event
 # Re-sealing cannot hide a missing registered smoke check.
 new_case qwen-native-training-smoke-check-missing 0 success
 replace_with_native_training_smoke_results
-python3 - "$NATIVE_RESULT_DIR/smoke-decision.json" <<'PY'
+"$PYTHON_BIN" - "$NATIVE_RESULT_DIR/smoke-decision.json" <<'PY'
 import json
 from pathlib import Path
 import sys
@@ -1031,7 +1032,7 @@ assert_no_backend_event
 # A re-sealed G3 summary still has to bind the exact evaluated trace.
 new_case qwen-native-training-main-g3-input-tampered 0 success
 replace_with_native_training_main_results false
-python3 - "$NATIVE_RESULT_DIR/r-g3-analysis/summary.json" <<'PY'
+"$PYTHON_BIN" - "$NATIVE_RESULT_DIR/r-g3-analysis/summary.json" <<'PY'
 import json
 from pathlib import Path
 import sys
@@ -1057,7 +1058,7 @@ assert_order
 # A re-sealed paired report cannot substitute another control endpoint.
 new_case qwen-native-training-main-paired-endpoint-tampered 0 success
 replace_with_native_training_main_results true
-python3 - "$NATIVE_RESULT_DIR/paired/summary.json" <<'PY'
+"$PYTHON_BIN" - "$NATIVE_RESULT_DIR/paired/summary.json" <<'PY'
 import json
 from pathlib import Path
 import sys
