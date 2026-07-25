@@ -154,8 +154,14 @@ class ResultsTest(unittest.TestCase):
             self.assertEqual(rows[1]["checkout_commit"], "commit-a")
             self.assertEqual(rows[3]["cost_lambda"], "0.1")
             markdown = (output_dir / "results.md").read_text()
-            for label in ("A / Base", "R / Reproduced", "B / Control", "C / Cost-aware"):
+            for label in (
+                "A / Parent (post-trained)",
+                "R / Reproduced",
+                "B / Control",
+                "C / Cost-aware",
+            ):
                 self.assertIn(f"| {label} |", markdown)
+            self.assertNotIn("A / Base", markdown)
 
     def test_rejects_missing_duplicate_and_multiple_eval_metrics(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -45,7 +45,7 @@ import re
 from search_r1.llm_agent.generation import LLMGenerationManager, GenerationConfig
 from search_r1.llm_agent.tool_protocol import (QWEN35_NATIVE,
                                                QWEN35_PROMPT_VERSION)
-from search_r1.trajectory_trace import (TraceJsonlWriter,
+from search_r1.trajectory_trace import (TRACE_SCHEMA_VERSION, TraceJsonlWriter,
                                         parse_search_r1_transcript,
                                         stable_sample_id)
 
@@ -132,7 +132,7 @@ def _validate_qwen35_native_training_contract(config):
         'data.max_prompt_length': 4096,
         'data.max_response_length': 500,
         'data.max_start_length': 1024,
-        'data.max_obs_length': 384,
+        'data.max_obs_length': 500,
         'max_turns': 4,
         'retriever.topk': 3,
     }
@@ -478,6 +478,36 @@ def _event_aligned_trace_turns(generation_events, retrieval_events,
             turn['turn'] = len(turns)
             turns.append(turn)
     return turns
+
+
+def _raw_generation_trace_records(generation_events):
+    """Project native generation events into the durable v3 raw audit shape."""
+    records = []
+    required = {
+        'raw_text', 'raw_token_ids', 'raw_token_count', 'action_token_ids',
+        'boundary', 'tail_dropped', 'raw_clipped'
+    }
+    for index, event in enumerate(generation_events):
+        missing = required - set(event)
+        if missing:
+            raise ValueError(
+                'v3 trace generation event is missing raw audit fields: '
+                f'{sorted(missing)}')
+        if event.get('turn') != index:
+            raise ValueError('v3 generation event turns must be contiguous')
+        records.append({
+            'turn': index,
+            'raw_text': event['raw_text'],
+            'raw_token_ids': list(event['raw_token_ids']),
+            'raw_token_count': int(event['raw_token_count']),
+            'action_text': str(event.get('text', '')),
+            'action_token_ids': list(event['action_token_ids']),
+            'action_token_count': int(event['token_count']),
+            'boundary': event['boundary'],
+            'tail_dropped': bool(event['tail_dropped']),
+            'raw_clipped': bool(event['raw_clipped']),
+        })
+    return records
 
 
 def _validation_metrics(data_sources, em_scores, search_counts, utilities):
@@ -907,6 +937,9 @@ class RayPPOTrainer(object):
             'trace_stage', self.config.trainer.experiment_name))
         run_id = str(self.config.trainer.get(
             'trace_run_id', self.config.trainer.experiment_name))
+        trace_schema_version = (
+            TRACE_SCHEMA_VERSION
+            if self.config.get('tool_protocol') == QWEN35_NATIVE else 1)
         if self.config.trainer.get('val_only', False):
             checkpoint_digest = self.config.trainer.get(
                 'trace_checkpoint_digest', None)
@@ -922,6 +955,7 @@ class RayPPOTrainer(object):
                 expected_rows=expected_rows,
                 run_id=run_id,
                 stage=stage,
+                schema_version=trace_schema_version,
             )
         else:
             expected_rows = (
@@ -936,9 +970,11 @@ class RayPPOTrainer(object):
                 expected_rows=expected_rows,
                 run_id=run_id,
                 stage=stage,
+                schema_version=trace_schema_version,
             )
 
     def _common_trace_records(self, batch):
+        native_trace = self.config.get('tool_protocol') == QWEN35_NATIVE
         response_width = batch.batch['responses'].shape[-1]
         prompt_width = batch.batch['prompts'].shape[-1]
         records = []
@@ -997,7 +1033,8 @@ class RayPPOTrainer(object):
                     raise ValueError(
                         'trace final_answer does not match generation events')
 
-            records.append({
+            record = {
+                'schema_version': TRACE_SCHEMA_VERSION if native_trace else 1,
                 'sample_id': stable_sample_id(
                     data_source, source_split, source_index),
                 'source_index': int(source_index),
@@ -1036,9 +1073,41 @@ class RayPPOTrainer(object):
                     'cost_reward_mode', 'linear')),
                 'cost_lambda': float(self.config.algorithm.get(
                     'cost_lambda', 0.0)),
-                'max_searches': int(self.config.max_turns),
                 'response_width': int(response_width),
-            })
+            }
+            if native_trace:
+                response_attention = item.batch['attention_mask'][
+                    prompt_width:].bool()
+                response_info_mask = item.batch['info_mask'][
+                    prompt_width:].bool()
+                policy_token_count = int(response_info_mask.sum().item())
+                observation_token_count = int(
+                    (response_attention & ~response_info_mask).sum().item())
+                action_count = int(item.batch['action_count'].item())
+                if action_count != len(generation_events):
+                    raise ValueError(
+                        'action_count does not match generation event count')
+                raw_generations = _raw_generation_trace_records(
+                    generation_events)
+                generated_policy_tokens = sum(
+                    generation['action_token_count']
+                    for generation in raw_generations)
+                info_mask_consistent = bool(
+                    not torch.any(response_info_mask
+                                  & ~response_attention).item()
+                    and policy_token_count == generated_policy_tokens)
+                record.update({
+                    'raw_generations': raw_generations,
+                    'policy_token_count': policy_token_count,
+                    'observation_token_count': observation_token_count,
+                    'observation_policy_token_count': 0,
+                    'info_mask_consistent': info_mask_consistent,
+                    'max_action_budget': int(self.config.max_turns),
+                    'action_count': action_count,
+                })
+            else:
+                record['max_searches'] = int(self.config.max_turns)
+            records.append(record)
         return records
 
     def _append_eval_traces(self, batch):
@@ -1049,6 +1118,7 @@ class RayPPOTrainer(object):
         group_size = _get_eval_group_size(self.config)
         records = self._common_trace_records(batch)
         for index, record in enumerate(records):
+            group_slot = 0
             if group_size > 1:
                 group_slot = int(
                     batch.non_tensor_batch['group_slot'][index])
@@ -1057,14 +1127,14 @@ class RayPPOTrainer(object):
                 if recorded_group_size != group_size:
                     raise ValueError(
                         'eval trace group_size does not match configuration')
-                group_uid = record['sample_id']
-                record.update({
-                    'group_uid': group_uid,
-                    'group_slot': group_slot,
-                    'group_size': group_size,
-                    'record_id': _grouped_eval_record_id(
-                        self.eval_trace_writer.stage, group_uid, group_slot),
-                })
+            group_uid = record['sample_id']
+            record.update({
+                'group_uid': group_uid,
+                'group_slot': group_slot,
+                'group_size': group_size,
+                'record_id': _grouped_eval_record_id(
+                    self.eval_trace_writer.stage, group_uid, group_slot),
+            })
             record['checkpoint_digest'] = checkpoint_digest
             self.eval_trace_writer.append(record)
 

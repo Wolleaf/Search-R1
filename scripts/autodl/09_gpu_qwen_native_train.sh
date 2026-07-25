@@ -3,9 +3,9 @@ set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 NATIVE_TRAIN_PROJECT_ROOT="${AUTODL_ROOT:-/root/autodl-tmp/search-r1}"
-NATIVE_TRAIN_DATA_DIR="$NATIVE_TRAIN_PROJECT_ROOT/data/search_mix_qwen35_native_v2"
+NATIVE_TRAIN_DATA_DIR="$NATIVE_TRAIN_PROJECT_ROOT/data/search_mix_qwen35_native_v3"
 NATIVE_TRAIN_STAGE="${QWEN_NATIVE_TRAIN_STAGE:-}"
-NATIVE_PRETRAIN_G3_EVIDENCE="${QWEN_NATIVE_PRETRAIN_G3_EVIDENCE:-}"
+NATIVE_PROTOCOL_GATE_EVIDENCE="${QWEN_NATIVE_PROTOCOL_GATE_EVIDENCE:-}"
 NATIVE_SMOKE_EVIDENCE="${QWEN_NATIVE_SMOKE_EVIDENCE:-}"
 
 export AUTODL_RUN_BUDGET_PROFILE=gated_followup
@@ -26,9 +26,10 @@ readonly NATIVE_TRAIN_MANIFEST="$NATIVE_TRAIN_DATA_DIR/manifest.json"
 readonly NATIVE_TRAIN_CATALOG="$NATIVE_TRAIN_DATA_DIR/catalog.jsonl"
 readonly NATIVE_TRAIN_G3_DATA="$NATIVE_TRAIN_DATA_DIR/probe_multi_64.parquet"
 readonly NATIVE_TRAIN_SOURCE_DIR="$PROJECT_ROOT/data/search_mix"
-readonly NATIVE_TRAIN_PROMPT_VERSION=qwen35-native-search-v2-answer-tag
-readonly NATIVE_TRAIN_SMOKE_CONTRACT=qwen-native-training-smoke-v1
-readonly NATIVE_TRAIN_MAIN_CONTRACT=qwen-native-training-main-v1
+readonly NATIVE_TRAIN_PROMPT_VERSION=qwen35-native-search-v3-original-aligned
+readonly NATIVE_TRAIN_SMOKE_CONTRACT=qwen-native-training-smoke-v3
+readonly NATIVE_TRAIN_MAIN_CONTRACT=qwen-native-training-main-v3
+readonly NATIVE_TRAIN_GATE_CONTRACT=qwen-native-gate-v3
 readonly NATIVE_TRAIN_GATE_CLI="$CHECKOUT_DIR/scripts/autodl/qwen_native_gate_analysis.py"
 readonly NATIVE_TRAIN_PAIRED_CLI="$CHECKOUT_DIR/scripts/autodl/paired_eval.py"
 readonly NATIVE_TRAIN_SMOKE_CLI="$CHECKOUT_DIR/scripts/autodl/qwen_native_smoke_analysis.py"
@@ -38,12 +39,12 @@ NATIVE_TRAIN_PREFLIGHT_COMMIT=''
 NATIVE_TRAIN_PREFLIGHT_HANDOFF=''
 NATIVE_TRAIN_PREFLIGHT_BASE_DIGEST=''
 NATIVE_TRAIN_PREFLIGHT_DATA_DIGEST=''
-NATIVE_TRAIN_PREFLIGHT_PRETRAIN_DIGEST=''
+NATIVE_TRAIN_PREFLIGHT_PROTOCOL_GATE_DIGEST=''
 NATIVE_TRAIN_PREFLIGHT_SMOKE_DIGEST='-'
-NATIVE_TRAIN_PRETRAIN_G3_DIGEST=''
-NATIVE_TRAIN_PRETRAIN_G3_RESULTS=''
-NATIVE_TRAIN_PRETRAIN_G3_OUTER=''
-NATIVE_TRAIN_PRETRAIN_G3_MANIFEST=''
+NATIVE_TRAIN_PROTOCOL_GATE_DIGEST=''
+NATIVE_TRAIN_PROTOCOL_GATE_RESULTS=''
+NATIVE_TRAIN_PROTOCOL_GATE_OUTER=''
+NATIVE_TRAIN_PROTOCOL_GATE_MANIFEST=''
 NATIVE_TRAIN_SMOKE_DIGEST=''
 NATIVE_TRAIN_SMOKE_RESULTS=''
 NATIVE_TRAIN_SMOKE_OUTER=''
@@ -67,8 +68,8 @@ require_qwen_native_train() {
         "$DATA_DIR" == "$NATIVE_TRAIN_DATA_DIR" &&
         "$EVAL_GROUP_SIZE" == 1 && -z "$EVAL_DATA_FILE" &&
         "$RUN_BUDGET_PROFILE" == gated_followup &&
-        -n "$NATIVE_PRETRAIN_G3_EVIDENCE" ]] || {
-        printf 'Qwen native v2 training is fixed to two GPUs, group 5, batch 8, response 500, observation 384, and neutral sampling.\n' >&2
+        -n "$NATIVE_PROTOCOL_GATE_EVIDENCE" ]] || {
+        printf 'Qwen native v3 training requires the exact structural G0/G1 gate, two GPUs, group 5, batch 8, response/observation 500, and total action budget 4.\n' >&2
         return 64
     }
     if [[ "$NATIVE_TRAIN_STAGE" == main && -z "$NATIVE_SMOKE_EVIDENCE" ]]; then
@@ -177,11 +178,11 @@ verify_complete_training_attempt() {
     VERIFIED_ATTEMPT_DIGEST="$marker_digest"
 }
 
-verify_pretrain_g3_evidence() {
+verify_protocol_gate_evidence() {
     local marker="$1" expected_checkpoint="$2" expected_digest="$3"
     local expected_commit="$4" expected_handoff="$5" expected_data="$6"
     verify_complete_training_attempt "$marker" qwen-native-gate \
-        "$RUNS_ROOT/qwen-native-gate/attempts" qwen-native-gate-v1 || return $?
+        "$RUNS_ROOT/qwen-native-gate/attempts" "$NATIVE_TRAIN_GATE_CONTRACT" || return $?
     "$TRAIN_ENV/bin/python" - \
         "$VERIFIED_ATTEMPT_RESULTS" "$expected_checkpoint" "$expected_digest" \
         "$expected_commit" "$expected_handoff" "$expected_data" <<'PY'
@@ -195,22 +196,47 @@ expected = sys.argv[2:]
 for name in ("stage.txt", "go_no_go.json", "summary.json", "lineage.tsv"):
     path = results / name
     if not path.is_file() or path.is_symlink():
-        raise SystemExit(f"pretraining G3 evidence is missing or symlinked: {path}")
-if (results / "stage.txt").read_text(encoding="utf-8").strip() != "g3":
-    raise SystemExit("pretraining marker is not a G3 result")
+        raise SystemExit(f"structural protocol-gate evidence is missing or symlinked: {path}")
+if (results / "stage.txt").read_text(encoding="utf-8").strip() != "g0_g1":
+    raise SystemExit("training predecessor is not the structural G0/G1 gate")
 decision = json.loads((results / "go_no_go.json").read_bytes())
 summary = json.loads((results / "summary.json").read_bytes())
-if decision.get("stage") != "g3" or decision.get("decision") != "GO":
-    raise SystemExit("pretraining G3 decision is not GO")
-if summary.get("decision") != "GO":
-    raise SystemExit("pretraining G3 summary is not GO")
+if (decision.get("schema") != "search-r1.qwen-native-gate" or
+        decision.get("schema_version") != 3 or
+        decision.get("stage") != "g0_g1" or
+        decision.get("decision") != "GO"):
+    raise SystemExit("structural G0/G1 decision is not a v3 GO")
+criteria = decision.get("criteria")
+required_criteria = {
+    "g0_prompt_token_match_count",
+    "g0_first_action_token_match_count",
+    "g0_direct_action_prefix_integrity_count",
+    "g0_manager_action_prefix_integrity_count",
+    "g0_e0_search_roundtrip_count",
+    "g0_e0_retrieved_document_count",
+    "g0_e0_tool_role_count",
+    "g0_e0_mask_leak_count",
+    "g1_action_token_prefix_integrity_count",
+    "g1_action_tail_leak_count",
+    "g1_info_mask_consistent_count",
+    "g1_observation_policy_token_count",
+    "g1_retrieval_alignment_error_count",
+}
+if (not isinstance(criteria, dict) or set(criteria) != required_criteria or
+        any(not isinstance(item, dict) or item.get("passed") is not True
+            for item in criteria.values())):
+    raise SystemExit("structural G0/G1 criteria are incomplete or failed")
+if (summary.get("schema") != "search-r1.qwen-native-gate" or
+        summary.get("schema_version") != 3 or
+        summary.get("stage") != "g0_g1" or summary.get("decision") != "GO"):
+    raise SystemExit("structural G0/G1 summary is not a v3 GO")
 with (results / "lineage.tsv").open(newline="", encoding="utf-8") as handle:
     rows = list(csv.DictReader(handle, delimiter="\t"))
 if len(rows) != 1:
-    raise SystemExit("pretraining G3 lineage must contain exactly one row")
+    raise SystemExit("structural G0/G1 lineage must contain exactly one row")
 row = rows[0]
 checks = {
-    "stage": row.get("stage") == "g3",
+    "stage": row.get("stage") == "g0_g1",
     "checkpoint": row.get("checkpoint") == expected[0],
     "checkpoint_digest": row.get("checkpoint_digest") == expected[1],
     "commit": row.get("evaluation_checkout_commit") == expected[2],
@@ -219,19 +245,19 @@ checks = {
 }
 failed = sorted(key for key, passed in checks.items() if not passed)
 if failed:
-    raise SystemExit("pretraining G3 lineage mismatch: " + ", ".join(failed))
+    raise SystemExit("structural G0/G1 lineage mismatch: " + ", ".join(failed))
 PY
-    NATIVE_TRAIN_PRETRAIN_G3_DIGEST="$VERIFIED_ATTEMPT_DIGEST"
-    NATIVE_TRAIN_PRETRAIN_G3_RESULTS="$VERIFIED_ATTEMPT_RESULTS"
-    NATIVE_TRAIN_PRETRAIN_G3_OUTER="$VERIFIED_ATTEMPT_OUTER"
-    NATIVE_TRAIN_PRETRAIN_G3_MANIFEST="$VERIFIED_ATTEMPT_MANIFEST"
+    NATIVE_TRAIN_PROTOCOL_GATE_DIGEST="$VERIFIED_ATTEMPT_DIGEST"
+    NATIVE_TRAIN_PROTOCOL_GATE_RESULTS="$VERIFIED_ATTEMPT_RESULTS"
+    NATIVE_TRAIN_PROTOCOL_GATE_OUTER="$VERIFIED_ATTEMPT_OUTER"
+    NATIVE_TRAIN_PROTOCOL_GATE_MANIFEST="$VERIFIED_ATTEMPT_MANIFEST"
 }
 
 verify_smoke_evidence() {
     local marker="$1" expected_base="$2" expected_base_digest="$3"
     local expected_commit="$4" expected_handoff="$5" expected_data="$6"
-    local expected_pretrain_digest="$7" metadata checkpoint checkpoint_digest
-    local base base_digest commit handoff data pretrain_marker pretrain_digest
+    local expected_gate_digest="$7" metadata checkpoint checkpoint_digest
+    local base base_digest commit handoff data gate_marker gate_digest
     verify_complete_training_attempt "$marker" qwen-native-training-smoke \
         "$NATIVE_TRAIN_RESULTS_ROOT/attempts" "$NATIVE_TRAIN_SMOKE_CONTRACT" || return $?
     metadata="$("$TRAIN_ENV/bin/python" - \
@@ -264,7 +290,7 @@ def read_env(path):
 contract = read_env(results / "contract.env")
 storage = read_env(results / "storage.env")
 checkpoint_tree = read_env(results / "checkpoint-tree.env")
-if contract.get("schema") != "qwen-native-training-smoke-v1" or contract.get("stage") != "smoke":
+if contract.get("schema") != "qwen-native-training-smoke-v3" or contract.get("stage") != "smoke":
     raise SystemExit("smoke contract identity mismatch")
 decision = json.loads((results / "smoke-decision.json").read_bytes())
 if (contract.get("decision") != "GO" or
@@ -290,8 +316,8 @@ run_dir = Path(row["run_dir"])
 keys = (
     "checkpoint", "checkpoint_digest", "parent_checkpoint",
     "parent_checkpoint_digest", "checkout_commit", "cpu_handoff_digest",
-    "data_manifest_sha256", "pretrain_g3_evidence",
-    "pretrain_g3_evidence_sha256",
+    "data_manifest_sha256", "protocol_gate_evidence",
+    "protocol_gate_evidence_sha256",
 )
 if any(not row.get(key) for key in keys):
     raise SystemExit("smoke lineage is incomplete")
@@ -318,13 +344,13 @@ print(*(row[key] for key in keys), sep="\t")
 PY
 )" || return 1
     IFS=$'\t' read -r checkpoint checkpoint_digest base base_digest commit handoff \
-        data pretrain_marker pretrain_digest <<<"$metadata"
+        data gate_marker gate_digest <<<"$metadata"
     [[ "$base" == "$expected_base" && "$base_digest" == "$expected_base_digest" &&
         "$commit" == "$expected_commit" && "$handoff" == "$expected_handoff" &&
         "$data" == "$expected_data" &&
-        "$pretrain_marker" == "$NATIVE_PRETRAIN_G3_EVIDENCE" &&
-        "$pretrain_digest" == "$expected_pretrain_digest" ]] || {
-        printf 'Smoke evidence does not bind the selected base, commit, handoff, data, and G3 marker.\n' >&2
+        "$gate_marker" == "$NATIVE_PROTOCOL_GATE_EVIDENCE" &&
+        "$gate_digest" == "$expected_gate_digest" ]] || {
+        printf 'Smoke evidence does not bind the selected base, commit, handoff, data, and structural protocol gate.\n' >&2
         return 1
     }
     [[ "$checkpoint_digest" =~ ^[0-9a-f]{64}$ &&
@@ -351,6 +377,8 @@ verify_qwen_native_train_data() {
         "$NATIVE_TRAIN_CATALOG"
         "$NATIVE_TRAIN_DATA_DIR/train_512.parquet"
         "$NATIVE_TRAIN_DATA_DIR/val_128.parquet"
+        "$NATIVE_TRAIN_DATA_DIR/nq_test_128_native_v3.parquet"
+        "$NATIVE_TRAIN_DATA_DIR/multihop_eval_256_native_v3.parquet"
         "$NATIVE_TRAIN_G3_DATA"
         "$NATIVE_TRAIN_SOURCE_DIR/manifest.json"
         "$NATIVE_TRAIN_SOURCE_DIR/retrieval_replay.json"
@@ -372,6 +400,33 @@ verify_qwen_native_train_data() {
         --eval-catalog "$PROJECT_ROOT/data/search_opportunity_gate/catalog.jsonl" \
         --eval-parquet "$PROJECT_ROOT/data/nq_small/test_128.parquet" \
         --expected-tool-protocol qwen35_native
+    "$TRAIN_ENV/bin/python" - "$HANDOFF" "$NATIVE_TRAIN_MANIFEST" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+handoff = json.loads(Path(sys.argv[1]).read_bytes())
+manifest = json.loads(Path(sys.argv[2]).read_bytes())
+expected_handoff = {
+    "schema": 3,
+    "native_prompt_version": "qwen35-native-search-v3-original-aligned",
+    "native_thinking_enabled": True,
+    "max_action_budget": 4,
+    "selection_observation_length": 384,
+    "rollout_observation_length": 500,
+}
+failed = sorted(key for key, value in expected_handoff.items()
+                if handoff.get(key) != value)
+if failed:
+    raise SystemExit("native v3 CPU handoff mismatch: " + ", ".join(failed))
+tokenizer = manifest.get("tokenizer", {})
+prompt_contract = manifest.get("prompt_contract", {})
+if (manifest.get("schema_version") != 4 or
+        prompt_contract.get("prompt_version") != expected_handoff["native_prompt_version"] or
+        tokenizer.get("selection_observation_length") != 384 or
+        tokenizer.get("rollout_observation_length") != 500):
+    raise SystemExit("native v3 data manifest contract mismatch")
+PY
 }
 
 qwen_native_train_preflight() {
@@ -380,19 +435,19 @@ qwen_native_train_preflight() {
     verify_qwen_native_train_data
     base_model="$(readlink -f -- "$MODEL_DIR")"
     data_digest="$(file_sha256 "$NATIVE_TRAIN_MANIFEST")" || return 1
-    verify_pretrain_g3_evidence "$NATIVE_PRETRAIN_G3_EVIDENCE" "$base_model" \
+    verify_protocol_gate_evidence "$NATIVE_PROTOCOL_GATE_EVIDENCE" "$base_model" \
         "$base_digest" "$commit" "$handoff_digest" "$data_digest" || return $?
     if [[ "$NATIVE_TRAIN_STAGE" == main ]]; then
         verify_smoke_evidence "$NATIVE_SMOKE_EVIDENCE" "$base_model" "$base_digest" \
             "$commit" "$handoff_digest" "$data_digest" \
-            "$NATIVE_TRAIN_PRETRAIN_G3_DIGEST" || return $?
+            "$NATIVE_TRAIN_PROTOCOL_GATE_DIGEST" || return $?
     fi
     NATIVE_TRAIN_PREFLIGHT_STAGE="$NATIVE_TRAIN_STAGE"
     NATIVE_TRAIN_PREFLIGHT_COMMIT="$commit"
     NATIVE_TRAIN_PREFLIGHT_HANDOFF="$handoff_digest"
     NATIVE_TRAIN_PREFLIGHT_BASE_DIGEST="$base_digest"
     NATIVE_TRAIN_PREFLIGHT_DATA_DIGEST="$data_digest"
-    NATIVE_TRAIN_PREFLIGHT_PRETRAIN_DIGEST="$NATIVE_TRAIN_PRETRAIN_G3_DIGEST"
+    NATIVE_TRAIN_PREFLIGHT_PROTOCOL_GATE_DIGEST="$NATIVE_TRAIN_PROTOCOL_GATE_DIGEST"
     NATIVE_TRAIN_PREFLIGHT_SMOKE_DIGEST="${NATIVE_TRAIN_SMOKE_DIGEST:--}"
 }
 
@@ -474,10 +529,12 @@ checks = {
     "val_batch": value("data", "val_batch_size") == 8,
     "eval_group": value("data", "eval_group_size") == 1,
     "response": value("data", "max_response_length") == 500,
-    "observation": value("data", "max_obs_length") == 384,
+    "observation": value("data", "max_obs_length") == 500,
     "prompt": value("data", "max_prompt_length") == 4096,
     "start": value("data", "max_start_length") == 1024,
     "turns": value("max_turns") == 4,
+    "capacity": value("max_turns") * (
+        value("data", "max_response_length") + value("data", "max_obs_length")) <= 4096,
     "retriever": value("retriever", "topk") == 3,
     "gpus": value("trainer", "n_gpus_per_node") == 2,
     "steps": value("trainer", "total_training_steps") == steps,
@@ -485,6 +542,7 @@ checks = {
     "test": value("trainer", "test_freq") == steps,
     "seed": value("trainer", "seed") == 42,
     "group": value("actor_rollout_ref", "rollout", "n_agent") == 5,
+    "sampling": value("actor_rollout_ref", "rollout", "do_sample") is True,
     "mini_batch": value("actor_rollout_ref", "actor", "ppo_mini_batch_size") == 40,
     "micro_batch": value("actor_rollout_ref", "actor", "ppo_micro_batch_size") == 2,
     "temperature": float(value("actor_rollout_ref", "rollout", "temperature")) == 1.0,
@@ -540,9 +598,9 @@ payload = {
     "checkpoint": str(checkpoint), "checkpoint_digest": checkpoint_digest,
     "config_sha256": config_digest, "cost_lambda": cost_lambda,
     "cost_reward_mode": cost_reward_mode, "group_size": 5,
-    "max_obs_length": 384, "max_response_length": 500,
+    "max_action_budget": 4, "max_obs_length": 500, "max_response_length": 500,
     "parent": str(parent), "parent_digest": parent_digest,
-    "prompt_version": prompt_version, "role": role, "schema": 1,
+    "prompt_version": prompt_version, "role": role, "schema": 3,
     "steps": steps, "train_batch_size": 8, "variant": variant,
 }
 print(json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
@@ -598,6 +656,8 @@ publish_native_training_evidence() {
         "$NATIVE_TRAIN_MANIFEST" "$NATIVE_TRAIN_MANIFEST.sha256"
         "$NATIVE_TRAIN_CATALOG" "$NATIVE_TRAIN_DATA_DIR/train_512.parquet"
         "$NATIVE_TRAIN_DATA_DIR/val_128.parquet" "$NATIVE_TRAIN_G3_DATA"
+        "$NATIVE_TRAIN_DATA_DIR/nq_test_128_native_v3.parquet"
+        "$NATIVE_TRAIN_DATA_DIR/multihop_eval_256_native_v3.parquet"
         "$HANDOFF" "$HANDOFF.sha256" "$MANIFEST_DIR/cpu.ok"
         "$MANIFEST_DIR/git.ok" "$MANIFEST_DIR/checkout-tree.sha256" "$@"
     )
@@ -651,7 +711,10 @@ count = summary.get("overall", {}).get("cost_contrast_group_count")
 if isinstance(count, bool) or not isinstance(count, int) or count < 0:
     raise SystemExit("R-G3 cost_contrast_group_count is invalid")
 checks = {
-    "stage": decision.get("stage") == "g3",
+    "schema": (decision.get("schema") == "search-r1.grouped-probe-analysis" and
+               decision.get("schema_version") == 3 and
+               summary.get("schema") == "search-r1.grouped-probe-analysis" and
+               summary.get("schema_version") == 3),
     "decision": decision.get("decision") in {"GO", "NO-GO"},
     "summary_decision": summary.get("decision") == decision.get("decision"),
     "checkpoint": summary.get("input", {}).get("checkpoint_digest") == checkpoint_digest,
@@ -683,7 +746,7 @@ payload = {
     "cost_contrast_group_count": count,
     "cost_contrast_group_minimum": 8,
     "decision": "GO" if authorized else "NO-GO",
-    "schema": "qwen-native-post-r-gate-v1",
+    "schema": "qwen-native-post-r-gate-v3",
 }
 print(json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
 PY
@@ -696,7 +759,7 @@ verify_native_training_preflight_state() {
         "$NATIVE_TRAIN_PREFLIGHT_HANDOFF" == "$handoff_digest" &&
         "$NATIVE_TRAIN_PREFLIGHT_BASE_DIGEST" == "$base_digest" &&
         "$NATIVE_TRAIN_PREFLIGHT_DATA_DIGEST" == "$data_digest" &&
-        "$NATIVE_TRAIN_PREFLIGHT_PRETRAIN_DIGEST" == "$NATIVE_TRAIN_PRETRAIN_G3_DIGEST" ]] || {
+        "$NATIVE_TRAIN_PREFLIGHT_PROTOCOL_GATE_DIGEST" == "$NATIVE_TRAIN_PROTOCOL_GATE_DIGEST" ]] || {
         printf 'Qwen native training inputs drifted after GPU preflight.\n' >&2
         return 1
     }
@@ -749,11 +812,11 @@ qwen_native_smoke_pipeline() {
 "stage_order=S2"$'\n'\
 "decision=$smoke_decision"$'\n'\
 "manual_review_required=true"$'\n'\
-"pretrain_g3_evidence=$NATIVE_PRETRAIN_G3_EVIDENCE"$'\n'\
-"pretrain_g3_evidence_sha256=$NATIVE_TRAIN_PRETRAIN_G3_DIGEST"$'\n'
+"protocol_gate_evidence=$NATIVE_PROTOCOL_GATE_EVIDENCE"$'\n'\
+"protocol_gate_evidence_sha256=$NATIVE_TRAIN_PROTOCOL_GATE_DIGEST"$'\n'
     atomic_write "$results_dir/lineage.tsv" \
-        $'stage\trole\trun_dir\tcheckpoint\tcheckpoint_digest\tparent_checkpoint\tparent_checkpoint_digest\tcheckout_commit\tcpu_handoff_digest\tdata_manifest_sha256\tresolved_config_sha256\ttrace_sha256\ttrace_manifest_sha256\trun_contract_sha256\tpretrain_g3_evidence\tpretrain_g3_evidence_sha256\n'\
-"S"$'\t'"smoke"$'\t'"$run"$'\t'"$checkpoint"$'\t'"$checkpoint_digest"$'\t'"$base_model"$'\t'"$base_digest"$'\t'"$commit"$'\t'"$handoff_digest"$'\t'"$data_digest"$'\t'"$config_digest"$'\t'"$trace_digest"$'\t'"$trace_manifest_digest"$'\t'"$contract_digest"$'\t'"$NATIVE_PRETRAIN_G3_EVIDENCE"$'\t'"$NATIVE_TRAIN_PRETRAIN_G3_DIGEST"$'\n'
+        $'stage\trole\trun_dir\tcheckpoint\tcheckpoint_digest\tparent_checkpoint\tparent_checkpoint_digest\tcheckout_commit\tcpu_handoff_digest\tdata_manifest_sha256\tresolved_config_sha256\ttrace_sha256\ttrace_manifest_sha256\trun_contract_sha256\tprotocol_gate_evidence\tprotocol_gate_evidence_sha256\n'\
+"S"$'\t'"smoke"$'\t'"$run"$'\t'"$checkpoint"$'\t'"$checkpoint_digest"$'\t'"$base_model"$'\t'"$base_digest"$'\t'"$commit"$'\t'"$handoff_digest"$'\t'"$data_digest"$'\t'"$config_digest"$'\t'"$trace_digest"$'\t'"$trace_manifest_digest"$'\t'"$contract_digest"$'\t'"$NATIVE_PROTOCOL_GATE_EVIDENCE"$'\t'"$NATIVE_TRAIN_PROTOCOL_GATE_DIGEST"$'\n'
     index_content="$(cat "$outer_attempt/native-training-runs.tsv")"
     atomic_write "$results_dir/run-index.tsv" "$index_content"$'\n'
     atomic_write "$results_dir/checkpoint-tree.env" \
@@ -767,7 +830,7 @@ qwen_native_smoke_pipeline() {
     fi
     verify_checkout "$commit" || return $?
     [[ "$(file_sha256 "$NATIVE_TRAIN_MANIFEST")" == "$data_digest" ]] || return 1
-    verify_pretrain_g3_evidence "$NATIVE_PRETRAIN_G3_EVIDENCE" "$base_model" \
+    verify_protocol_gate_evidence "$NATIVE_PROTOCOL_GATE_EVIDENCE" "$base_model" \
         "$base_digest" "$commit" "$handoff_digest" "$data_digest" || return $?
     verify_native_checkpoint_digest "$base_model" "$base_digest" || return $?
     verify_native_checkpoint_digest "$checkpoint" "$checkpoint_digest" || return $?
@@ -775,8 +838,8 @@ qwen_native_smoke_pipeline() {
         qwen-native-training-smoke "$NATIVE_TRAIN_SMOKE_CONTRACT" \
         "$results_dir/contract.env" "$results_dir/lineage.tsv" \
         "$results_dir/run-index.tsv" "$results_dir/storage.env" \
-        "$results_dir/checkpoint-tree.env" "$NATIVE_PRETRAIN_G3_EVIDENCE" \
-        "$NATIVE_TRAIN_PRETRAIN_G3_MANIFEST" "$run/train.log" \
+        "$results_dir/checkpoint-tree.env" "$NATIVE_PROTOCOL_GATE_EVIDENCE" \
+        "$NATIVE_TRAIN_PROTOCOL_GATE_MANIFEST" "$run/train.log" \
         "$run/resolved-config.yaml" "$run/run.env" "$run/lineage.tsv" \
         "$run/native-training-contract.json" \
         "$results_dir/smoke-decision.json" \
@@ -797,7 +860,6 @@ qwen_native_main_pipeline() {
     local outer_attempt="$1" commit="$2" handoff_digest="$3"
     local base_model="$4" base_digest="$5" data_digest="$6"
     local reproduce_run eval_run control_run='' cost_run=''
-    local control_eval_run='' cost_eval_run=''
     local reproduce_checkpoint control_checkpoint='' cost_checkpoint=''
     local reproduce_digest control_digest='' cost_digest=''
     local reproduce_config control_config='' cost_config='' eval_config
@@ -807,12 +869,25 @@ qwen_native_main_pipeline() {
     local control_trace_digest='' control_trace_manifest_digest=''
     local cost_trace_digest='' cost_trace_manifest_digest=''
     local eval_trace_digest eval_trace_manifest_digest
-    local control_eval_trace_digest='' control_eval_trace_manifest_digest=''
-    local cost_eval_trace_digest='' cost_eval_trace_manifest_digest=''
-    local results_dir analysis_dir paired_dir decision_metadata analysis_decision contrast_count
-    local branch_authorized=false branch_rows='' branch_json stage_order index_content
+    local results_dir analysis_dir decision_metadata analysis_decision contrast_count
+    local branch_authorized=false branch_rows='' ar_rows='' branch_json stage_order index_content
     local wandb_run wandb_file wandb_count wandb_history_count
+    local eval_key eval_suffix eval_artifact eval_rows eval_stage control_eval_run cost_eval_run
+    local trace_identity eval_trace_digest_tmp eval_trace_manifest_digest_tmp
     local -a evidence_files wandb_runs
+    local -a eval_keys=(val nq_test multihop)
+    local -A control_eval_runs cost_eval_runs control_eval_trace_digests
+    local -A control_eval_trace_manifest_digests cost_eval_trace_digests
+    local -A cost_eval_trace_manifest_digests paired_dirs eval_expected_rows eval_artifacts
+    local -A parent_eval_runs reproduced_eval_runs parent_eval_trace_digests
+    local -A parent_eval_trace_manifest_digests reproduced_eval_trace_digests
+    local -A reproduced_eval_trace_manifest_digests ar_dirs
+    eval_expected_rows[val]=128
+    eval_expected_rows[nq_test]=128
+    eval_expected_rows[multihop]=256
+    eval_artifacts[val]=val
+    eval_artifacts[nq_test]=nq_test_eval
+    eval_artifacts[multihop]=multihop_eval
 
     verify_native_checkpoint_digest "$base_model" "$base_digest" || return $?
     # R is always a fresh process from the sealed base. Smoke weights are never an input.
@@ -861,12 +936,59 @@ qwen_native_main_pipeline() {
         "$analysis_decision" "$contrast_count")" || return 1
     atomic_write "$results_dir/branch-decision.json" "$branch_json"$'\n'
 
-    # B/C use the sealed native-v2 train/val contract, not the temporary 64x5 probe.
+    # B/C use the sealed native-v3 train/eval contract, not the temporary 64x5 probe.
     export EVAL_DATA_FILE=''
     export EVAL_EXPECTED_ROWS=128
     export EVAL_GROUP_SIZE=1
 
+    for eval_key in "${eval_keys[@]}"; do
+        eval_rows="${eval_expected_rows[$eval_key]}"
+        export EVAL_EXPECTED_ROWS="$eval_rows"
+
+        run_job eval "qwen_native_a_$eval_key" "$base_model" '' "$base_digest" || return $?
+        parent_eval_runs[$eval_key]="$LAST_RUN_DIR"
+        eval_stage="${eval_key^^}"
+        eval_stage="A-${eval_stage//_/-}-EVAL"
+        append_native_train_index "$outer_attempt" "$eval_stage" \
+            "parent_${eval_key}_eval" "${parent_eval_runs[$eval_key]}" || return $?
+        trace_identity="$(verify_native_trace_identity \
+            "${parent_eval_runs[$eval_key]}/traces/eval_predictions.manifest.json" \
+            "$eval_rows")" || return 1
+        IFS=$'\t' read -r eval_trace_digest_tmp eval_trace_manifest_digest_tmp \
+            <<<"$trace_identity"
+        parent_eval_trace_digests[$eval_key]="$eval_trace_digest_tmp"
+        parent_eval_trace_manifest_digests[$eval_key]="$eval_trace_manifest_digest_tmp"
+
+        run_job eval "qwen_native_r_$eval_key" "$reproduce_checkpoint" '' \
+            "$reproduce_digest" || return $?
+        reproduced_eval_runs[$eval_key]="$LAST_RUN_DIR"
+        eval_stage="${eval_key^^}"
+        eval_stage="R-${eval_stage//_/-}-EVAL"
+        append_native_train_index "$outer_attempt" "$eval_stage" \
+            "reproduced_${eval_key}_eval" "${reproduced_eval_runs[$eval_key]}" || return $?
+        trace_identity="$(verify_native_trace_identity \
+            "${reproduced_eval_runs[$eval_key]}/traces/eval_predictions.manifest.json" \
+            "$eval_rows")" || return 1
+        IFS=$'\t' read -r eval_trace_digest_tmp eval_trace_manifest_digest_tmp \
+            <<<"$trace_identity"
+        reproduced_eval_trace_digests[$eval_key]="$eval_trace_digest_tmp"
+        reproduced_eval_trace_manifest_digests[$eval_key]="$eval_trace_manifest_digest_tmp"
+
+        ar_dirs[$eval_key]="$results_dir/paired-ar-$eval_key"
+        "$TRAIN_ENV/bin/python" "$NATIVE_TRAIN_PAIRED_CLI" \
+            --parent "${parent_eval_runs[$eval_key]}/traces/eval_predictions.jsonl" \
+            --reproduced "${reproduced_eval_runs[$eval_key]}/traces/eval_predictions.jsonl" \
+            --data-manifest "$NATIVE_TRAIN_MANIFEST" \
+            --eval-artifact "${eval_artifacts[$eval_key]}" \
+            --expected-parent-checkpoint-digest "$base_digest" \
+            --expected-reproduced-checkpoint-digest "$reproduce_digest" \
+            --output-dir "${ar_dirs[$eval_key]}" \
+            --expected-rows "$eval_rows" || return $?
+    done
+
     if [[ "$branch_authorized" == true ]]; then
+        # Endpoint loops end on multihop-256; restore the neutral training metadata.
+        export EVAL_EXPECTED_ROWS=128
         verify_native_checkpoint_digest "$reproduce_checkpoint" "$reproduce_digest" || return $?
         run_job train control "$BRANCH_STEPS" "$reproduce_checkpoint" \
             "$reproduce_digest" || return $?
@@ -904,40 +1026,61 @@ qwen_native_main_pipeline() {
             "$((BRANCH_STEPS * TRAIN_BATCH_SIZE * 5))")" || return 1
         IFS=$'\t' read -r cost_trace_digest cost_trace_manifest_digest <<<"$cost_trace"
 
-        # Evaluate both fixed endpoints on the same sealed 128-question set.
-        run_job eval qwen_native_b "$control_checkpoint" '' "$control_digest" || return $?
-        control_eval_run="$LAST_RUN_DIR"
-        append_native_train_index "$outer_attempt" B-EVAL control_eval \
-            "$control_eval_run" || return $?
-        control_trace="$(verify_native_trace_identity \
-            "$control_eval_run/traces/eval_predictions.manifest.json" 128)" || return 1
-        IFS=$'\t' read -r control_eval_trace_digest \
-            control_eval_trace_manifest_digest <<<"$control_trace"
+        # Evaluate both fixed endpoints greedily on curated and unfiltered v3 sets.
+        for eval_key in "${eval_keys[@]}"; do
+            eval_suffix="$eval_key"
+            eval_artifact="${eval_artifacts[$eval_key]}"
+            eval_rows="${eval_expected_rows[$eval_key]}"
+            export EVAL_EXPECTED_ROWS="$eval_rows"
 
-        run_job eval qwen_native_c "$cost_checkpoint" '' "$cost_digest" || return $?
-        cost_eval_run="$LAST_RUN_DIR"
-        append_native_train_index "$outer_attempt" C-EVAL cost_aware_gated_eval \
-            "$cost_eval_run" || return $?
-        cost_trace="$(verify_native_trace_identity \
-            "$cost_eval_run/traces/eval_predictions.manifest.json" 128)" || return 1
-        IFS=$'\t' read -r cost_eval_trace_digest \
-            cost_eval_trace_manifest_digest <<<"$cost_trace"
+            run_job eval "qwen_native_b_$eval_suffix" "$control_checkpoint" '' \
+                "$control_digest" || return $?
+            control_eval_run="$LAST_RUN_DIR"
+            control_eval_runs[$eval_key]="$control_eval_run"
+            eval_stage="${eval_key^^}"
+            eval_stage="B-${eval_stage//_/-}-EVAL"
+            append_native_train_index "$outer_attempt" "$eval_stage" \
+                "control_${eval_key}_eval" "$control_eval_run" || return $?
+            trace_identity="$(verify_native_trace_identity \
+                "$control_eval_run/traces/eval_predictions.manifest.json" \
+                "$eval_rows")" || return 1
+            IFS=$'\t' read -r eval_trace_digest_tmp \
+                eval_trace_manifest_digest_tmp <<<"$trace_identity"
+            control_eval_trace_digests[$eval_key]="$eval_trace_digest_tmp"
+            control_eval_trace_manifest_digests[$eval_key]="$eval_trace_manifest_digest_tmp"
 
-        paired_dir="$results_dir/paired"
-        "$TRAIN_ENV/bin/python" "$NATIVE_TRAIN_PAIRED_CLI" \
-            --control "$control_eval_run/traces/eval_predictions.jsonl" \
-            --cost-aware-gated "$cost_eval_run/traces/eval_predictions.jsonl" \
-            --catalog "$NATIVE_TRAIN_CATALOG" \
-            --data-manifest "$NATIVE_TRAIN_MANIFEST" \
-            --expected-control-checkpoint-digest "$control_digest" \
-            --expected-cost-aware-gated-checkpoint-digest "$cost_digest" \
-            --output-dir "$paired_dir" \
-            --expected-rows 128 || return $?
+            run_job eval "qwen_native_c_$eval_suffix" "$cost_checkpoint" '' \
+                "$cost_digest" || return $?
+            cost_eval_run="$LAST_RUN_DIR"
+            cost_eval_runs[$eval_key]="$cost_eval_run"
+            eval_stage="${eval_key^^}"
+            eval_stage="C-${eval_stage//_/-}-EVAL"
+            append_native_train_index "$outer_attempt" "$eval_stage" \
+                "cost_aware_gated_${eval_key}_eval" "$cost_eval_run" || return $?
+            trace_identity="$(verify_native_trace_identity \
+                "$cost_eval_run/traces/eval_predictions.manifest.json" \
+                "$eval_rows")" || return 1
+            IFS=$'\t' read -r eval_trace_digest_tmp \
+                eval_trace_manifest_digest_tmp <<<"$trace_identity"
+            cost_eval_trace_digests[$eval_key]="$eval_trace_digest_tmp"
+            cost_eval_trace_manifest_digests[$eval_key]="$eval_trace_manifest_digest_tmp"
+
+            paired_dirs[$eval_key]="$results_dir/paired-$eval_key"
+            "$TRAIN_ENV/bin/python" "$NATIVE_TRAIN_PAIRED_CLI" \
+                --control "$control_eval_run/traces/eval_predictions.jsonl" \
+                --cost-aware-gated "$cost_eval_run/traces/eval_predictions.jsonl" \
+                --data-manifest "$NATIVE_TRAIN_MANIFEST" \
+                --eval-artifact "$eval_artifact" \
+                --expected-control-checkpoint-digest "$control_digest" \
+                --expected-cost-aware-gated-checkpoint-digest "$cost_digest" \
+                --output-dir "${paired_dirs[$eval_key]}" \
+                --expected-rows "$eval_rows" || return $?
+        done
     fi
 
-    stage_order=R60,G3
+    stage_order=R60,G3,A-VAL-EVAL,R-VAL-EVAL,A-NQ-TEST-EVAL,R-NQ-TEST-EVAL,A-MULTIHOP-EVAL,R-MULTIHOP-EVAL
     if [[ "$branch_authorized" == true ]]; then
-        stage_order=R60,G3,B20,C20,B-EVAL,C-EVAL
+        stage_order+=,B20,C20,B-VAL-EVAL,C-VAL-EVAL,B-NQ-TEST-EVAL,C-NQ-TEST-EVAL,B-MULTIHOP-EVAL,C-MULTIHOP-EVAL
     fi
     reproduce_config="$(file_sha256 "$reproduce_run/resolved-config.yaml")" || return 1
     reproduce_contract="$(file_sha256 "$reproduce_run/native-training-contract.json")" || return 1
@@ -949,18 +1092,25 @@ qwen_native_main_pipeline() {
 "analysis_decision=$analysis_decision"$'\n'\
 "cost_contrast_group_count=$contrast_count"$'\n'\
 "branch_authorized=$branch_authorized"$'\n'\
-"pretrain_g3_evidence=$NATIVE_PRETRAIN_G3_EVIDENCE"$'\n'\
-"pretrain_g3_evidence_sha256=$NATIVE_TRAIN_PRETRAIN_G3_DIGEST"$'\n'\
+"protocol_gate_evidence=$NATIVE_PROTOCOL_GATE_EVIDENCE"$'\n'\
+"protocol_gate_evidence_sha256=$NATIVE_TRAIN_PROTOCOL_GATE_DIGEST"$'\n'\
 "smoke_evidence=$NATIVE_SMOKE_EVIDENCE"$'\n'\
 "smoke_evidence_sha256=$NATIVE_TRAIN_SMOKE_DIGEST"$'\n'
     atomic_write "$results_dir/lineage.tsv" \
         $'stage\trole\trun_dir\tcheckpoint\tcheckpoint_digest\tparent_checkpoint\tparent_checkpoint_digest\tcheckout_commit\tcpu_handoff_digest\tdata_manifest_sha256\tresolved_config_sha256\ttrace_sha256\ttrace_manifest_sha256\trun_contract_sha256\tpredecessor_evidence_sha256\n'\
 "R"$'\t'"reproduced"$'\t'"$reproduce_run"$'\t'"$reproduce_checkpoint"$'\t'"$reproduce_digest"$'\t'"$base_model"$'\t'"$base_digest"$'\t'"$commit"$'\t'"$handoff_digest"$'\t'"$data_digest"$'\t'"$reproduce_config"$'\t'"$reproduce_trace_digest"$'\t'"$reproduce_trace_manifest_digest"$'\t'"$reproduce_contract"$'\t'"$NATIVE_TRAIN_SMOKE_DIGEST"$'\n'\
 "G3"$'\t'"capability_gate"$'\t'"$eval_run"$'\t'"$reproduce_checkpoint"$'\t'"$reproduce_digest"$'\t'"$reproduce_checkpoint"$'\t'"$reproduce_digest"$'\t'"$commit"$'\t'"$handoff_digest"$'\t'"$data_digest"$'\t'"$eval_config"$'\t'"$eval_trace_digest"$'\t'"$eval_trace_manifest_digest"$'\t-'$'\t'"$NATIVE_TRAIN_SMOKE_DIGEST"$'\n'
+    for eval_key in "${eval_keys[@]}"; do
+        eval_stage="${eval_key^^}"
+        eval_stage="${eval_stage//_/-}"
+        ar_rows+="A-$eval_stage-EVAL"$'\t'"parent_${eval_key}_eval"$'\t'"${parent_eval_runs[$eval_key]}"$'\t'"$base_model"$'\t'"$base_digest"$'\t'"$base_model"$'\t'"$base_digest"$'\t'"$commit"$'\t'"$handoff_digest"$'\t'"$data_digest"$'\t'"$(file_sha256 "${parent_eval_runs[$eval_key]}/resolved-config.yaml")"$'\t'"${parent_eval_trace_digests[$eval_key]}"$'\t'"${parent_eval_trace_manifest_digests[$eval_key]}"$'\t-'$'\t'"$NATIVE_TRAIN_SMOKE_DIGEST"$'\n'
+        ar_rows+="R-$eval_stage-EVAL"$'\t'"reproduced_${eval_key}_eval"$'\t'"${reproduced_eval_runs[$eval_key]}"$'\t'"$reproduce_checkpoint"$'\t'"$reproduce_digest"$'\t'"$reproduce_checkpoint"$'\t'"$reproduce_digest"$'\t'"$commit"$'\t'"$handoff_digest"$'\t'"$data_digest"$'\t'"$(file_sha256 "${reproduced_eval_runs[$eval_key]}/resolved-config.yaml")"$'\t'"${reproduced_eval_trace_digests[$eval_key]}"$'\t'"${reproduced_eval_trace_manifest_digests[$eval_key]}"$'\t-'$'\t'"$NATIVE_TRAIN_SMOKE_DIGEST"$'\n'
+    done
+    printf '%s' "$ar_rows" >>"$results_dir/lineage.tsv"
     evidence_files=(
         "$results_dir/contract.env" "$results_dir/lineage.tsv"
-        "$results_dir/branch-decision.json" "$NATIVE_PRETRAIN_G3_EVIDENCE"
-        "$NATIVE_TRAIN_PRETRAIN_G3_MANIFEST" "$NATIVE_SMOKE_EVIDENCE"
+        "$results_dir/branch-decision.json" "$NATIVE_PROTOCOL_GATE_EVIDENCE"
+        "$NATIVE_TRAIN_PROTOCOL_GATE_MANIFEST" "$NATIVE_SMOKE_EVIDENCE"
         "$NATIVE_TRAIN_SMOKE_MANIFEST" "$NATIVE_TRAIN_SMOKE_RESULTS/contract.env"
         "$NATIVE_TRAIN_SMOKE_RESULTS/lineage.tsv" "$NATIVE_TRAIN_SMOKE_RESULTS/storage.env"
         "$reproduce_run/train.log" "$reproduce_run/resolved-config.yaml"
@@ -977,15 +1127,37 @@ qwen_native_main_pipeline() {
         "$analysis_dir/go_no_go.json" "$analysis_dir/per_trajectory.jsonl"
         "$analysis_dir/per_question.jsonl"
     )
+    for eval_key in "${eval_keys[@]}"; do
+        for wandb_run in "${parent_eval_runs[$eval_key]}" \
+            "${reproduced_eval_runs[$eval_key]}"; do
+            evidence_files+=(
+                "$wandb_run/train.log" "$wandb_run/resolved-config.yaml"
+                "$wandb_run/run.env" "$wandb_run/traces/eval_predictions.jsonl"
+                "$wandb_run/traces/eval_predictions.manifest.json"
+                "$wandb_run/traces/eval_predictions.manifest.json.sha256"
+            )
+        done
+        evidence_files+=(
+            "${ar_dirs[$eval_key]}/summary.json"
+            "${ar_dirs[$eval_key]}/summary.md"
+            "${ar_dirs[$eval_key]}/paired_results.csv"
+            "${ar_dirs[$eval_key]}/correct_questions.csv"
+            "${ar_dirs[$eval_key]}/wrong_questions.csv"
+            "${ar_dirs[$eval_key]}/search_transition.csv"
+        )
+    done
     if [[ "$branch_authorized" == true ]]; then
         control_config="$(file_sha256 "$control_run/resolved-config.yaml")" || return 1
         cost_config="$(file_sha256 "$cost_run/resolved-config.yaml")" || return 1
         control_contract="$(file_sha256 "$control_run/native-training-contract.json")" || return 1
         cost_contract="$(file_sha256 "$cost_run/native-training-contract.json")" || return 1
         branch_rows="B"$'\t'"control"$'\t'"$control_run"$'\t'"$control_checkpoint"$'\t'"$control_digest"$'\t'"$reproduce_checkpoint"$'\t'"$reproduce_digest"$'\t'"$commit"$'\t'"$handoff_digest"$'\t'"$data_digest"$'\t'"$control_config"$'\t'"$control_trace_digest"$'\t'"$control_trace_manifest_digest"$'\t'"$control_contract"$'\t'"$NATIVE_TRAIN_SMOKE_DIGEST"$'\n'\
-"C"$'\t'"cost_aware_gated"$'\t'"$cost_run"$'\t'"$cost_checkpoint"$'\t'"$cost_digest"$'\t'"$reproduce_checkpoint"$'\t'"$reproduce_digest"$'\t'"$commit"$'\t'"$handoff_digest"$'\t'"$data_digest"$'\t'"$cost_config"$'\t'"$cost_trace_digest"$'\t'"$cost_trace_manifest_digest"$'\t'"$cost_contract"$'\t'"$NATIVE_TRAIN_SMOKE_DIGEST"$'\n'\
-"B-EVAL"$'\t'"control_eval"$'\t'"$control_eval_run"$'\t'"$control_checkpoint"$'\t'"$control_digest"$'\t'"$control_checkpoint"$'\t'"$control_digest"$'\t'"$commit"$'\t'"$handoff_digest"$'\t'"$data_digest"$'\t'"$(file_sha256 "$control_eval_run/resolved-config.yaml")"$'\t'"$control_eval_trace_digest"$'\t'"$control_eval_trace_manifest_digest"$'\t-'$'\t'"$NATIVE_TRAIN_SMOKE_DIGEST"$'\n'\
-"C-EVAL"$'\t'"cost_aware_gated_eval"$'\t'"$cost_eval_run"$'\t'"$cost_checkpoint"$'\t'"$cost_digest"$'\t'"$cost_checkpoint"$'\t'"$cost_digest"$'\t'"$commit"$'\t'"$handoff_digest"$'\t'"$data_digest"$'\t'"$(file_sha256 "$cost_eval_run/resolved-config.yaml")"$'\t'"$cost_eval_trace_digest"$'\t'"$cost_eval_trace_manifest_digest"$'\t-'$'\t'"$NATIVE_TRAIN_SMOKE_DIGEST"$'\n'
+"C"$'\t'"cost_aware_gated"$'\t'"$cost_run"$'\t'"$cost_checkpoint"$'\t'"$cost_digest"$'\t'"$reproduce_checkpoint"$'\t'"$reproduce_digest"$'\t'"$commit"$'\t'"$handoff_digest"$'\t'"$data_digest"$'\t'"$cost_config"$'\t'"$cost_trace_digest"$'\t'"$cost_trace_manifest_digest"$'\t'"$cost_contract"$'\t'"$NATIVE_TRAIN_SMOKE_DIGEST"$'\n'
+        for eval_key in "${eval_keys[@]}"; do
+            eval_stage="${eval_key^^}"
+            branch_rows+="B-${eval_stage//_/-}-EVAL"$'\t'"control_${eval_key}_eval"$'\t'"${control_eval_runs[$eval_key]}"$'\t'"$control_checkpoint"$'\t'"$control_digest"$'\t'"$control_checkpoint"$'\t'"$control_digest"$'\t'"$commit"$'\t'"$handoff_digest"$'\t'"$data_digest"$'\t'"$(file_sha256 "${control_eval_runs[$eval_key]}/resolved-config.yaml")"$'\t'"${control_eval_trace_digests[$eval_key]}"$'\t'"${control_eval_trace_manifest_digests[$eval_key]}"$'\t-'$'\t'"$NATIVE_TRAIN_SMOKE_DIGEST"$'\n'
+            branch_rows+="C-${eval_stage//_/-}-EVAL"$'\t'"cost_aware_gated_${eval_key}_eval"$'\t'"${cost_eval_runs[$eval_key]}"$'\t'"$cost_checkpoint"$'\t'"$cost_digest"$'\t'"$cost_checkpoint"$'\t'"$cost_digest"$'\t'"$commit"$'\t'"$handoff_digest"$'\t'"$data_digest"$'\t'"$(file_sha256 "${cost_eval_runs[$eval_key]}/resolved-config.yaml")"$'\t'"${cost_eval_trace_digests[$eval_key]}"$'\t'"${cost_eval_trace_manifest_digests[$eval_key]}"$'\t-'$'\t'"$NATIVE_TRAIN_SMOKE_DIGEST"$'\n'
+        done
         printf '%s' "$branch_rows" >>"$results_dir/lineage.tsv"
         evidence_files+=(
             "$control_run/train.log" "$control_run/resolved-config.yaml"
@@ -999,24 +1171,39 @@ qwen_native_main_pipeline() {
             "$cost_run/traces/train_trajectories.jsonl"
             "$cost_run/traces/train_trajectories.manifest.json"
             "$cost_run/traces/train_trajectories.manifest.json.sha256"
-            "$control_eval_run/train.log" "$control_eval_run/resolved-config.yaml"
-            "$control_eval_run/run.env"
-            "$control_eval_run/traces/eval_predictions.jsonl"
-            "$control_eval_run/traces/eval_predictions.manifest.json"
-            "$control_eval_run/traces/eval_predictions.manifest.json.sha256"
-            "$cost_eval_run/train.log" "$cost_eval_run/resolved-config.yaml"
-            "$cost_eval_run/run.env"
-            "$cost_eval_run/traces/eval_predictions.jsonl"
-            "$cost_eval_run/traces/eval_predictions.manifest.json"
-            "$cost_eval_run/traces/eval_predictions.manifest.json.sha256"
-            "$paired_dir/summary.json" "$paired_dir/summary.md"
-            "$paired_dir/paired_results.csv" "$paired_dir/correct_questions.csv"
-            "$paired_dir/wrong_questions.csv" "$paired_dir/search_transition.csv"
         )
+        for eval_key in "${eval_keys[@]}"; do
+            control_eval_run="${control_eval_runs[$eval_key]}"
+            cost_eval_run="${cost_eval_runs[$eval_key]}"
+            evidence_files+=(
+                "$control_eval_run/train.log" "$control_eval_run/resolved-config.yaml"
+                "$control_eval_run/run.env"
+                "$control_eval_run/traces/eval_predictions.jsonl"
+                "$control_eval_run/traces/eval_predictions.manifest.json"
+                "$control_eval_run/traces/eval_predictions.manifest.json.sha256"
+                "$cost_eval_run/train.log" "$cost_eval_run/resolved-config.yaml"
+                "$cost_eval_run/run.env"
+                "$cost_eval_run/traces/eval_predictions.jsonl"
+                "$cost_eval_run/traces/eval_predictions.manifest.json"
+                "$cost_eval_run/traces/eval_predictions.manifest.json.sha256"
+                "${paired_dirs[$eval_key]}/summary.json"
+                "${paired_dirs[$eval_key]}/summary.md"
+                "${paired_dirs[$eval_key]}/paired_results.csv"
+                "${paired_dirs[$eval_key]}/correct_questions.csv"
+                "${paired_dirs[$eval_key]}/wrong_questions.csv"
+                "${paired_dirs[$eval_key]}/search_transition.csv"
+            )
+        done
     fi
     wandb_runs=("$reproduce_run" "$eval_run")
+    for eval_key in "${eval_keys[@]}"; do
+        wandb_runs+=("${parent_eval_runs[$eval_key]}" "${reproduced_eval_runs[$eval_key]}")
+    done
     if [[ "$branch_authorized" == true ]]; then
-        wandb_runs+=("$control_run" "$cost_run" "$control_eval_run" "$cost_eval_run")
+        wandb_runs+=("$control_run" "$cost_run")
+        for eval_key in "${eval_keys[@]}"; do
+            wandb_runs+=("${control_eval_runs[$eval_key]}" "${cost_eval_runs[$eval_key]}")
+        done
     fi
     for wandb_run in "${wandb_runs[@]}"; do
         [[ -d "$wandb_run/wandb" && ! -L "$wandb_run/wandb" ]] || {
@@ -1049,11 +1236,11 @@ qwen_native_main_pipeline() {
 
     verify_checkout "$commit" || return $?
     [[ "$(file_sha256 "$NATIVE_TRAIN_MANIFEST")" == "$data_digest" ]] || return 1
-    verify_pretrain_g3_evidence "$NATIVE_PRETRAIN_G3_EVIDENCE" "$base_model" \
+    verify_protocol_gate_evidence "$NATIVE_PROTOCOL_GATE_EVIDENCE" "$base_model" \
         "$base_digest" "$commit" "$handoff_digest" "$data_digest" || return $?
     verify_smoke_evidence "$NATIVE_SMOKE_EVIDENCE" "$base_model" "$base_digest" \
         "$commit" "$handoff_digest" "$data_digest" \
-        "$NATIVE_TRAIN_PRETRAIN_G3_DIGEST" || return $?
+        "$NATIVE_TRAIN_PROTOCOL_GATE_DIGEST" || return $?
     verify_native_checkpoint_digest "$base_model" "$base_digest" || return $?
     verify_native_checkpoint_digest "$reproduce_checkpoint" "$reproduce_digest" || return $?
     if [[ "$branch_authorized" == true ]]; then
@@ -1076,12 +1263,12 @@ qwen_native_train_pipeline() {
     local base_model="$4" base_digest="$5" data_digest
     require_qwen_native_train || return $?
     data_digest="$(file_sha256 "$NATIVE_TRAIN_MANIFEST")" || return 1
-    verify_pretrain_g3_evidence "$NATIVE_PRETRAIN_G3_EVIDENCE" "$base_model" \
+    verify_protocol_gate_evidence "$NATIVE_PROTOCOL_GATE_EVIDENCE" "$base_model" \
         "$base_digest" "$commit" "$handoff_digest" "$data_digest" || return $?
     if [[ "$NATIVE_TRAIN_STAGE" == main ]]; then
         verify_smoke_evidence "$NATIVE_SMOKE_EVIDENCE" "$base_model" "$base_digest" \
             "$commit" "$handoff_digest" "$data_digest" \
-            "$NATIVE_TRAIN_PRETRAIN_G3_DIGEST" || return $?
+            "$NATIVE_TRAIN_PROTOCOL_GATE_DIGEST" || return $?
     fi
     verify_native_training_preflight_state "$commit" "$handoff_digest" \
         "$base_digest" "$data_digest" || return $?
@@ -1111,7 +1298,7 @@ qwen_native_train_main() {
             phase_launch gpu "$0"
             ;;
         *)
-            printf 'Usage: QWEN_NATIVE_TRAIN_STAGE={smoke|main} QWEN_NATIVE_PRETRAIN_G3_EVIDENCE=<marker> [QWEN_NATIVE_SMOKE_EVIDENCE=<marker>] GPU_COUNT=2 AUTODL_PRICE_PER_HOUR=<price> bash %s\n' "$0" >&2
+            printf 'Usage: QWEN_NATIVE_TRAIN_STAGE={smoke|main} QWEN_NATIVE_PROTOCOL_GATE_EVIDENCE=<g0_g1-marker> [QWEN_NATIVE_SMOKE_EVIDENCE=<marker>] GPU_COUNT=2 AUTODL_PRICE_PER_HOUR=<price> bash %s\n' "$0" >&2
             exit 64
             ;;
     esac

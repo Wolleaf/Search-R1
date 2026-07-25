@@ -762,7 +762,7 @@ smoke_lineage_fields = (
     "parent_checkpoint", "parent_checkpoint_digest", "checkout_commit",
     "cpu_handoff_digest", "data_manifest_sha256", "resolved_config_sha256",
     "trace_sha256", "trace_manifest_sha256", "run_contract_sha256",
-    "pretrain_g3_evidence", "pretrain_g3_evidence_sha256",
+    "protocol_gate_evidence", "protocol_gate_evidence_sha256",
 )
 main_lineage_fields = smoke_lineage_fields[:-2] + ("predecessor_evidence_sha256",)
 index_fields = ("stage", "role", "run_dir")
@@ -773,7 +773,7 @@ handoff_digest = require_evidence(project / "manifests/cpu.ok").read_text(
     encoding="utf-8"
 ).strip()
 data_manifest = require_evidence(
-    project / "data/search_mix_qwen35_native_v2/manifest.json"
+    project / "data/search_mix_qwen35_native_v3/manifest.json"
 )
 data_manifest_digest = sha256(data_manifest)
 if re.fullmatch(r"[0-9a-f]{40}", checkout_commit) is None:
@@ -824,12 +824,12 @@ def validate_common_lineage(row, stage, role, run_kind, predecessor_digest):
         fail(f"trace digest mismatch for {stage}")
 
 
-if contract == "qwen-native-training-smoke-v1":
+if contract == "qwen-native-training-smoke-v3":
     env = load_env(
         results / "contract.env",
         (
             "schema", "stage", "stage_order", "decision", "manual_review_required",
-            "pretrain_g3_evidence", "pretrain_g3_evidence_sha256",
+            "protocol_gate_evidence", "protocol_gate_evidence_sha256",
         ),
     )
     expected = {
@@ -843,19 +843,23 @@ if contract == "qwen-native-training-smoke-v1":
     if env["decision"] not in {"GO", "NO-GO"}:
         fail("invalid smoke contract decision")
     pretrain_root, pretrain_entries = validate_bound_predecessor(
-        env["pretrain_g3_evidence"],
+        env["protocol_gate_evidence"],
         "qwen-native-gate",
         "runs/qwen-native-gate/attempts",
-        env["pretrain_g3_evidence_sha256"],
-        "qwen-native-gate-v1",
+        env["protocol_gate_evidence_sha256"],
+        "qwen-native-gate-v3",
     )
     if any(relative(pretrain_root / name) not in pretrain_entries
            for name in ("stage.txt", "go_no_go.json")):
-        fail("smoke predecessor omits its G3 decision evidence")
-    if (pretrain_root / "stage.txt").read_text(encoding="utf-8").strip() != "g3":
-        fail("smoke predecessor is not G3")
-    if json.loads((pretrain_root / "go_no_go.json").read_bytes()).get("decision") != "GO":
-        fail("smoke predecessor is not a G3 GO")
+        fail("smoke predecessor omits its structural gate decision evidence")
+    if (pretrain_root / "stage.txt").read_text(encoding="utf-8").strip() != "g0_g1":
+        fail("smoke predecessor is not the structural G0/G1 gate")
+    gate_decision = json.loads((pretrain_root / "go_no_go.json").read_bytes())
+    if (gate_decision.get("schema") != "search-r1.qwen-native-gate" or
+            gate_decision.get("schema_version") != 3 or
+            gate_decision.get("stage") != "g0_g1" or
+            gate_decision.get("decision") != "GO"):
+        fail("smoke predecessor is not a structural G0/G1 v3 GO")
     rows = load_tsv(results / "lineage.tsv", smoke_lineage_fields)
     index = load_tsv(results / "run-index.tsv", index_fields)
     if len(rows) != 1 or len(index) != 1:
@@ -893,8 +897,8 @@ if contract == "qwen-native-training-smoke-v1":
     }
     if any(row[key] != value for key, value in smoke_artifact_digests.items()):
         fail("smoke run artifact digest mismatch")
-    if row["pretrain_g3_evidence"] != env["pretrain_g3_evidence"] or \
-            row["pretrain_g3_evidence_sha256"] != env["pretrain_g3_evidence_sha256"]:
+    if row["protocol_gate_evidence"] != env["protocol_gate_evidence"] or \
+            row["protocol_gate_evidence_sha256"] != env["protocol_gate_evidence_sha256"]:
         fail("smoke lineage predecessor mismatch")
     checkpoint_env = load_env(
         results / "checkpoint-tree.env", ("checkpoint", "checkpoint_tree_sha256")
@@ -910,7 +914,7 @@ if contract == "qwen-native-training-smoke-v1":
     if not isinstance(inputs, dict) or set(inputs) != {
             "catalog_sha256", "log_sha256", "trace_sha256", "wandb_tree_sha256"}:
         fail("malformed smoke decision inputs")
-    catalog = require_evidence(project / "data/search_mix_qwen35_native_v2/catalog.jsonl")
+    catalog = require_evidence(project / "data/search_mix_qwen35_native_v3/catalog.jsonl")
     expected_inputs = {
         "catalog_sha256": sha256(catalog),
         "log_sha256": sha256(run_dir / "train.log"),
@@ -931,13 +935,13 @@ if contract == "qwen-native-training-smoke-v1":
     if re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", storage["recorded_at"]) is None:
         fail("invalid smoke storage timestamp")
 
-elif contract == "qwen-native-training-main-v1":
+elif contract == "qwen-native-training-main-v3":
     env = load_env(
         results / "contract.env",
         (
             "schema", "stage", "stage_order", "analysis_decision",
             "cost_contrast_group_count", "branch_authorized",
-            "pretrain_g3_evidence", "pretrain_g3_evidence_sha256",
+            "protocol_gate_evidence", "protocol_gate_evidence_sha256",
             "smoke_evidence", "smoke_evidence_sha256",
         ),
     )
@@ -954,28 +958,39 @@ elif contract == "qwen-native-training-main-v1":
     expected_authorized = env["analysis_decision"] == "GO" and contrast_count >= 8
     if authorized != expected_authorized:
         fail("branch authorization is inconsistent with the post-R gate")
-    expected_stage_order = "R60,G3,B20,C20,B-EVAL,C-EVAL" if authorized else "R60,G3"
+    expected_stage_order = (
+        "R60,G3,A-VAL-EVAL,R-VAL-EVAL,A-NQ-TEST-EVAL,R-NQ-TEST-EVAL,"
+        "A-MULTIHOP-EVAL,R-MULTIHOP-EVAL"
+    )
+    if authorized:
+        expected_stage_order += (
+            ",B20,C20,B-VAL-EVAL,C-VAL-EVAL,B-NQ-TEST-EVAL,C-NQ-TEST-EVAL,"
+            "B-MULTIHOP-EVAL,C-MULTIHOP-EVAL"
+        )
     if env["stage_order"] != expected_stage_order:
         fail("main stage order is inconsistent with branch authorization")
     pretrain_root, pretrain_entries = validate_bound_predecessor(
-        env["pretrain_g3_evidence"],
+        env["protocol_gate_evidence"],
         "qwen-native-gate",
         "runs/qwen-native-gate/attempts",
-        env["pretrain_g3_evidence_sha256"],
-        "qwen-native-gate-v1",
+        env["protocol_gate_evidence_sha256"],
+        "qwen-native-gate-v3",
     )
     if any(relative(pretrain_root / name) not in pretrain_entries
            for name in ("stage.txt", "go_no_go.json")):
-        fail("main predecessor omits its G3 decision evidence")
-    if (pretrain_root / "stage.txt").read_text(encoding="utf-8").strip() != "g3" or \
-            json.loads((pretrain_root / "go_no_go.json").read_bytes()).get("decision") != "GO":
-        fail("main pretraining predecessor is not a G3 GO")
+        fail("main predecessor omits its structural gate decision evidence")
+    protocol_decision = json.loads((pretrain_root / "go_no_go.json").read_bytes())
+    if ((pretrain_root / "stage.txt").read_text(encoding="utf-8").strip() != "g0_g1" or
+            protocol_decision.get("schema_version") != 3 or
+            protocol_decision.get("stage") != "g0_g1" or
+            protocol_decision.get("decision") != "GO"):
+        fail("main predecessor is not a structural G0/G1 v3 GO")
     smoke_root, smoke_entries = validate_bound_predecessor(
         env["smoke_evidence"],
         "qwen-native-training-smoke",
         "runs/qwen-native-training/attempts",
         env["smoke_evidence_sha256"],
-        "qwen-native-training-smoke-v1",
+        "qwen-native-training-smoke-v3",
     )
     if any(relative(smoke_root / name) not in smoke_entries
            for name in ("contract.env", "smoke-decision.json")):
@@ -984,10 +999,10 @@ elif contract == "qwen-native-training-main-v1":
         smoke_root / "contract.env",
         (
             "schema", "stage", "stage_order", "decision", "manual_review_required",
-            "pretrain_g3_evidence", "pretrain_g3_evidence_sha256",
+            "protocol_gate_evidence", "protocol_gate_evidence_sha256",
         ),
     )
-    if (smoke_env["schema"] != "qwen-native-training-smoke-v1" or
+    if (smoke_env["schema"] != "qwen-native-training-smoke-v3" or
             smoke_env["stage"] != "smoke" or smoke_env["stage_order"] != "S2" or
             smoke_env["decision"] != "GO" or smoke_env["manual_review_required"] != "true"):
         fail("main smoke predecessor contract mismatch")
@@ -1002,9 +1017,9 @@ elif contract == "qwen-native-training-main-v1":
     validate_smoke_decision_shape(smoke_decision)
     if smoke_decision.get("decision") != "GO":
         fail("main smoke predecessor decision is not GO")
-    if smoke_env["pretrain_g3_evidence"] != env["pretrain_g3_evidence"] or \
-            smoke_env["pretrain_g3_evidence_sha256"] != env["pretrain_g3_evidence_sha256"]:
-        fail("main predecessors do not share the same G3 evidence")
+    if smoke_env["protocol_gate_evidence"] != env["protocol_gate_evidence"] or \
+            smoke_env["protocol_gate_evidence_sha256"] != env["protocol_gate_evidence_sha256"]:
+        fail("main predecessors do not share the same structural gate evidence")
     decision_path = require_evidence(results / "branch-decision.json")
     decision = json.loads(decision_path.read_bytes())
     expected_decision_keys = {
@@ -1019,7 +1034,7 @@ elif contract == "qwen-native-training-main-v1":
         "cost_contrast_group_count": contrast_count,
         "cost_contrast_group_minimum": 8,
         "decision": "GO" if authorized else "NO-GO",
-        "schema": "qwen-native-post-r-gate-v1",
+        "schema": "qwen-native-post-r-gate-v3",
     }
     if decision != expected_decision:
         fail("branch-decision.json is inconsistent with contract.env")
@@ -1046,13 +1061,23 @@ elif contract == "qwen-native-training-main-v1":
     expected = [
         ("R", "reproduced", "train"),
         ("G3", "capability_gate", "eval"),
+        ("A-VAL-EVAL", "parent_val_eval", "eval"),
+        ("R-VAL-EVAL", "reproduced_val_eval", "eval"),
+        ("A-NQ-TEST-EVAL", "parent_nq_test_eval", "eval"),
+        ("R-NQ-TEST-EVAL", "reproduced_nq_test_eval", "eval"),
+        ("A-MULTIHOP-EVAL", "parent_multihop_eval", "eval"),
+        ("R-MULTIHOP-EVAL", "reproduced_multihop_eval", "eval"),
     ]
     if authorized:
         expected.extend((
             ("B", "control", "train"),
             ("C", "cost_aware_gated", "train"),
-            ("B-EVAL", "control_eval", "eval"),
-            ("C-EVAL", "cost_aware_gated_eval", "eval"),
+            ("B-VAL-EVAL", "control_val_eval", "eval"),
+            ("C-VAL-EVAL", "cost_aware_gated_val_eval", "eval"),
+            ("B-NQ-TEST-EVAL", "control_nq_test_eval", "eval"),
+            ("C-NQ-TEST-EVAL", "cost_aware_gated_nq_test_eval", "eval"),
+            ("B-MULTIHOP-EVAL", "control_multihop_eval", "eval"),
+            ("C-MULTIHOP-EVAL", "cost_aware_gated_multihop_eval", "eval"),
         ))
     if len(rows) != len(expected) or len(index) != len(expected):
         fail("main lineage/run-index row count does not match branch decision")
@@ -1075,7 +1100,7 @@ elif contract == "qwen-native-training-main-v1":
     g3_trace = g3_run / "traces/eval_predictions.jsonl"
     g3_trace_digest = sha256(g3_trace)
     catalog = require_evidence(
-        project / "data/search_mix_qwen35_native_v2/catalog.jsonl"
+        project / "data/search_mix_qwen35_native_v3/catalog.jsonl"
     )
     catalog_digest = sha256(catalog)
     summary_input = analysis_summary.get("input")
@@ -1083,7 +1108,7 @@ elif contract == "qwen-native-training-main-v1":
     summary_gate = analysis_summary.get("go_no_go")
     replay = analysis_summary.get("strict_em_replay")
     if (analysis_summary.get("schema") != "search-r1.grouped-probe-analysis" or
-            analysis_summary.get("schema_version") != 2 or
+            analysis_summary.get("schema_version") != 3 or
             not isinstance(summary_input, dict) or
             not isinstance(summary_contract, dict) or
             not isinstance(summary_gate, dict) or
@@ -1104,7 +1129,7 @@ elif contract == "qwen-native-training-main-v1":
         "expected_questions": 64,
         "trajectories_per_question": 5,
         "expected_trajectories": 320,
-        "max_searches": 4,
+        "max_action_budget": 4,
     }
     if any(summary_contract.get(key) != value
            for key, value in expected_probe_contract.items()):
@@ -1126,7 +1151,7 @@ elif contract == "qwen-native-training-main-v1":
             fail(f"R-G3 strict-EM replay count is invalid: {key}")
     expected_decision_binding = {
         "schema": "search-r1.grouped-probe-analysis",
-        "schema_version": 2,
+        "schema_version": 3,
         "stage": "g3",
         "decision": env["analysis_decision"],
         "trace_sha256": g3_trace_digest,
@@ -1138,124 +1163,224 @@ elif contract == "qwen-native-training-main-v1":
             analysis_decision.get("strict_em_replay") != replay or \
             summary_gate.get("decision") != env["analysis_decision"]:
         fail("R-G3 decision is not bound to its strict-EM summary")
+    for prefix in ("A", "R"):
+        if prefix == "A":
+            expected_checkpoint = r_row["parent_checkpoint"]
+            expected_checkpoint_digest = r_row["parent_checkpoint_digest"]
+        else:
+            expected_checkpoint = r_row["checkpoint"]
+            expected_checkpoint_digest = r_row["checkpoint_digest"]
+        for dataset in ("VAL", "NQ-TEST", "MULTIHOP"):
+            eval_stage = f"{prefix}-{dataset}-EVAL"
+            eval_row = by_stage[eval_stage]
+            if eval_row["checkpoint"] != expected_checkpoint or \
+                    eval_row["checkpoint_digest"] != expected_checkpoint_digest or \
+                    eval_row["parent_checkpoint"] != expected_checkpoint or \
+                    eval_row["parent_checkpoint_digest"] != expected_checkpoint_digest:
+                fail(f"{eval_stage} does not bind its fixed endpoint checkpoint")
+
     if authorized:
         for stage in ("B", "C"):
             row = by_stage[stage]
             if row["parent_checkpoint"] != r_row["checkpoint"] or \
                     row["parent_checkpoint_digest"] != r_row["checkpoint_digest"]:
                 fail(f"{stage} does not descend from the sealed R checkpoint")
-        for eval_stage, train_stage in (("B-EVAL", "B"), ("C-EVAL", "C")):
-            eval_row = by_stage[eval_stage]
-            train_row = by_stage[train_stage]
-            if eval_row["checkpoint"] != train_row["checkpoint"] or \
-                    eval_row["checkpoint_digest"] != train_row["checkpoint_digest"]:
-                fail(f"{eval_stage} does not evaluate the matching branch checkpoint")
-            if eval_row["parent_checkpoint"] != train_row["checkpoint"] or \
-                    eval_row["parent_checkpoint_digest"] != train_row["checkpoint_digest"]:
-                fail(f"{eval_stage} lineage does not bind its input checkpoint")
-        paired = results / "paired"
+        for prefix, train_stage in (("B", "B"), ("C", "C")):
+            for dataset in ("VAL", "NQ-TEST", "MULTIHOP"):
+                eval_stage = f"{prefix}-{dataset}-EVAL"
+                eval_row = by_stage[eval_stage]
+                train_row = by_stage[train_stage]
+                if eval_row["checkpoint"] != train_row["checkpoint"] or \
+                        eval_row["checkpoint_digest"] != train_row["checkpoint_digest"]:
+                    fail(f"{eval_stage} does not evaluate the matching branch checkpoint")
+                if eval_row["parent_checkpoint"] != train_row["checkpoint"] or \
+                        eval_row["parent_checkpoint_digest"] != train_row["checkpoint_digest"]:
+                    fail(f"{eval_stage} lineage does not bind its input checkpoint")
+
+    try:
+        data_contract = json.loads(data_manifest.read_bytes())
+    except json.JSONDecodeError as exc:
+        fail(f"invalid formal data manifest: {exc}")
+    if not isinstance(data_contract, dict):
+        fail("formal data manifest must be an object")
+    prompt_contract = data_contract.get("prompt_contract")
+    tokenizer_contract = data_contract.get("tokenizer")
+    if (data_contract.get("schema_version") != 4 or
+            not isinstance(prompt_contract, dict) or
+            prompt_contract.get("tool_protocol") != "qwen35_native" or
+            prompt_contract.get("prompt_version") !=
+            "qwen35-native-search-v3-original-aligned" or
+            not isinstance(tokenizer_contract, dict) or
+            tokenizer_contract.get("selection_observation_length") != 384 or
+            tokenizer_contract.get("rollout_observation_length") != 500):
+        fail("formal native-v3 data contract is invalid")
+    artifacts = data_contract.get("artifacts", {})
+    if not isinstance(artifacts, dict):
+        fail("formal data manifest artifacts must be an object")
+    eval_specs = (
+        ("val", "val", "val_128.parquet", 128, "VAL"),
+        ("nq_test", "nq_test_eval", "nq_test_128_native_v3.parquet", 128, "NQ-TEST"),
+        ("multihop", "multihop_eval", "multihop_eval_256_native_v3.parquet", 256, "MULTIHOP"),
+    )
+    endpoint_contract = {
+        "group_size": 1,
+        "rollouts_per_question": 1,
+        "do_sample": False,
+        "decoding": "greedy",
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "top_k": 0,
+        "min_p": 0.0,
+        "presence_penalty": 0.0,
+        "repetition_penalty": 1.0,
+        "seed": 42,
+        "group_slot": 0,
+        "preserve_artifact_order": True,
+        "pairing_key": "typed_sample_id",
+        "bootstrap": {
+            "method": "paired_percentile_bootstrap",
+            "confidence_level": 0.95,
+            "seed": 42,
+            "resamples": 10000,
+        },
+    }
+
+    def validate_paired_endpoint(
+            directory, artifact_key, filename, row_count, roles, stage_rows,
+            stage_names, checkpoint_rows, report_type, mode, baseline_role,
+            candidate_role):
+        paired = results / directory
         for name in (
             "summary.json", "summary.md", "paired_results.csv", "correct_questions.csv",
             "wrong_questions.csv", "search_transition.csv",
         ):
             require_evidence(paired / name)
-        paired_summary = load_json(paired / "summary.json", "paired summary")
-        expected_paired_keys = {
-            "schema_version", "expected_rows", "cost_lambda", "max_searches",
-            "inputs", "stages", "comparisons", "catalog", "formal_contract",
+        summary = load_json(paired / "summary.json", f"{directory} summary")
+        if (summary.get("schema_version") != 2 or
+                summary.get("report_type") != report_type or
+                summary.get("expected_rows") != row_count or
+                summary.get("cost_lambda") != 0.10 or
+                summary.get("max_searches") != 4):
+            fail(f"{directory} summary contract is invalid")
+        if set(summary.get("inputs", {})) != roles or \
+                set(summary.get("stages", {})) != roles or \
+                set(summary.get("comparisons", {})) != {candidate_role}:
+            fail(f"{directory} summary roles are invalid")
+        comparison = summary["comparisons"][candidate_role]
+        bootstrap = comparison.get("paired_bootstrap") \
+            if isinstance(comparison, dict) else None
+        if (not isinstance(comparison, dict) or
+                comparison.get("baseline_role") != baseline_role or
+                comparison.get("candidate_role") != candidate_role or
+                not isinstance(bootstrap, dict)):
+            fail(f"{directory} comparison identity is invalid")
+        expected_bootstrap = {
+            "method": "paired_percentile_bootstrap",
+            "confidence_level": 0.95,
+            "seed": 42,
+            "resamples": 10000,
+            "pairing_key": "typed_sample_id",
+            "baseline_role": baseline_role,
+            "candidate_role": candidate_role,
         }
-        if set(paired_summary) != expected_paired_keys or \
-                paired_summary["schema_version"] != 1 or \
-                paired_summary["expected_rows"] != 128 or \
-                paired_summary["cost_lambda"] != 0.10 or \
-                paired_summary["max_searches"] != 4:
-            fail("paired summary schema or fixed evaluation contract is invalid")
-        paired_inputs = paired_summary.get("inputs")
-        paired_stages = paired_summary.get("stages")
-        paired_comparisons = paired_summary.get("comparisons")
-        if not isinstance(paired_inputs, dict) or set(paired_inputs) != {
-                "control", "cost_aware_gated"} or \
-                not isinstance(paired_stages, dict) or set(paired_stages) != {
-                    "control", "cost_aware_gated"} or \
-                not isinstance(paired_comparisons, dict) or \
-                set(paired_comparisons) != {"cost_aware_gated"}:
-            fail("paired summary roles are invalid")
-        paired_runs = {
-            "control": (
-                Path(by_stage["B-EVAL"]["run_dir"]),
-                "qwen_native_b",
-            ),
-            "cost_aware_gated": (
-                Path(by_stage["C-EVAL"]["run_dir"]),
-                "qwen_native_c",
-            ),
+        metric_fields = {
+            "estimate_candidate_minus_baseline", "estimate_candidate_minus_control",
+            "ci_lower", "ci_upper", "valid_resamples",
         }
-        for role, (run_dir, expected_stage) in paired_runs.items():
-            trace = run_dir / "traces/eval_predictions.jsonl"
-            expected_input = {
-                "path": str(trace),
-                "sha256": sha256(trace),
-            }
-            if paired_inputs[role] != expected_input or \
-                    not isinstance(paired_stages[role], dict) or \
-                    paired_stages[role].get("stage") != expected_stage:
-                fail(f"paired summary input mismatch for {role}")
-        paired_catalog = paired_summary.get("catalog")
-        catalog_rows = catalog.read_text(encoding="utf-8").splitlines()
-        if not isinstance(paired_catalog, dict) or paired_catalog != {
-                "path": str(catalog),
-                "sha256": catalog_digest,
-                "row_count": len(catalog_rows),
-                "matched_rows": 128,
-                "replay_status": "passed",
-                "strict_em_scorer": "qa_em.em_check",
-        }:
-            fail("paired summary catalog replay binding is invalid")
-        try:
-            data_contract = json.loads(data_manifest.read_bytes())
-        except json.JSONDecodeError as exc:
-            fail(f"invalid formal data manifest: {exc}")
-        artifacts = data_contract.get("artifacts", {}) \
-            if isinstance(data_contract, dict) else {}
-        val_artifact = artifacts.get("val", {}) \
-            if isinstance(artifacts, dict) else {}
-        sample_ids = val_artifact.get("sample_ids") \
-            if isinstance(val_artifact, dict) else None
-        if not isinstance(sample_ids, list) or len(sample_ids) != 128:
-            fail("formal data manifest does not bind val_128 sample IDs")
+        metrics = bootstrap.get("metrics", {})
+        if set(bootstrap) != set(expected_bootstrap) | {"metrics"} or \
+                any(bootstrap.get(key) != value
+                    for key, value in expected_bootstrap.items()) or \
+                set(metrics) != {
+                    "em", "executed_searches", "correct_only_searches",
+                    "action_count", "trajectory_tokens", "invalid_actions",
+                    "clipping_rate",
+                } or any(
+                    not isinstance(value, dict) or set(value) != metric_fields
+                    for value in metrics.values()
+                ):
+            fail(f"{directory} bootstrap contract is invalid")
+        for role in roles:
+            trace = Path(stage_rows[role]["run_dir"]) / "traces/eval_predictions.jsonl"
+            if summary["inputs"][role] != {"path": str(trace), "sha256": sha256(trace)} or \
+                    summary["stages"][role].get("stage") != stage_names[role]:
+                fail(f"{directory} paired input mismatch for {role}")
+        artifact = artifacts.get(artifact_key, {})
+        sample_ids = artifact.get("sample_ids") if isinstance(artifact, dict) else None
+        artifact_path = project / "data/search_mix_qwen35_native_v3" / filename
+        if (not isinstance(sample_ids, list) or len(sample_ids) != row_count or
+                artifact.get("file") != filename or artifact.get("rows") != row_count or
+                artifact.get("sha256") != sha256(artifact_path)):
+            fail(f"formal manifest does not bind {artifact_key}")
         sample_ids_digest = hashlib.sha256(json.dumps(
             sample_ids, ensure_ascii=False, separators=(",", ":")
         ).encode("utf-8")).hexdigest()
-        expected_formal_contract = {
-            "mode": "qwen35_native_v2_b_c",
+        expected_formal = {
+            "mode": mode,
             "data_manifest": {
                 "path": str(data_manifest),
                 "sha256": data_manifest_digest,
-                "schema_version": 3,
-            },
-            "catalog": {
-                "path": str(catalog),
-                "sha256": catalog_digest,
-            },
-            "val": {
-                "file": "val_128.parquet",
-                "rows": 128,
-                "sample_ids_sha256": sample_ids_digest,
-                "sample_set_status": "exact",
+                "schema_version": 4,
+                "prompt_version": "qwen35-native-search-v3-original-aligned",
             },
             "endpoints": {
-                "control": {
-                    "stage": "qwen_native_b",
-                    "checkpoint_digest": by_stage["B"]["checkpoint_digest"],
-                },
-                "cost_aware_gated": {
-                    "stage": "qwen_native_c",
-                    "checkpoint_digest": by_stage["C"]["checkpoint_digest"],
-                },
+                role: {
+                    "stage": stage_names[role],
+                    "checkpoint_digest": checkpoint_rows[role]["checkpoint_digest"],
+                }
+                for role in roles
             },
+            "evaluation_artifact": {
+                "key": artifact_key,
+                "file": filename,
+                "rows": row_count,
+                "sha256": artifact["sha256"],
+                "sample_ids_sha256": sample_ids_digest,
+                "sample_set_status": "exact",
+                "sample_order_status": "exact",
+                "path": str(artifact_path),
+                "parquet_replay_status": "passed",
+            },
+            "endpoint_evaluation": endpoint_contract,
         }
-        if paired_summary.get("formal_contract") != expected_formal_contract:
-            fail("paired summary formal contract is invalid")
+        if summary.get("formal_contract") != expected_formal:
+            fail(f"{directory} formal contract is invalid")
+
+    for directory_key, artifact_key, filename, row_count, stage_key in eval_specs:
+        ar_roles = {"parent", "reproduced"}
+        ar_stage_rows = {
+            "parent": by_stage[f"A-{stage_key}-EVAL"],
+            "reproduced": by_stage[f"R-{stage_key}-EVAL"],
+        }
+        validate_paired_endpoint(
+            f"paired-ar-{directory_key}", artifact_key, filename, row_count,
+            ar_roles, ar_stage_rows,
+            {
+                "parent": f"qwen_native_a_{directory_key}",
+                "reproduced": f"qwen_native_r_{directory_key}",
+            },
+            {"parent": {"checkpoint_digest": r_row["parent_checkpoint_digest"]},
+             "reproduced": r_row},
+            "parent_reproduced_capability", "qwen35_native_v3_a_r_capability",
+            "parent", "reproduced",
+        )
+        if authorized:
+            bc_roles = {"control", "cost_aware_gated"}
+            bc_stage_rows = {
+                "control": by_stage[f"B-{stage_key}-EVAL"],
+                "cost_aware_gated": by_stage[f"C-{stage_key}-EVAL"],
+            }
+            validate_paired_endpoint(
+                f"paired-{directory_key}", artifact_key, filename, row_count,
+                bc_roles, bc_stage_rows,
+                {
+                    "control": f"qwen_native_b_{directory_key}",
+                    "cost_aware_gated": f"qwen_native_c_{directory_key}",
+                },
+                {"control": by_stage["B"], "cost_aware_gated": by_stage["C"]},
+                "control_cost_efficiency", "qwen35_native_v3_b_c_efficiency",
+                "control", "cost_aware_gated",
+            )
 else:
     fail(f"unsupported native training contract: {contract}")
 PY
@@ -1307,7 +1432,7 @@ validate_followup_success_artifacts() {
                 per_question.jsonl lineage.tsv run-index.tsv
             )
             ;;
-        qwen-native-gate-v1)
+        qwen-native-gate-v3)
             results_relative_parent='runs/qwen-native-gate/attempts'
             marker_relative_parent='manifests/qwen-native-gate'
             required=(
@@ -1315,7 +1440,7 @@ validate_followup_success_artifacts() {
                 per_question.jsonl lineage.tsv run-index.tsv stage.txt sampling.json
             )
             ;;
-        qwen-native-training-smoke-v1)
+        qwen-native-training-smoke-v3)
             results_relative_parent='runs/qwen-native-training/attempts'
             marker_relative_parent='manifests/qwen-native-training-smoke'
             required=(
@@ -1323,7 +1448,7 @@ validate_followup_success_artifacts() {
                 smoke-decision.json
             )
             ;;
-        qwen-native-training-main-v1)
+        qwen-native-training-main-v3)
             results_relative_parent='runs/qwen-native-training/attempts'
             marker_relative_parent='manifests/qwen-native-training-main'
             required=(
@@ -1370,7 +1495,7 @@ validate_followup_success_artifacts() {
         [[ ${seen["$results_relative_parent/$(basename -- "$attempt")/$file"]+present} ]] || return 1
     done
     case "$contract" in
-        qwen-native-training-smoke-v1|qwen-native-training-main-v1)
+        qwen-native-training-smoke-v3|qwen-native-training-main-v3)
             validate_qwen_native_training_evidence "$contract" "$project" "$results" \
                 "$(basename -- "$attempt")" "$expected_uid" || return 1
             ;;

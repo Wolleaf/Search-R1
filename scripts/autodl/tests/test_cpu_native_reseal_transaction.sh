@@ -6,6 +6,29 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$ROOT"' EXIT
 
+"$PYTHON_BIN" - "$AUTODL_DIR/02_cpu_prepare.sh" <<'PY'
+from pathlib import Path
+import sys
+
+text = Path(sys.argv[1]).read_text(encoding="utf-8")
+required = (
+    'search_mix_qwen35_native_v3',
+    'validate-native-evidence',
+    '--native-prompt-version qwen35-native-search-v3-original-aligned',
+    '--native-thinking-enabled',
+    '--max-action-budget 4',
+    '--selection-observation-length 384',
+    '--rollout-observation-length 500',
+)
+missing = [value for value in required if value not in text]
+if missing:
+    raise SystemExit(f"CPU native v3 contract is incomplete: {missing}")
+validation = text.index('validate-native-evidence')
+publication = text.index('"$train_python" "$CHECKOUT_DIR/scripts/autodl/handoff.py" create')
+if validation >= publication:
+    raise SystemExit("native evidence validation must precede handoff publication")
+PY
+
 MANIFEST_DIR="$ROOT/manifests"
 SEAL_DIR="$MANIFEST_DIR/cpu-seals/attempt-1"
 ATTEMPT_DIR="$ROOT/state/attempts/cpu/attempt-1"

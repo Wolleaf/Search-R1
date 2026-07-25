@@ -21,6 +21,7 @@ EVAL_METRICS = {
 UTILITY_LAMBDA = 0.10
 MAX_SEARCHES = 4
 UTILITY_TOLERANCE = 2e-6
+PARENT_DISPLAY_NAME = "A / Parent (post-trained)"
 
 
 def _metric_rows(log_path: Path, reject_duplicates: bool) -> list[tuple[int, dict[str, float]]]:
@@ -242,7 +243,7 @@ def summarize(args: argparse.Namespace) -> None:
         raise ValueError("control and cost-aware metadata disagree on seed")
 
     labels = {
-        "base": "A / Base",
+        "base": PARENT_DISPLAY_NAME,
         "reproduced": "R / Reproduced",
         "control": "B / Control",
         "cost_aware": "C / Cost-aware",

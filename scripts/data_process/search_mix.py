@@ -18,6 +18,8 @@ import unicodedata
 
 from search_r1.llm_agent.tool_protocol import (
     LEGACY_XML,
+    ParsedAction,
+    Qwen35Conversation,
     QWEN35_CHAT_TEMPLATE_SHA256,
     QWEN35_MODEL_REVISION,
     QWEN35_NATIVE,
@@ -39,9 +41,12 @@ CORPUS_REVISION = "69c1c00ffe7c5554c68d8548355cb22e46aabc51"
 CORPUS_SHA256 = "7abd929223399cd63c52b499f289bf4f9039be1e9f8c43e1cb3938305b2317db"
 SEED = 42
 TOPK = 3
-MAX_OBS_LENGTH = 384
+SELECTION_OBSERVATION_LENGTH = 384
+ROLLOUT_OBSERVATION_LENGTH = 500
+# Selection remains tied to the historical 384-token visibility filter.
+MAX_OBS_LENGTH = SELECTION_OBSERVATION_LENGTH
 SCHEMA_VERSION = 2
-MATERIALIZED_SCHEMA_VERSION = 3
+MATERIALIZED_SCHEMA_VERSION = 4
 SELECTION_POLICY = "retrieval-verified-search-mix-v1"
 LEGACY_PROMPT_VERSION = "search-r1-legacy-xml-v1"
 
@@ -107,9 +112,12 @@ OUTPUT_FILES = {
     "probe": "probe_multi_64.parquet",
 }
 NATIVE_PROBE_FILES = {
-    "probe_g0": ("probe_g0_8.parquet", 8, False),
-    "probe_forced": ("probe_forced_16.parquet", 16, True),
-    "probe_autonomous": ("probe_autonomous_32.parquet", 32, False),
+    "probe_g0": ("probe_g0_8.parquet", 8),
+    "probe_autonomous": ("probe_autonomous_16.parquet", 16),
+}
+NATIVE_EVAL_FILES = {
+    "nq_test_eval": "nq_test_128_native_v3.parquet",
+    "multihop_eval": "multihop_eval_256_native_v3.parquet",
 }
 BAD_ANSWERS = {"yes", "no", "true", "false", "unknown"}
 
@@ -298,13 +306,10 @@ def make_prefix(question: str) -> str:
 
 
 def make_prompt(question: object,
-                tool_protocol: str = LEGACY_XML,
-                force_search: bool = False) -> list[dict[str, str]]:
+                tool_protocol: str = LEGACY_XML) -> list[dict[str, str]]:
     protocol = normalize_tool_protocol(tool_protocol)
     if protocol == QWEN35_NATIVE:
-        return qwen35_messages(str(question), force_search=force_search)
-    if force_search:
-        raise ValueError("force_search is only supported by qwen35_native")
+        return qwen35_messages(str(question))
     return [{"role": "user", "content": make_prefix(str(question))}]
 
 
@@ -1269,13 +1274,11 @@ def select_catalog(
 
 
 def make_record(catalog: Mapping[str, Any],
-                tool_protocol: str = LEGACY_XML,
-                force_search: bool = False) -> dict[str, Any]:
+                tool_protocol: str = LEGACY_XML) -> dict[str, Any]:
     return {
         "data_source":
         catalog["data_source"],
-        "prompt": make_prompt(catalog["question"], tool_protocol,
-                              force_search),
+        "prompt": make_prompt(catalog["question"], tool_protocol),
         "ability":
         "fact-reasoning",
         "reward_model": {
@@ -1294,8 +1297,7 @@ def make_record(catalog: Mapping[str, Any],
 def _ordered_records(catalog: Sequence[Mapping[str, Any]],
                      split: str,
                      tool_protocol: str = LEGACY_XML,
-                     limit: Optional[int] = None,
-                     force_search: bool = False) -> list[dict[str, Any]]:
+                     limit: Optional[int] = None) -> list[dict[str, Any]]:
     if split == "probe":
         selected = [
             record for record in catalog
@@ -1312,9 +1314,7 @@ def _ordered_records(catalog: Sequence[Mapping[str, Any]],
         if type(limit) is not int or limit <= 0 or limit > len(selected):
             raise ValueError("output limit must select a non-empty prefix")
         selected = selected[:limit]
-    return [
-        make_record(record, tool_protocol, force_search) for record in selected
-    ]
+    return [make_record(record, tool_protocol) for record in selected]
 
 
 def _atomic_write_parquet(records: Sequence[Mapping[str, Any]],
@@ -1585,12 +1585,11 @@ def materialize(
             ],
         }
     if protocol == QWEN35_NATIVE:
-        for label, (filename, rows, force_search) in NATIVE_PROBE_FILES.items():
+        for label, (filename, rows) in NATIVE_PROBE_FILES.items():
             records = _ordered_records(catalog,
                                        "probe",
                                        protocol,
-                                       limit=rows,
-                                       force_search=force_search)
+                                       limit=rows)
             output_records[label] = records
             path = local_dir / filename
             _atomic_write_parquet(records, path)
@@ -1659,10 +1658,14 @@ def materialize(
             "corpus_sha256": CORPUS_SHA256,
             "ledger_sha256": sha256_file(ledger_path),
         },
-        "tokenizer": {
+        "tokenizer": ({
             "revision": MODEL_REVISION,
-            "max_obs_length": MAX_OBS_LENGTH
-        },
+            "selection_observation_length": SELECTION_OBSERVATION_LENGTH,
+            "rollout_observation_length": ROLLOUT_OBSERVATION_LENGTH,
+        } if protocol == QWEN35_NATIVE else {
+            "revision": MODEL_REVISION,
+            "max_obs_length": SELECTION_OBSERVATION_LENGTH,
+        }),
         "quotas": QUOTAS,
         "materialize_rejection_counts": dict(sorted(rejection_counts.items())),
         "overlap_checks": {
@@ -1677,6 +1680,7 @@ def materialize(
     if protocol == QWEN35_NATIVE:
         manifest["prompt_contract"] = prompt_contract(protocol)
         manifest["derived_from"] = native_lineage
+        manifest["evaluation_sources"] = {}
     manifest_path = local_dir / MANIFEST_FILE
     atomic_write(manifest_path, canonical_json_bytes(manifest))
     write_digest_sidecar(manifest_path)
@@ -1688,6 +1692,58 @@ def _copy_regular_file(source: Path, destination: Path) -> None:
         raise ValueError(f"Reusable artifact is missing or symlinked: {source}")
     destination.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(source, destination)
+
+
+def _native_eval_materializations(
+    eval_catalogs: Sequence[Path],
+    eval_parquets: Sequence[Path],
+) -> dict[str, dict[str, Any]]:
+    """Load sealed held-out rows and replace only their legacy prompts."""
+    if len(eval_catalogs) > 1 or len(eval_parquets) > 1:
+        raise ValueError("Native v3 accepts one NQ and one multihop eval source")
+    materializations: dict[str, dict[str, Any]] = {}
+    if eval_parquets:
+        from scripts.data_process import nq_small
+
+        source_file = Path(eval_parquets[0]).resolve()
+        source_manifest = source_file.parent / MANIFEST_FILE
+        records, sample_ids, verified_file = nq_small.load_native_test_records(
+            source_manifest, source_file)
+        materializations["nq_test_eval"] = {
+            "records": records,
+            "sample_ids": sample_ids,
+            "source_manifest": source_manifest.resolve(),
+            "source_file": verified_file,
+        }
+    if eval_catalogs:
+        from scripts.data_process import multihop_search_gate
+
+        source_catalog = Path(eval_catalogs[0]).resolve()
+        source_manifest = source_catalog.parent / MANIFEST_FILE
+        records, sample_ids, source_file = (
+            multihop_search_gate.load_native_eval_records(
+                source_manifest, source_catalog))
+        materializations["multihop_eval"] = {
+            "records": records,
+            "sample_ids": sample_ids,
+            "source_manifest": source_manifest.resolve(),
+            "source_file": source_file,
+        }
+    return materializations
+
+
+def _native_eval_source_contract(
+        materializations: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
+    result = {}
+    for label, values in sorted(materializations.items()):
+        source_manifest = Path(values["source_manifest"])
+        source_file = Path(values["source_file"])
+        result[label] = {
+            "source_manifest_sha256": sha256_file(source_manifest),
+            "source_artifact_file": source_file.name,
+            "source_artifact_sha256": sha256_file(source_file),
+        }
+    return result
 
 
 def materialize_native(
@@ -1718,6 +1774,7 @@ def materialize_native(
     source_catalog_path = source_dir / CATALOG_FILE
     source_catalog = source_catalog_path.read_bytes()
     catalog = read_canonical_jsonl(source_catalog_path)
+    native_evals = _native_eval_materializations(eval_catalogs, eval_parquets)
     derived_from = {
         "source_manifest_sha256": sha256_file(source_manifest),
         "source_catalog_sha256": sha256_file(source_catalog_path),
@@ -1771,12 +1828,11 @@ def materialize_native(
                     for record in records
                 ],
             }
-        for label, (filename, rows, force_search) in NATIVE_PROBE_FILES.items():
+        for label, (filename, rows) in NATIVE_PROBE_FILES.items():
             records = _ordered_records(catalog,
                                        "probe",
                                        QWEN35_NATIVE,
-                                       limit=rows,
-                                       force_search=force_search)
+                                       limit=rows)
             output_records[label] = records
             path = staging / filename
             _atomic_write_parquet(records, path)
@@ -1789,6 +1845,17 @@ def materialize_native(
                     for record in records
                 ],
             }
+        for label, values in native_evals.items():
+            filename = NATIVE_EVAL_FILES[label]
+            records = values["records"]
+            path = staging / filename
+            _atomic_write_parquet(records, path)
+            artifacts[label] = {
+                "file": filename,
+                "rows": len(records),
+                "sha256": sha256_file(path),
+                "sample_ids": list(values["sample_ids"]),
+            }
 
         manifest = {
             "schema_version": MATERIALIZED_SCHEMA_VERSION,
@@ -1796,7 +1863,12 @@ def materialize_native(
             "seed": source_payload["seed"],
             "sources": source_payload["sources"],
             "retrieval": source_payload["retrieval"],
-            "tokenizer": source_payload["tokenizer"],
+            "tokenizer": {
+                "revision": MODEL_REVISION,
+                "selection_observation_length":
+                SELECTION_OBSERVATION_LENGTH,
+                "rollout_observation_length": ROLLOUT_OBSERVATION_LENGTH,
+            },
             "quotas": source_payload["quotas"],
             "materialize_rejection_counts":
             source_payload["materialize_rejection_counts"],
@@ -1804,6 +1876,7 @@ def materialize_native(
             "artifacts": artifacts,
             "prompt_contract": prompt_contract(QWEN35_NATIVE),
             "derived_from": derived_from,
+            "evaluation_sources": _native_eval_source_contract(native_evals),
         }
         staged_manifest = staging / MANIFEST_FILE
         atomic_write(staged_manifest, canonical_json_bytes(manifest))
@@ -1881,7 +1954,7 @@ def _validate_native_prompt(tokenizer: Any,
     direct_ids = _flat_token_ids(
         tokenizer.apply_chat_template(canonical,
                                       tools=qwen35_tools(),
-                                      enable_thinking=False,
+                                      enable_thinking=True,
                                       add_generation_prompt=True,
                                       tokenize=True,
                                       return_dict=False))
@@ -1913,13 +1986,29 @@ def _manifest_tool_protocol(manifest: Mapping[str, Any]) -> str:
             "schema_version", "selection_policy", "seed", "sources",
             "retrieval", "tokenizer", "quotas",
             "materialize_rejection_counts", "overlap_checks", "artifacts",
-            "prompt_contract", "derived_from"
+            "prompt_contract", "derived_from", "evaluation_sources"
         }
         if set(manifest) != expected_keys:
             raise ValueError("Native manifest contract mismatch")
         if manifest.get("prompt_contract") != prompt_contract(QWEN35_NATIVE):
             raise ValueError("Native manifest prompt contract mismatch")
         _validate_derived_from(manifest.get("derived_from"))
+        evaluation_sources = manifest.get("evaluation_sources")
+        if (not isinstance(evaluation_sources, Mapping)
+                or not set(evaluation_sources).issubset(NATIVE_EVAL_FILES)):
+            raise ValueError("Native evaluation source contract mismatch")
+        for label, source in evaluation_sources.items():
+            if (not isinstance(source, Mapping) or set(source) != {
+                    "source_manifest_sha256", "source_artifact_file",
+                    "source_artifact_sha256"
+            } or not isinstance(source["source_artifact_file"], str)
+                    or Path(source["source_artifact_file"]).name !=
+                    source["source_artifact_file"]):
+                raise ValueError("Native evaluation source contract mismatch")
+            for key in ("source_manifest_sha256", "source_artifact_sha256"):
+                if (not isinstance(source[key], str)
+                        or re.fullmatch(r"[0-9a-f]{64}", source[key]) is None):
+                    raise ValueError("Native evaluation digest is invalid")
         return QWEN35_NATIVE
     raise ValueError("Manifest schema_version mismatch")
 
@@ -1966,10 +2055,15 @@ def _verify_manifest_artifacts(
     }
     if manifest.get("retrieval") != expected_retrieval:
         raise ValueError("Manifest retrieval contract mismatch")
-    if manifest.get("tokenizer") != {
-            "revision": MODEL_REVISION,
-            "max_obs_length": MAX_OBS_LENGTH,
-    }:
+    expected_tokenizer = ({
+        "revision": MODEL_REVISION,
+        "selection_observation_length": SELECTION_OBSERVATION_LENGTH,
+        "rollout_observation_length": ROLLOUT_OBSERVATION_LENGTH,
+    } if protocol == QWEN35_NATIVE else {
+        "revision": MODEL_REVISION,
+        "max_obs_length": SELECTION_OBSERVATION_LENGTH,
+    })
+    if manifest.get("tokenizer") != expected_tokenizer:
         raise ValueError("Manifest tokenizer contract mismatch")
     if manifest.get("overlap_checks") != {
             "passed": True,
@@ -1995,9 +2089,14 @@ def _verify_manifest_artifacts(
             label: values[0]
             for label, values in NATIVE_PROBE_FILES.items()
         })
+        expected_artifact_names.update({
+            label: NATIVE_EVAL_FILES[label]
+            for label in manifest["evaluation_sources"]
+        })
     parquet_labels = set(OUTPUT_FILES)
     if protocol == QWEN35_NATIVE:
         parquet_labels.update(NATIVE_PROBE_FILES)
+        parquet_labels.update(manifest["evaluation_sources"])
     if (not isinstance(artifacts, Mapping)
             or set(artifacts) != set(expected_artifact_names)):
         raise ValueError("Manifest artifacts must be an object")
@@ -2036,6 +2135,7 @@ def verify_manifest(
     artifacts = manifest["artifacts"]
     source_payload: Optional[Mapping[str, Any]] = None
     source_catalog_sha256: Optional[str] = None
+    native_evals: dict[str, dict[str, Any]] = {}
     if protocol == QWEN35_NATIVE:
         if source_manifest is None:
             raise ValueError(
@@ -2056,6 +2156,11 @@ def verify_manifest(
         }
         if manifest["derived_from"] != expected_lineage:
             raise ValueError("Native manifest lineage does not match source")
+        native_evals = _native_eval_materializations(eval_catalogs,
+                                                     eval_parquets)
+        if manifest["evaluation_sources"] != _native_eval_source_contract(
+                native_evals):
+            raise ValueError("Native evaluation lineage does not match source")
         if reselect_catalog:
             verify_replay_receipt(source_manifest)
     elif not reselect_catalog:
@@ -2151,15 +2256,14 @@ def verify_manifest(
     output_specs = [(split, filename, split, None, False)
                     for split, filename in OUTPUT_FILES.items()]
     if protocol == QWEN35_NATIVE:
-        output_specs.extend((label, filename, "probe", rows, force_search)
-                            for label, (filename, rows,
-                                        force_search) in NATIVE_PROBE_FILES.items())
-    for label, filename, split, limit, force_search in output_specs:
+        output_specs.extend((label, filename, "probe", rows, False)
+                            for label, (filename,
+                                        rows) in NATIVE_PROBE_FILES.items())
+    for label, filename, split, limit, _ in output_specs:
         expected_rows = _ordered_records(catalog,
                                          split,
                                          protocol,
-                                         limit=limit,
-                                         force_search=force_search)
+                                         limit=limit)
         actual_rows = _read_parquet(local_dir / filename)
         if actual_rows != expected_rows:
             raise ValueError(f"Parquet rows do not match catalog: {filename}")
@@ -2187,6 +2291,25 @@ def verify_manifest(
         }:
             raise ValueError(f"Parquet exposes unexpected fields: {filename}")
 
+    for label, values in native_evals.items():
+        filename = NATIVE_EVAL_FILES[label]
+        expected_rows = values["records"]
+        actual_rows = _read_parquet(local_dir / filename)
+        if actual_rows != expected_rows:
+            raise ValueError(
+                f"Native eval rows do not match sealed source: {filename}")
+        for row_index, row in enumerate(actual_rows):
+            try:
+                _validate_native_prompt(tokenizer, row["prompt"])
+            except (KeyError, TypeError, ValueError) as error:
+                raise ValueError(
+                    f"Native prompt validation failed for {filename} row "
+                    f"{row_index}: {error}") from error
+        artifact = artifacts[label]
+        if (artifact["rows"] != len(expected_rows)
+                or artifact["sample_ids"] != values["sample_ids"]):
+            raise ValueError(f"Native eval manifest metadata mismatch: {filename}")
+
     questions = [normalize_question(record["question"]) for record in catalog]
     if len(questions) != len(set(questions)):
         raise ValueError("Catalog contains duplicate normalized questions")
@@ -2194,6 +2317,96 @@ def verify_manifest(
     if selected_questions & set(excluded_list):
         raise ValueError("Catalog overlaps evaluation exclusions")
     return manifest
+
+
+def _native_search_response(query: str) -> tuple[str, ParsedAction]:
+    reasoning = "Inspect the retrieved evidence."
+    action_text = (
+        "<tool_call>\n<function=search>\n<parameter=query>\n"
+        f"{query}\n</parameter>\n</function>\n</tool_call>")
+    return (f"{reasoning}\n</think>\n\n{action_text}",
+            ParsedAction("search", query, prefix=reasoning))
+
+
+def validate_native_rollout_evidence(
+    manifest_path: Path,
+    source_manifest: Path,
+    model_dir: Path,
+    eval_catalogs: Sequence[Path] = (),
+    eval_parquets: Sequence[Path] = (),
+) -> dict[str, int]:
+    """Prove all 640 selected rows retain their evidence at 500 tokens."""
+    manifest = verify_manifest(manifest_path,
+                               model_dir,
+                               eval_catalogs,
+                               eval_parquets,
+                               expected_tool_protocol=QWEN35_NATIVE,
+                               source_manifest=source_manifest,
+                               reselect_catalog=False)
+    if manifest["tokenizer"][
+            "rollout_observation_length"] != ROLLOUT_OBSERVATION_LENGTH:
+        raise ValueError("Native rollout observation contract mismatch")
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(model_dir, local_files_only=True)
+    local_dir = Path(manifest_path).resolve().parent
+    catalog = read_canonical_jsonl(local_dir / CATALOG_FILE)
+    evidence_by_id = {
+        str(record["source_id"]): record
+        for record in read_canonical_jsonl(local_dir / EVIDENCE_FILE)
+    }
+    expected_rows = sum(sum(values.values()) for values in QUOTAS.values())
+    if len(catalog) != expected_rows or expected_rows != 640:
+        raise ValueError("Native evidence validation requires all 640 rows")
+
+    counts = Counter()
+    for selected in catalog:
+        sample_id = str(selected["source_id"])
+        evidence = evidence_by_id.get(sample_id)
+        if evidence is None:
+            raise ValueError(f"Missing sealed evidence for {sample_id}")
+        messages = qwen35_messages(str(selected["question"]))
+        rendered = render_qwen35_prompt(tokenizer, messages)
+        prompt_ids = _flat_token_ids(
+            tokenizer(rendered, add_special_tokens=False)["input_ids"])
+        conversation = Qwen35Conversation(tokenizer, messages, prompt_ids)
+
+        first_text, first_action = _native_search_response(
+            str(selected["first_query"]))
+        first = conversation.append_followup(
+            first_text, first_action, _observation_text(evidence["first_results"]),
+            ROLLOUT_OBSERVATION_LENGTH).visible_observation
+        answers = list(clean_answers(selected["golden_answers"]))
+        category = str(selected["category"])
+        if category == "single":
+            if not phrase_visible(answers, first):
+                raise ValueError(
+                    f"Native 500-token suffix hides NQ gold for {sample_id}")
+        else:
+            first_titles = selected["first_supporting_titles"]
+            second_titles = selected["second_supporting_titles"]
+            facts = selected["supporting_facts"]
+            if (len(first_titles) != 1 or len(second_titles) != 1
+                    or not phrase_visible(first_titles, first)
+                    or not _facts_visible(facts, first_titles[0], first)):
+                raise ValueError(
+                    f"Native 500-token suffix hides first-hop evidence for {sample_id}"
+                )
+            second_query = selected["second_oracle_query"]
+            second_text, second_action = _native_search_response(
+                str(second_query))
+            second = conversation.append_followup(
+                second_text, second_action,
+                _observation_text(evidence["second_results"]),
+                ROLLOUT_OBSERVATION_LENGTH).visible_observation
+            if (not phrase_visible(second_titles, second)
+                    or not _facts_visible(facts, second_titles[0], second)
+                    or not phrase_visible(answers, second)):
+                raise ValueError(
+                    f"Native 500-token suffix hides second-hop evidence for {sample_id}"
+                )
+        counts[category] += 1
+    return {"rows": len(catalog), **dict(sorted(counts.items()))}
 
 
 def verify_replay_receipt(manifest_path: Path) -> Mapping[str, Any]:
@@ -2404,6 +2617,18 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     replay.add_argument("--offsets-path", type=Path, required=True)
     verify_replay = subparsers.add_parser("verify-replay")
     verify_replay.add_argument("--manifest", type=Path, required=True)
+    visibility = subparsers.add_parser("validate-native-evidence")
+    visibility.add_argument("--manifest", type=Path, required=True)
+    visibility.add_argument("--source-manifest", type=Path, required=True)
+    visibility.add_argument("--model-dir", type=Path, required=True)
+    visibility.add_argument("--eval-catalog",
+                            type=Path,
+                            action="append",
+                            default=[])
+    visibility.add_argument("--eval-parquet",
+                            type=Path,
+                            action="append",
+                            default=[])
     return parser.parse_args(argv)
 
 
@@ -2440,9 +2665,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                                             args.corpus_path,
                                             args.offsets_path)
         print(f"Replayed selected retrieval evidence: {receipt}")
-    else:
+    elif args.command == "verify-replay":
         verify_replay_receipt(args.manifest)
         print(f"Verified retrieval replay receipt: {args.manifest.resolve()}")
+    else:
+        counts = validate_native_rollout_evidence(
+            args.manifest, args.source_manifest, args.model_dir,
+            args.eval_catalog, args.eval_parquet)
+        print("Validated native 500-token evidence visibility: " +
+              json.dumps(counts, sort_keys=True))
     return 0
 
 

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
 from dataclasses import dataclass
 import hashlib
 import json
@@ -16,6 +17,8 @@ import sys
 import tempfile
 from typing import Any, Mapping, Optional, Sequence
 
+from search_r1.llm_agent.tool_protocol import qwen35_messages
+
 DATASET_NAME = "RUC-NLPIR/FlashRAG_datasets"
 DATASET_REVISION = "bcafb8dd07d453be3cbeeeb3f78be1841bddf92c"
 CONFIGS = ("hotpotqa", "2wikimultihopqa")
@@ -25,6 +28,7 @@ PER_CONFIG_SIZE = 128
 SCHEMA_VERSION = 1
 SELECTION_POLICY = "seeded-shuffle-global-question-dedup-v1"
 EVAL_FILE = "eval_256.parquet"
+NATIVE_EVAL_FILE = "multihop_eval_256_native_v3.parquet"
 CATALOG_FILE = "catalog.jsonl"
 MANIFEST_FILE = "manifest.json"
 SOURCE_FILE_SPECS = {
@@ -821,6 +825,39 @@ def verify_manifest(manifest_path: Path) -> Mapping[str, Any]:
     for row, catalog in zip(eval_records, catalog_records):
         _verify_eval_row(row, catalog)
     return manifest
+
+
+def load_native_eval_records(
+        manifest_path: Path,
+        catalog_path: Optional[Path] = None,
+) -> tuple[list[dict[str, Any]], list[str], Path]:
+    """Verify the sealed eval set and replace only its legacy prompt."""
+    manifest = verify_manifest(manifest_path)
+    manifest_path = Path(manifest_path).resolve()
+    expected_catalog = manifest_path.parent / manifest["artifacts"][
+        "catalog_jsonl"]["file"]
+    if catalog_path is not None and Path(catalog_path).resolve() != expected_catalog:
+        raise ValueError("Multihop catalog does not match its sealed manifest")
+    catalog = [
+        _validate_catalog_record(record)
+        for record in _read_catalog(expected_catalog)
+    ]
+    eval_path = manifest_path.parent / manifest["artifacts"]["eval_parquet"][
+        "file"]
+    rows = read_eval_parquet(eval_path)
+    if len(rows) != len(catalog):
+        raise ValueError("Multihop eval/catalog row count mismatch")
+
+    native_rows = []
+    for row, record in zip(rows, catalog):
+        _verify_eval_row(row, record)
+        native = deepcopy(dict(row))
+        native["prompt"] = qwen35_messages(record["question"])
+        native_rows.append(native)
+    sample_ids = [str(record["sample_id"]) for record in catalog]
+    if sample_ids != manifest["sample_ids"]:
+        raise ValueError("Multihop eval order does not match sealed sample IDs")
+    return native_rows, sample_ids, eval_path
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:

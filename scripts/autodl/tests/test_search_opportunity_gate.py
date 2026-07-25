@@ -301,6 +301,7 @@ class SearchOpportunityGateTest(unittest.TestCase):
             expected_rows=len(catalog),
             run_id="search-opportunity-test",
             stage="search_opportunity",
+            schema_version=1,
         )
         try:
             for position, record in enumerate(catalog):

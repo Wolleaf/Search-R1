@@ -5,7 +5,8 @@ import numpy as np
 import pytest
 import torch
 
-from search_r1.llm_agent.generation import LLMGenerationManager
+from search_r1.llm_agent.generation import (
+    LLMGenerationManager, slice_first_complete_native_action)
 from search_r1.llm_agent.tool_protocol import (QWEN35_RETRY_PROMPT,
                                                qwen35_messages, qwen35_tools)
 from verl import DataProto
@@ -75,19 +76,22 @@ class _CharTokenizer:
 
     def apply_chat_template(self, messages, tools, enable_thinking,
                             add_generation_prompt, tokenize):
-        assert enable_thinking is False
+        assert enable_thinking is True
         assert tokenize is False
         rendered = "<tools>" + json.dumps(
             tools, sort_keys=True, separators=(",", ":")) + "</tools>"
-        assistant_prefix = "<assistant><think></think>"
+        assistant_prefix = "<assistant><think>\n"
         for message in messages:
             if message["role"] == "system":
                 rendered += f'<system>{message["content"]}</system>'
             elif message["role"] == "user":
                 rendered += f'<user>{message["content"]}</user>'
             elif message["role"] == "assistant":
-                rendered += assistant_prefix + message[
-                    "content"] + "</assistant>"
+                reasoning = str(message.get("reasoning_content", ""))
+                rendered += "<assistant>"
+                if reasoning:
+                    rendered += f"<think>\n{reasoning}\n</think>\n\n"
+                rendered += message["content"] + "</assistant>"
             elif message["role"] == "tool":
                 rendered += f'<tool>{message["content"]}</tool>'
             else:
@@ -121,11 +125,11 @@ class _TrimNoncanonicalCharTokenizer(_CharTokenizer):
 
     def apply_chat_template(self, messages, tools, enable_thinking,
                             add_generation_prompt, tokenize):
-        assert enable_thinking is False
+        assert enable_thinking is True
         assert tokenize is False
         rendered = "<tools>" + json.dumps(
             tools, sort_keys=True, separators=(",", ":")) + "</tools>"
-        assistant_prefix = "<assistant><think></think>"
+        assistant_prefix = "<assistant><think>\n"
         for message in messages:
             content = message["content"].strip()
             if message["role"] == "system":
@@ -133,7 +137,11 @@ class _TrimNoncanonicalCharTokenizer(_CharTokenizer):
             elif message["role"] == "user":
                 rendered += f"<user>{content}</user>"
             elif message["role"] == "assistant":
-                rendered += assistant_prefix + content + "</assistant>"
+                reasoning = str(message.get("reasoning_content", "")).strip()
+                rendered += "<assistant>"
+                if reasoning:
+                    rendered += f"<think>\n{reasoning}\n</think>\n\n"
+                rendered += content + "</assistant>"
             elif message["role"] == "tool":
                 rendered += f"<tool>{content}</tool>"
             else:
@@ -165,7 +173,7 @@ def _generation_batch(tokenizer, raw_messages):
         tokenizer.apply_chat_template(
             messages,
             tools=qwen35_tools(),
-            enable_thinking=False,
+            enable_thinking=True,
             add_generation_prompt=True,
             tokenize=False,
         ) for messages in raw_messages
@@ -259,7 +267,7 @@ def _native_manager(tokenizer, worker, **config_overrides):
     return manager
 
 
-def test_native_postprocess_preserves_sampled_tokens_without_action_rewrite():
+def test_native_postprocess_slices_original_tokens_at_first_action_close():
     tokenizer = _CharTokenizer()
     manager = LLMGenerationManager(
         tokenizer=tokenizer,
@@ -271,11 +279,32 @@ def test_native_postprocess_preserves_sampled_tokens_without_action_rewrite():
 
     response_ids, response_text = manager._postprocess_responses(generated)
 
-    expected = (tokenizer(raw, add_special_tokens=False)["input_ids"] +
-                [tokenizer.eos_token_id])
+    action = raw.split("</tool_call>", 1)[0] + "</tool_call>"
+    expected = tokenizer(action, add_special_tokens=False)["input_ids"]
     assert response_ids[0, :len(expected)].tolist() == expected
     assert response_ids.shape[1] == len(expected)
-    assert response_text == [raw]
+    assert response_text == [action]
+    audit = manager._last_native_action_slices[0]
+    assert audit.action_token_ids == tuple(expected)
+    assert audit.raw_text == raw
+    assert audit.tail_dropped is True
+
+
+def test_native_slice_executes_only_first_complete_action_and_keeps_raw_tail():
+    tokenizer = _CharTokenizer()
+    first = ("<tool_call><function=search><parameter=query>capital of France"
+             "</parameter></function></tool_call>")
+    raw = first + "<answer>Paris</answer>ignored"
+    sampled = (tokenizer(raw, add_special_tokens=False)["input_ids"] +
+               [tokenizer.eos_token_id])
+
+    result = slice_first_complete_native_action(tokenizer, sampled)
+
+    assert result.action_text == first
+    assert result.raw_text == raw
+    assert list(result.action_token_ids) == sampled[:len(result.action_token_ids)]
+    assert result.boundary == "tool_call"
+    assert result.tail_dropped is True
 
 
 def test_native_loop_keeps_tokens_masks_actions_and_reorder_alignment():
@@ -286,7 +315,7 @@ def test_native_loop_keeps_tokens_masks_actions_and_reorder_alignment():
     searched_answer = "Evidence is sufficient.\n<answer>Paris</answer>"
     worker = _ScriptedWorker(tokenizer, [[search, direct_answer],
                                          [searched_answer]])
-    manager = _native_manager(tokenizer, worker)
+    manager = _native_manager(tokenizer, worker, max_turns=2)
     raw_messages = [
         qwen35_messages("Capital of France?"),
         qwen35_messages("Capital of Gaul?")
@@ -299,11 +328,9 @@ def test_native_loop_keeps_tokens_masks_actions_and_reorder_alignment():
         raw_messages=raw_messages,
     )
 
-    search_ids = (tokenizer(search, add_special_tokens=False)["input_ids"] +
-                  [tokenizer.eos_token_id])
-    answer_ids = (tokenizer(searched_answer,
-                            add_special_tokens=False)["input_ids"] +
-                  [tokenizer.eos_token_id])
+    search_ids = tokenizer(search, add_special_tokens=False)["input_ids"]
+    answer_ids = tokenizer(
+        searched_answer, add_special_tokens=False)["input_ids"]
     second_prompt = worker.prompts[1][0].tolist()
     suffix_ids = second_prompt[len(prompt_rows[0]) + len(search_ids):]
     assert second_prompt == prompt_rows[0] + search_ids + suffix_ids
@@ -321,6 +348,7 @@ def test_native_loop_keeps_tokens_masks_actions_and_reorder_alignment():
     assert response_loss_mask[len(expected_response) - 1].item() == 1
 
     assert output.batch["executed_search_count"].tolist() == [1, 0]
+    assert output.batch["action_count"].tolist() == [2, 1]
     assert output.non_tensor_batch["final_answer"].tolist() == [
         "Paris", "Lyon"
     ]
@@ -344,6 +372,11 @@ def test_native_loop_keeps_tokens_masks_actions_and_reorder_alignment():
     ] == ["search", "answer"]
     assert output.non_tensor_batch["retrieval_events"][0][0][
         "visible_observation"] == "Doc 1 says Paris is the capital of France."
+    first_event = output.non_tensor_batch["generation_events"][0][0]
+    assert first_event["action_token_ids"] == search_ids
+    assert first_event["raw_token_ids"] == search_ids + [tokenizer.eos_token_id]
+    assert first_event["raw_text"] == search
+    assert first_event["tail_dropped"] is True
 
     output.reorder(torch.tensor([1, 0]))
     assert output.non_tensor_batch["final_answer"].tolist() == [
@@ -362,18 +395,24 @@ def test_native_loop_preserves_trimmed_noncanonical_sample_and_mask(
               "capital of France</parameter></function></tool_call>  ")
     before, marker, after = search.partition("France")
     assert marker
-    search_ids = (
+    raw_search_ids = (
         tokenizer(before, add_special_tokens=False)["input_ids"] +
         [tokenizer.noncanonical_token_id] +
         tokenizer(after, add_special_tokens=False)["input_ids"])
     if sampled_eos:
-        search_ids.append(tokenizer.eos_token_id)
+        raw_search_ids.append(tokenizer.eos_token_id)
+    action_after = after.split("</tool_call>", 1)[0] + "</tool_call>"
+    search_ids = (
+        tokenizer(before, add_special_tokens=False)["input_ids"] +
+        [tokenizer.noncanonical_token_id] +
+        tokenizer(action_after, add_special_tokens=False)["input_ids"])
     tagged_answer = "<answer>Paris</answer>"
-    answer_ids = (tokenizer(tagged_answer,
-                            add_special_tokens=False)["input_ids"] +
-                  [tokenizer.eos_token_id])
-    worker = _RawScriptedWorker(tokenizer, [[search_ids], [answer_ids]])
-    manager = _native_manager(tokenizer, worker)
+    answer_ids = tokenizer(
+        tagged_answer, add_special_tokens=False)["input_ids"]
+    raw_answer_ids = answer_ids + [tokenizer.eos_token_id]
+    worker = _RawScriptedWorker(tokenizer,
+                                [[raw_search_ids], [raw_answer_ids]])
+    manager = _native_manager(tokenizer, worker, max_turns=2)
     raw_messages = [qwen35_messages("Capital of France?")]
     gen_batch, prompt_rows = _generation_batch(tokenizer, raw_messages)
 
@@ -395,10 +434,7 @@ def test_native_loop_preserves_trimmed_noncanonical_sample_and_mask(
                      len(suffix_ids)].tolist() == [0] * len(suffix_ids)
     assert loss_mask[len(search_ids) + len(suffix_ids):len(expected)].tolist(
     ) == [1] * len(answer_ids)
-    if sampled_eos:
-        assert suffix_ids[0] != tokenizer.eos_token_id
-    else:
-        assert suffix_ids[0] == tokenizer.eos_token_id
+    assert suffix_ids[0] == tokenizer.eos_token_id
 
 
 def test_native_invalid_action_uses_native_retry_and_preserves_mask():
@@ -407,7 +443,7 @@ def test_native_invalid_action_uses_native_retry_and_preserves_mask():
                "trailing</function></tool_call>")
     worker = _ScriptedWorker(tokenizer,
                              [[invalid], ["<answer>Paris</answer>"]])
-    manager = _native_manager(tokenizer, worker)
+    manager = _native_manager(tokenizer, worker, max_turns=2)
     raw_messages = [qwen35_messages("Capital of France?")]
     gen_batch, prompt_rows = _generation_batch(tokenizer, raw_messages)
 
@@ -417,12 +453,11 @@ def test_native_invalid_action_uses_native_retry_and_preserves_mask():
         raw_messages=raw_messages,
     )
 
-    invalid_ids = (tokenizer(invalid, add_special_tokens=False)["input_ids"] +
-                   [tokenizer.eos_token_id])
+    invalid_ids = tokenizer(invalid, add_special_tokens=False)["input_ids"]
     retry_prompt = tokenizer.decode(worker.prompts[1][0])
     assert QWEN35_RETRY_PROMPT in retry_prompt
-    assert "opening tag <answer>" in retry_prompt
-    assert "closing tag </answer>" in retry_prompt
+    assert QWEN35_RETRY_PROMPT == "My action is not correct. Let me rethink."
+    assert "Call search" not in retry_prompt
     assert "<information>" not in retry_prompt
     events = output.non_tensor_batch["generation_events"][0]
     assert events[0]["action"] is None
@@ -451,9 +486,9 @@ def test_native_conversations_copy_raw_messages_and_require_alignment():
 
     conversations = manager._prepare_native_conversations(
         gen_batch, raw_messages)
-    raw_messages[0][1]["content"] = "Question: Mutated?\n"
+    raw_messages[0][0]["content"] = "Question: Mutated?\n"
 
-    assert conversations[0].messages[1]["content"] == "Question: Original?\n"
+    assert "Question: Original?\n" in conversations[0].messages[0]["content"]
     try:
         manager._prepare_native_conversations(gen_batch, [])
     except ValueError as error:
@@ -472,9 +507,35 @@ def test_native_conversations_copy_raw_messages_and_require_alignment():
         raise AssertionError("oversized native prompts must fail")
 
 
+def test_native_loop_uses_four_total_actions_without_free_terminal_action():
+    tokenizer = _CharTokenizer()
+    search = ("<tool_call><function=search><parameter=query>"
+              "capital of France</parameter></function></tool_call>")
+    worker = _ScriptedWorker(tokenizer, [[[search][0]] for _ in range(5)])
+    manager = _native_manager(
+        tokenizer,
+        worker,
+        max_turns=4,
+        max_prompt_length=4096,
+    )
+    raw_messages = [qwen35_messages("Capital of France?")]
+    gen_batch, _ = _generation_batch(tokenizer, raw_messages)
+
+    output = manager.run_llm_loop(
+        gen_batch,
+        gen_batch.batch["input_ids"].clone(),
+        raw_messages=raw_messages,
+    )
+
+    assert output.batch["action_count"].tolist() == [4]
+    assert output.batch["executed_search_count"].tolist() == [4]
+    assert len(output.non_tensor_batch["generation_events"][0]) == 4
+    assert len(worker.turns) == 1
+
+
 def test_native_capacity_counts_only_the_policy_right_side():
     tokenizer = _CharTokenizer()
-    exact_capacity = 4 * (500 + 384) + 500
+    exact_capacity = 4 * (500 + 500)
 
     LLMGenerationManager(
         tokenizer=tokenizer,
@@ -484,12 +545,12 @@ def test_native_capacity_counts_only_the_policy_right_side():
             max_start_length=10_000,
             max_prompt_length=exact_capacity,
             max_response_length=500,
-            max_obs_length=384,
+            max_obs_length=500,
         ),
     )
 
     with pytest.raises(ValueError, match=(
-            "right-side capacity requires 4036 tokens.*4035")):
+            "right-side capacity requires 4000 tokens.*3999")):
         LLMGenerationManager(
             tokenizer=tokenizer,
             actor_rollout_wg=None,
@@ -498,7 +559,7 @@ def test_native_capacity_counts_only_the_policy_right_side():
                 max_start_length=1,
                 max_prompt_length=exact_capacity - 1,
                 max_response_length=500,
-                max_obs_length=384,
+                max_obs_length=500,
             ),
         )
 
@@ -586,7 +647,7 @@ def test_legacy_rolling_context_still_uses_prompt_length_cap():
 def test_native_rolling_context_keeps_full_validated_capacity():
     tokenizer = _CharTokenizer()
     max_start_length = 1024
-    max_prompt_length = 4 * (500 + 384) + 500
+    max_prompt_length = 4 * (500 + 500)
     manager = LLMGenerationManager(
         tokenizer=tokenizer,
         actor_rollout_wg=None,
@@ -595,7 +656,7 @@ def test_native_rolling_context_keeps_full_validated_capacity():
             max_start_length=max_start_length,
             max_prompt_length=max_prompt_length,
             max_response_length=500,
-            max_obs_length=384,
+            max_obs_length=500,
         ),
     )
     initial = torch.arange(2, max_start_length + 2).unsqueeze(0)
@@ -608,18 +669,10 @@ def test_native_rolling_context_keeps_full_validated_capacity():
 
     for turn in range(4):
         response = torch.full((1, 500), 10 + turn * 2)
-        observation = torch.full((1, 384), 11 + turn * 2)
+        observation = torch.full((1, 500), 11 + turn * 2)
         rollings = manager._update_rolling_state(
             rollings, response, observation)
         expected = torch.cat((expected, response, observation), dim=1)
-
-    final_response = torch.full((1, 500), 30)
-    rollings = manager._update_rolling_state(
-        rollings,
-        final_response,
-        torch.empty((1, 0), dtype=torch.long),
-    )
-    expected = torch.cat((expected, final_response), dim=1)
 
     assert expected.shape[1] == max_start_length + max_prompt_length
     assert torch.equal(rollings.batch["input_ids"], expected)

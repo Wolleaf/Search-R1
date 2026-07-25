@@ -1,0 +1,3 @@
+stage	mode	run_dir	trace
+g0_g1	eval	/root/autodl-tmp/search-r1/runs/eval/qwen_native_g1/attempts/20260725T035137Z-1685-10976	/root/autodl-tmp/search-r1/runs/eval/qwen_native_g1/attempts/20260725T035137Z-1685-10976/traces/eval_predictions.jsonl
+g0	protocol_probe	/root/autodl-tmp/search-r1/runs/eval/qwen_native_g0/attempts/20260725T034515Z-1685-14070	/root/autodl-tmp/search-r1/runs/eval/qwen_native_g0/attempts/20260725T034515Z-1685-14070/output/records.jsonl

@@ -11,7 +11,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Set
 
 TRACE_SCHEMA = "search-r1.trajectory"
-TRACE_SCHEMA_VERSION = 1
+TRACE_SCHEMA_VERSION = 3
+SUPPORTED_TRACE_SCHEMA_VERSIONS = (1, 2, TRACE_SCHEMA_VERSION)
+PUBLISHABLE_TRACE_SCHEMA_VERSIONS = (1, TRACE_SCHEMA_VERSION)
 MANIFEST_SCHEMA = "search-r1.trajectory-manifest"
 MANIFEST_SCHEMA_VERSION = 1
 
@@ -44,6 +46,15 @@ _COMMON_FIELDS = {
     "response_clipped",
     "turns_used",
     "invalid_action_count",
+}
+_V3_FIELDS = {
+    "raw_generations",
+    "max_action_budget",
+    "action_count",
+    "policy_token_count",
+    "observation_token_count",
+    "observation_policy_token_count",
+    "info_mask_consistent",
 }
 _TRAIN_FIELDS = {
     "step",
@@ -232,6 +243,72 @@ def _validate_turn(turn: Any, index: int) -> None:
         raise ValueError(f"turns[{index}] recognized action must be valid")
 
 
+def _validate_raw_generation(generation: Any, index: int) -> None:
+    if not isinstance(generation, Mapping):
+        raise ValueError(f"raw_generations[{index}] must be an object")
+    required = {
+        "turn",
+        "raw_text",
+        "raw_token_ids",
+        "raw_token_count",
+        "action_text",
+        "action_token_ids",
+        "action_token_count",
+        "boundary",
+        "tail_dropped",
+        "raw_clipped",
+    }
+    missing = required - set(generation)
+    if missing:
+        raise ValueError(
+            f"raw_generations[{index}] is missing fields: {sorted(missing)}")
+    if generation["turn"] != index:
+        raise ValueError(f"raw_generations[{index}].turn must equal {index}")
+    for name in ("raw_text", "action_text"):
+        _require_string(generation[name],
+                        f"raw_generations[{index}].{name}",
+                        allow_empty=True)
+    for name in ("raw_token_ids", "action_token_ids"):
+        values = generation[name]
+        if (not isinstance(values, list) or any(
+                isinstance(value, bool) or not isinstance(value, int)
+                or value < 0 for value in values)):
+            raise ValueError(
+                f"raw_generations[{index}].{name} must contain token IDs")
+    _require_int(generation["raw_token_count"],
+                 f"raw_generations[{index}].raw_token_count")
+    _require_int(generation["action_token_count"],
+                 f"raw_generations[{index}].action_token_count")
+    raw_ids = generation["raw_token_ids"]
+    action_ids = generation["action_token_ids"]
+    if generation["raw_token_count"] != len(raw_ids):
+        raise ValueError(
+            f"raw_generations[{index}].raw_token_count does not match IDs")
+    if generation["action_token_count"] != len(action_ids):
+        raise ValueError(
+            f"raw_generations[{index}].action_token_count does not match IDs")
+    if raw_ids[:len(action_ids)] != action_ids:
+        raise ValueError(
+            f"raw_generations[{index}] action IDs are not a raw-token prefix")
+    if generation["boundary"] not in ("tool_call", "answer", "eos", "length"):
+        raise ValueError(f"raw_generations[{index}].boundary is invalid")
+    for name in ("tail_dropped", "raw_clipped"):
+        if not isinstance(generation[name], bool):
+            raise ValueError(
+                f"raw_generations[{index}].{name} must be boolean")
+    if generation["tail_dropped"] != (raw_ids != action_ids):
+        raise ValueError(
+            f"raw_generations[{index}].tail_dropped does not match IDs")
+    if (generation["boundary"] == "tool_call"
+            and not generation["action_text"].rstrip().endswith("</tool_call>")):
+        raise ValueError(
+            f"raw_generations[{index}] tool_call boundary is inconsistent")
+    if (generation["boundary"] == "answer"
+            and not generation["action_text"].rstrip().endswith("</answer>")):
+        raise ValueError(
+            f"raw_generations[{index}] answer boundary is inconsistent")
+
+
 def _stable_record_id(record: Mapping[str, Any]) -> str:
     identity: Dict[str, Any] = {
         "record_type": record["record_type"],
@@ -287,15 +364,21 @@ def validate_trace_record(record: Mapping[str, Any],
             f"record_type must be {expected_record_type!r}, got {record_type!r}"
         )
 
+    schema_version = record.get("schema_version")
+    if (isinstance(schema_version, bool) or not isinstance(schema_version, int)
+            or schema_version not in SUPPORTED_TRACE_SCHEMA_VERSIONS):
+        raise ValueError("trace record schema_version mismatch")
     required = _COMMON_FIELDS | (_TRAIN_FIELDS
                                  if record_type == "train" else _EVAL_FIELDS)
+    if schema_version == TRACE_SCHEMA_VERSION:
+        required |= _V3_FIELDS
     missing = required - set(record)
     if missing:
         raise ValueError(f"trace record is missing fields: {sorted(missing)}")
     if record["schema"] != TRACE_SCHEMA:
         raise ValueError("trace record schema mismatch")
-    if record["schema_version"] != TRACE_SCHEMA_VERSION:
-        raise ValueError("trace record schema_version mismatch")
+    if schema_version == TRACE_SCHEMA_VERSION and "max_searches" in record:
+        raise ValueError("v3 trace records must not contain max_searches")
 
     for name in ("record_id", "run_id", "stage", "sample_id", "question"):
         _require_string(record[name], name)
@@ -339,6 +422,32 @@ def validate_trace_record(record: Mapping[str, Any],
     if not isinstance(record["response_clipped"], bool):
         raise ValueError("response_clipped must be boolean")
 
+    if schema_version == TRACE_SCHEMA_VERSION:
+        _require_int(record["max_action_budget"],
+                     "max_action_budget",
+                     minimum=1)
+        _require_int(record["action_count"], "action_count")
+        if record["action_count"] > record["max_action_budget"]:
+            raise ValueError("action_count exceeds max_action_budget")
+        if record["executed_search_count"] > record["action_count"]:
+            raise ValueError("executed_search_count exceeds action_count")
+        if not isinstance(record["raw_generations"], list):
+            raise ValueError("raw_generations must be a list")
+        for index, generation in enumerate(record["raw_generations"]):
+            _validate_raw_generation(generation, index)
+        if record["action_count"] != len(record["raw_generations"]):
+            raise ValueError("action_count must equal len(raw_generations)")
+        if ("generation_events" in record
+                and len(record["generation_events"]) != record["action_count"]):
+            raise ValueError("action_count must equal len(generation_events)")
+        for name in ("policy_token_count", "observation_token_count",
+                     "observation_policy_token_count"):
+            _require_int(record[name], name)
+        if record["observation_policy_token_count"] != 0:
+            raise ValueError("observation_policy_token_count must be zero")
+        if record["info_mask_consistent"] is not True:
+            raise ValueError("info_mask_consistent must be true")
+
     if record_type == "train":
         _require_int(record["step"], "step", minimum=1)
         _require_string(record["group_uid"], "group_uid")
@@ -362,8 +471,8 @@ def _canonical_json(value: Mapping[str, Any]) -> bytes:
 
 
 def _inspect_jsonl(path: Path, expected_rows: int, record_type: Optional[str],
-                   run_id: Optional[str],
-                   stage: Optional[str]) -> Dict[str, Any]:
+                   run_id: Optional[str], stage: Optional[str],
+                   schema_version: Optional[int] = None) -> Dict[str, Any]:
     _require_int(expected_rows, "expected_rows", minimum=1)
     digest = hashlib.sha256()
     rows = 0
@@ -380,6 +489,10 @@ def _inspect_jsonl(path: Path, expected_rows: int, record_type: Optional[str],
                 raise ValueError(
                     f"invalid JSON on trace line {line_number}") from error
             validate_trace_record(record, expected_record_type=record_type)
+            if (schema_version is not None
+                    and record["schema_version"] != schema_version):
+                raise ValueError(
+                    f"trace line {line_number} has a different schema_version")
             if line != _canonical_json(record):
                 raise ValueError(
                     f"trace line {line_number} is not canonical JSON")
@@ -408,10 +521,11 @@ def inspect_trace_jsonl(path: Path,
                         expected_rows: int,
                         record_type: Optional[str] = None,
                         run_id: Optional[str] = None,
-                        stage: Optional[str] = None) -> Dict[str, Any]:
+                        stage: Optional[str] = None,
+                        schema_version: Optional[int] = None) -> Dict[str, Any]:
     """Re-validate a complete JSONL file and return its artifact metadata."""
     return _inspect_jsonl(Path(path), expected_rows, record_type, run_id,
-                          stage)
+                          stage, schema_version)
 
 
 def _atomic_write(path: Path, payload: bytes) -> None:
@@ -441,12 +555,17 @@ class TraceJsonlWriter:
     """Append validated records to a partial file and atomically finalize it."""
 
     def __init__(self, path: Path, record_type: str, expected_rows: int,
-                 run_id: str, stage: str) -> None:
+                 run_id: str, stage: str,
+                 schema_version: int = TRACE_SCHEMA_VERSION) -> None:
         if record_type not in ("train", "eval"):
             raise ValueError("record_type must be 'train' or 'eval'")
         _require_int(expected_rows, "expected_rows", minimum=1)
         _require_string(run_id, "run_id")
         _require_string(stage, "stage")
+        if (isinstance(schema_version, bool) or not isinstance(schema_version, int)
+                or schema_version not in PUBLISHABLE_TRACE_SCHEMA_VERSIONS):
+            raise ValueError(
+                "schema_version must be an explicitly publishable version")
 
         self.path = Path(path)
         self.partial_path = self.path.with_name(self.path.name + ".partial")
@@ -457,6 +576,7 @@ class TraceJsonlWriter:
         self.expected_rows = expected_rows
         self.run_id = run_id
         self.stage = stage
+        self.schema_version = schema_version
         self._record_ids: Set[str] = set()
         self._rows = 0
         self._closed = False
@@ -483,8 +603,16 @@ class TraceJsonlWriter:
         if self._rows >= self.expected_rows:
             raise ValueError(
                 f"cannot append more than expected_rows={self.expected_rows}")
-        prepared = prepare_trace_record(record, self.record_type, self.run_id,
-                                        self.stage)
+        candidate = dict(record)
+        candidate.setdefault("schema_version", self.schema_version)
+        if self.schema_version == 1 and _V3_FIELDS.intersection(candidate):
+            raise ValueError(
+                "v1 trace writer cannot publish v3-only audit fields")
+        prepared = prepare_trace_record(candidate, self.record_type,
+                                        self.run_id, self.stage)
+        if prepared["schema_version"] != self.schema_version:
+            raise ValueError(
+                "trace record schema_version does not match its writer")
         record_id = prepared["record_id"]
         if record_id in self._record_ids:
             raise ValueError(f"duplicate trace record_id: {record_id}")
@@ -522,6 +650,7 @@ class TraceJsonlWriter:
             self.record_type,
             self.run_id,
             self.stage,
+            self.schema_version,
         )
         if self.path.exists():
             raise FileExistsError(
@@ -536,7 +665,7 @@ class TraceJsonlWriter:
             "artifact": {
                 "path": self.path.name,
                 "record_schema": TRACE_SCHEMA,
-                "record_schema_version": TRACE_SCHEMA_VERSION,
+                "record_schema_version": self.schema_version,
                 "record_type": self.record_type,
                 "expected_rows": self.expected_rows,
                 **artifact,
@@ -593,7 +722,8 @@ def verify_trace_manifest(
         raise ValueError(
             "trace manifest artifact has missing or unknown fields")
     if (artifact["record_schema"] != TRACE_SCHEMA
-            or artifact["record_schema_version"] != TRACE_SCHEMA_VERSION):
+            or artifact["record_schema_version"]
+            not in SUPPORTED_TRACE_SCHEMA_VERSIONS):
         raise ValueError("trace record schema mismatch in manifest")
     if artifact["rows"] != artifact["expected_rows"]:
         raise ValueError("trace manifest rows do not match expected_rows")
@@ -609,6 +739,7 @@ def verify_trace_manifest(
         artifact["record_type"],
         manifest["run_id"],
         manifest["stage"],
+        artifact["record_schema_version"],
     )
     if inspected != {
             "bytes": artifact["bytes"],

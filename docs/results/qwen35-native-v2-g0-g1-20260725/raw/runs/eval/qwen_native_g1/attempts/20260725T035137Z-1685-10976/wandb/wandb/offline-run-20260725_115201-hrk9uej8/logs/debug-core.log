@@ -1,0 +1,7 @@
+{"time":"2026-07-25T11:52:01.602811839+08:00","level":"INFO","msg":"main: starting server","port-filename":"/tmp/tmpvftbybgl/port-7840.txt","pid":7840,"log-level":0,"disable-analytics":false,"shutdown-on-parent-exit":false,"enable-dcgm-profiling":false}
+{"time":"2026-07-25T11:52:01.603566788+08:00","level":"INFO","msg":"server: will exit if parent process dies","ppid":7840}
+{"time":"2026-07-25T11:52:01.603550333+08:00","level":"INFO","msg":"server: accepting connections","addr":{"Name":"/tmp/wandb-7840-8055-2425914067/socket","Net":"unix"}}
+{"time":"2026-07-25T11:52:01.775080679+08:00","level":"INFO","msg":"connection: ManageConnectionData: new connection created","id":"1(@)"}
+{"time":"2026-07-25T11:52:01.781930142+08:00","level":"INFO","msg":"handleInformInit: received","streamId":"hrk9uej8","id":"1(@)"}
+{"time":"2026-07-25T11:52:01.969281936+08:00","level":"INFO","msg":"handleInformInit: stream started","streamId":"hrk9uej8","id":"1(@)"}
+{"time":"2026-07-25T11:54:48.091865316+08:00","level":"INFO","msg":"server: parent process exited, terminating service process"}

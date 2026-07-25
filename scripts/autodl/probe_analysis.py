@@ -24,11 +24,11 @@ if str(REPOSITORY_ROOT) not in sys.path:
 from search_r1.trajectory_trace import validate_trace_record  # noqa: E402
 
 ANALYSIS_SCHEMA = "search-r1.grouped-probe-analysis"
-ANALYSIS_SCHEMA_VERSION = 2
+ANALYSIS_SCHEMA_VERSION = 3
 EXPECTED_GROUPS = 64
 GROUP_SIZE = 5
 EXPECTED_ROWS = EXPECTED_GROUPS * GROUP_SIZE
-MAX_SEARCHES = 4
+MAX_ACTION_BUDGET = 4
 MIN_MULTI_SEARCHES = 2
 MAX_QUERY_TOKEN_JACCARD = 0.8
 NEAR_MISS_DIAGNOSTIC_THRESHOLD = 16
@@ -429,13 +429,13 @@ def _load_trace(
             raise ValueError(
                 f"{location} checkpoint_digest does not match the expected model"
             )
-        if raw_record.get("max_searches") != MAX_SEARCHES:
+        if raw_record.get("max_action_budget") != MAX_ACTION_BUDGET:
             raise ValueError(
-                f"{location} max_searches must equal {MAX_SEARCHES}")
+                f"{location} max_action_budget must equal {MAX_ACTION_BUDGET}")
         searches = raw_record["executed_search_count"]
-        if searches > MAX_SEARCHES:
+        if searches > MAX_ACTION_BUDGET:
             raise ValueError(
-                f"{location} executed_search_count exceeds {MAX_SEARCHES}")
+                f"{location} executed_search_count exceeds the action budget")
         if _require_int(raw_record.get("group_size"),
                         f"{location} group_size",
                         minimum=1) != GROUP_SIZE:
@@ -1030,8 +1030,8 @@ def analyze(args: argparse.Namespace) -> dict[str, Any]:
             GROUP_SIZE,
             "expected_trajectories":
             EXPECTED_ROWS,
-            "max_searches":
-            MAX_SEARCHES,
+            "max_action_budget":
+            MAX_ACTION_BUDGET,
             "multi_search_minimum":
             MIN_MULTI_SEARCHES,
             "max_query_token_jaccard":

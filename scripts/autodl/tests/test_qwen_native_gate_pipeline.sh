@@ -7,7 +7,7 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$ROOT"' EXIT
 
-DATA_DIR="$ROOT/data/search_mix_qwen35_native_v2"
+DATA_DIR="$ROOT/data/search_mix_qwen35_native_v3"
 LEGACY_DIR="$ROOT/data/search_mix"
 mkdir -p "$DATA_DIR" "$LEGACY_DIR" "$ROOT/data/nq_small" \
     "$ROOT/data/search_opportunity_gate" "$ROOT/envs/train/bin" \
@@ -23,7 +23,7 @@ exec "${PYTHON_BIN:-python3}" "$@"
 SH
 chmod +x "$ROOT/envs/train/bin/python"
 for file in train_512.parquet val_128.parquet probe_multi_64.parquet \
-    probe_g0_8.parquet probe_forced_16.parquet probe_autonomous_32.parquet; do
+    probe_g0_8.parquet probe_autonomous_16.parquet; do
     printf 'fixture\n' >"$DATA_DIR/$file"
 done
 "$PYTHON_BIN" - "$DATA_DIR" <<'PY'
@@ -43,8 +43,11 @@ catalog = b"".join(
 )
 (root / "catalog.jsonl").write_bytes(catalog)
 manifest = {
-    "schema_version": 3,
-    "prompt_contract": {"tool_protocol": "qwen35_native"},
+    "schema_version": 4,
+    "prompt_contract": {
+        "tool_protocol": "qwen35_native",
+        "prompt_version": "qwen35-native-search-v3-original-aligned",
+    },
     "artifacts": {
         "catalog": {
             "file": "catalog.jsonl",
@@ -52,8 +55,7 @@ manifest = {
         },
         "probe": {"rows": 64, "sample_ids": sample_ids},
         "probe_g0": {"rows": 8, "sample_ids": sample_ids[:8]},
-        "probe_forced": {"rows": 16, "sample_ids": sample_ids[:16]},
-        "probe_autonomous": {"rows": 32, "sample_ids": sample_ids[:32]},
+        "probe_autonomous": {"rows": 16, "sample_ids": sample_ids[:16]},
     },
 }
 (root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
@@ -77,7 +79,7 @@ QWEN_NATIVE_GATE_STAGE=g0_g1
 source "$AUTODL_DIR/08_gpu_qwen_native_gate.sh"
 require_native_gate
 [[ "$AUTODL_GPU_PIPELINE" == qwen_native_gate && "$TOOL_PROTOCOL" == qwen35_native ]]
-[[ "$DATA_DIR" == "$ROOT/data/search_mix_qwen35_native_v2" ]]
+[[ "$DATA_DIR" == "$ROOT/data/search_mix_qwen35_native_v3" ]]
 [[ "$EVAL_EXPECTED_ROWS" == 16 && "$EVAL_GROUP_SIZE" == 2 ]]
 
 # GPU helpers must import the sealed checkout without relying on an editable install.
@@ -160,14 +162,14 @@ CAPTURE="$ROOT/native-config-args.txt"
 AUTODL_CONFIG_ONLY=1 AUTODL_ROOT="$ROOT" GPU_COUNT=2 \
     DATA_DIR="$DATA_DIR" OUTPUT_DIR="$ROOT/output" CAPTURE_LOG="$CAPTURE" \
     TOOL_PROTOCOL=qwen35_native MAX_RESPONSE_LENGTH=500 \
-    EVAL_DATA_FILE="$DATA_DIR/probe_autonomous_32.parquet" EVAL_GROUP_SIZE=3 \
-    TRACE_OUTPUT_DIR="$ROOT/traces" TRACE_STAGE=qwen_native_g2 \
+    EVAL_DATA_FILE="$DATA_DIR/probe_autonomous_16.parquet" EVAL_GROUP_SIZE=2 \
+    TRACE_OUTPUT_DIR="$ROOT/traces" TRACE_STAGE=qwen_native_g1 \
     TRACE_RUN_ID=test TRACE_CHECKPOINT_DIGEST="$DIGEST" \
-    bash "$AUTODL_DIR/train_small_grpo.sh" eval qwen_native_g2 \
+    bash "$AUTODL_DIR/train_small_grpo.sh" eval qwen_native_g1 \
         "$ROOT/models/Qwen3.5-2B"
 grep -Fxq "data.train_files=$DATA_DIR/train_512.parquet" "$CAPTURE"
 grep -Fxq 'data.return_raw_chat=true' "$CAPTURE"
-grep -Fxq 'data.eval_group_size=3' "$CAPTURE"
+grep -Fxq 'data.eval_group_size=2' "$CAPTURE"
 grep -Fxq 'actor_rollout_ref.rollout.top_k=0' "$CAPTURE"
 grep -Fxq 'actor_rollout_ref.rollout.presence_penalty=0.0' "$CAPTURE"
 grep -Fxq '++tool_protocol=qwen35_native' "$CAPTURE"
@@ -186,7 +188,7 @@ sampling = {
     "presence_penalty": 0.0, "repetition_penalty": 1.0,
 }
 records = []
-for mode in ("direct", "native_manager", "legacy_manager"):
+for mode in ("direct", "native_manager"):
     for question in range(8):
         for slot in range(2):
             records.append({
@@ -194,16 +196,39 @@ for mode in ("direct", "native_manager", "legacy_manager"):
                 "group_slot": slot,
                 "mode": mode,
                 "prompt_token_sha256": "b" * 64,
-                "raw_text": "<tool_call><function=search><parameter=query>capital city</parameter></function></tool_call>",
+                "raw_text": "reasoning</think><tool_call><function=search><parameter=query>capital city</parameter></function></tool_call> tail",
+                "raw_token_ids": [1, 2, 3],
+                "action_text": "reasoning</think><tool_call><function=search><parameter=query>capital city</parameter></function></tool_call>",
+                "action_token_ids": [1, 2],
+                "action_boundary": "tool_call",
+                "tail_dropped": True,
                 "parsed_action": {
                     "action": "search", "content": "capital city", "error": None,
-                    "prefix": "", "valid": True,
+                    "prefix": "reasoning", "valid": True,
+                },
+                "thinking": {
+                    "context": "initial_question", "template_opening_provided": True,
+                    "nonempty_reasoning": True, "closing_before_action": True,
                 },
                 "generation_events": [], "retrieval_events": [], "final_answer": None,
             })
 fixture = {
-    "resolved_config": {"checkpoint_digest": digest, "sampling": sampling},
+    "resolved_config": {
+        "checkpoint_digest": digest, "sampling": sampling,
+        "prompt_version": "qwen35-native-search-v3-original-aligned",
+        "max_action_budget": 4, "max_obs_length": 500,
+    },
     "records": records,
+    "environment_replay": {
+        "sample_id": "hotpotqa:train:0", "query": "Barack Obama",
+        "action_text": "fixed", "requested_search_count": 1,
+        "executed_search_count": 1, "retrieval_event_count": 1,
+        "nonempty_tool_response_count": 1, "retrieved_document_count": 3,
+        "visible_tool_response": "Doc 1 evidence", "tool_role_rendered": True,
+        "policy_token_count": 2, "tool_response_token_count": 4,
+        "tool_response_policy_token_count": 0, "info_mask_consistent": True,
+        "scientific_metric": False,
+    },
 }
 fixture_path.write_text(json.dumps(fixture), encoding="utf-8")
 with trace_path.open("w", encoding="utf-8", newline="\n") as handle:
@@ -211,13 +236,25 @@ with trace_path.open("w", encoding="utf-8", newline="\n") as handle:
         for slot in range(2):
             trace = {
                 "sample_id": f"hotpotqa:train:{question}", "group_slot": slot,
+                "schema_version": 3,
                 "checkpoint_digest": digest, "question": "What is the capital city?",
                 "turns": [{
                     "action": "search", "valid_action": True,
                     "search_query": f"capital city {question}", "retrieval_executed": True,
                     "observation": "Doc 1 evidence", "retrieved_docs": [{"title": "Doc"}],
                 }],
-                "executed_search_count": 1, "generation_events": [{"clipped": False}],
+                "executed_search_count": 1,
+                "generation_events": [{
+                    "turn": 0, "text": "reasoning</think><tool_call>x</tool_call>",
+                    "raw_text": "reasoning</think><tool_call>x</tool_call> tail",
+                    "raw_token_ids": [1, 2, 3], "action_token_ids": [1, 2],
+                    "tail_dropped": True, "generation_context": "initial_question",
+                    "action": "search", "clipped": False,
+                }],
+                "retrieval_events": [{"turn": 0, "query": f"capital city {question}"}],
+                "max_action_budget": 4, "action_count": 1,
+                "policy_token_count": 2, "observation_token_count": 1,
+                "observation_policy_token_count": 0, "info_mask_consistent": True,
                 "invalid_action_count": 0, "response_clipped": False, "em": 0,
             }
             handle.write(json.dumps(trace, sort_keys=True) + "\n")
@@ -227,7 +264,7 @@ PROBE_OUTPUT="$ROOT/protocol-output"
 "$PYTHON_BIN" "$AUTODL_DIR/qwen_native_protocol_probe.py" \
     --checkpoint-digest "$DIGEST" --seed 42 --fixture-input "$FIXTURE" \
     --output-dir "$PROBE_OUTPUT"
-[[ "$(wc -l <"$PROBE_OUTPUT/records.jsonl")" == 48 ]]
+[[ "$(wc -l <"$PROBE_OUTPUT/records.jsonl")" == 32 ]]
 
 ANALYSIS="$ROOT/analysis"
 "$PYTHON_BIN" "$AUTODL_DIR/qwen_native_gate_analysis.py" \
@@ -255,7 +292,8 @@ record = next(item for item in raw_mismatch["records"]
               if item["mode"] == "native_manager"
               and item["sample_id"] == "hotpotqa:train:0"
               and item["group_slot"] == 0)
-record["raw_text"] += " mismatched"
+record["raw_token_ids"][1] = 9
+record["action_token_ids"][1] = 9
 raw_target.write_text(json.dumps(raw_mismatch), encoding="utf-8")
 
 direct_invalid = copy.deepcopy(fixture)
@@ -272,7 +310,7 @@ assert changed == 2
 invalid_target.write_text(json.dumps(direct_invalid), encoding="utf-8")
 PY
 
-# Complete G0 scientific failures return zero and retain their reports.
+# Complete structural NO-GO results return zero and retain their reports.
 RAW_MISMATCH_PROBE="$ROOT/protocol-raw-mismatch-output"
 RAW_MISMATCH_ANALYSIS="$ROOT/raw-mismatch-analysis"
 "$PYTHON_BIN" "$AUTODL_DIR/qwen_native_protocol_probe.py" \
@@ -306,11 +344,10 @@ import sys
 raw_result, invalid_result = (
     json.loads(Path(path).read_text(encoding="utf-8")) for path in sys.argv[1:])
 assert raw_result["decision"] == "NO-GO"
-assert raw_result["failed_criteria"] == ["g0_raw_text_match_count"]
-assert raw_result["criteria"]["g0_raw_text_match_count"]["observed"] == 15
-assert invalid_result["decision"] == "NO-GO"
-assert invalid_result["failed_criteria"] == ["g0_direct_parseable_count"]
-assert invalid_result["criteria"]["g0_direct_parseable_count"]["observed"] == 14
+assert raw_result["failed_criteria"] == ["g0_first_action_token_match_count"]
+assert raw_result["criteria"]["g0_first_action_token_match_count"]["observed"] == 15
+assert invalid_result["decision"] == "GO"
+assert invalid_result["failed_criteria"] == []
 PY
 
 WRONG_TRACE="$ROOT/g1-wrong-sample-trace.jsonl"
@@ -333,6 +370,11 @@ if "$PYTHON_BIN" "$AUTODL_DIR/qwen_native_gate_analysis.py" \
     printf 'A shape-correct trace from the wrong fixed sample set was accepted.\n' >&2
     exit 1
 fi
+
+# LEGACY_V2_READ_ONLY_BEGIN: active v3 has no pre-training G2/G3 shell stages.
+# The historical fixtures below document old bindings and are not executed.
+printf 'qwen native v3 E0/G0/G1 pipeline tests passed\n'
+exit 0
 
 # A complete scientific NO-GO is still exit 0 and retains its report.
 G2_TRACE="$ROOT/g2-trace.jsonl"

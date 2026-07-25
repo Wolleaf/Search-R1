@@ -12,7 +12,6 @@ from search_r1.llm_agent.tool_protocol import (
     Qwen35Conversation,
     parse_action,
     qwen35_messages,
-    qwen35_system_prompt,
     qwen35_tool_schema_sha256,
     qwen35_tools,
     render_qwen35_prompt,
@@ -33,23 +32,29 @@ class _CharacterTokenizer:
 
     def apply_chat_template(self, messages, tools, enable_thinking,
                             add_generation_prompt, tokenize):
-        assert enable_thinking is False
+        assert enable_thinking is True
         assert add_generation_prompt is True
         assert tokenize is False
         rendered = "TOOLS:" + json.dumps(
             tools, sort_keys=True, separators=(",", ":")) + "\n"
-        for message in messages:
+        last_query_index = max(index for index, message in enumerate(messages)
+                               if message["role"] == "user")
+        for index, message in enumerate(messages):
             role = message["role"]
             content = message["content"]
             if role == "tool":
                 rendered += ("<|im_start|>user\n<tool_response>\n" + content +
                              "\n</tool_response><|im_end|>\n")
             elif role == "assistant":
-                rendered += ("<|im_start|>assistant\n<think>\n\n</think>\n\n" +
-                             content + "<|im_end|>\n")
+                rendered += "<|im_start|>assistant\n"
+                if index > last_query_index:
+                    reasoning = message.get("reasoning_content", "").strip()
+                    rendered += ("<think>\n" + reasoning +
+                                 "\n</think>\n\n")
+                rendered += content.strip() + "<|im_end|>\n"
             else:
                 rendered += (f"<|im_start|>{role}\n{content}<|im_end|>\n")
-        rendered += "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        rendered += "<|im_start|>assistant\n<think>\n"
         return rendered
 
 
@@ -58,7 +63,7 @@ class _LastQueryAwareCharacterTokenizer(_CharacterTokenizer):
 
     def apply_chat_template(self, messages, tools, enable_thinking,
                             add_generation_prompt, tokenize):
-        assert enable_thinking is False
+        assert enable_thinking is True
         assert add_generation_prompt is True
         assert tokenize is False
         last_query_index = -1
@@ -86,7 +91,7 @@ class _LastQueryAwareCharacterTokenizer(_CharacterTokenizer):
                 rendered += content + "<|im_end|>\n"
             else:
                 rendered += f"<|im_start|>{role}\n{content}<|im_end|>\n"
-        rendered += "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        rendered += "<|im_start|>assistant\n<think>\n"
         return rendered
 
 
@@ -129,24 +134,30 @@ class _TrimNoncanonicalTokenizer:
 
     def apply_chat_template(self, messages, tools, enable_thinking,
                             add_generation_prompt, tokenize):
-        assert enable_thinking is False
+        assert enable_thinking is True
         assert add_generation_prompt is True
         assert tokenize is False
         rendered = "TOOLS:" + json.dumps(
             tools, sort_keys=True, separators=(",", ":")) + "\n"
-        for message in messages:
+        last_query_index = max(index for index, message in enumerate(messages)
+                               if message["role"] == "user")
+        for index, message in enumerate(messages):
             role = message["role"]
             content = message["content"].strip()
             if role == "tool":
                 rendered += ("<|im_start|>user\n<tool_response>\n" + content +
                              "\n</tool_response><|im_end|>\n")
             elif role == "assistant":
-                rendered += ("<|im_start|>assistant\n<think>\n\n</think>\n\n" +
-                             content + "<|im_end|>\n")
+                rendered += "<|im_start|>assistant\n"
+                if index > last_query_index:
+                    reasoning = message.get("reasoning_content", "").strip()
+                    rendered += ("<think>\n" + reasoning +
+                                 "\n</think>\n\n")
+                rendered += content + "<|im_end|>\n"
             else:
                 rendered += (f"<|im_start|>{role}\n{content}"
                              "<|im_end|>\n")
-        rendered += "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        rendered += "<|im_start|>assistant\n<think>\n"
         return rendered
 
 
@@ -174,9 +185,16 @@ class _TrimNoncanonicalTokenizer:
         (
             "<tool_call><function=search><parameter=query>query</parameter>"
             "</function></tool_call>",
+            "search",
+            "query",
             None,
-            "",
-            "placeholder_search_query",
+        ),
+        (
+            "<tool_call><function=search><parameter=query>and</parameter>"
+            "</function></tool_call>",
+            "search",
+            "and",
+            None,
         ),
         (
             "<tool_call><function=search><parameter=q>France</parameter>"
@@ -222,6 +240,9 @@ def test_native_parser_is_strict(text, action, content, error):
     [
         ("I will verify.\n", "I will verify."),
         ("<think>\n\n</think>\n", ""),
+        ("Useful nonempty reasoning.\n</think>\n", "Useful nonempty reasoning."),
+        ("<think>Useful nonempty reasoning.</think>\n",
+         "Useful nonempty reasoning."),
         ("<think>\n\n</think>\nI will verify.\n", "I will verify."),
     ],
 )
@@ -269,10 +290,6 @@ def test_native_parser_shares_safe_prefix(prefix, expected_prefix, action_text,
             "malformed_answer",
         ),
         (
-            "<think>I know this.</think><answer>Paris</answer>",
-            "nonempty_thinking_prefix",
-        ),
-        (
             "<think></think><think></think><answer>Paris</answer>",
             "invalid_action_prefix",
         ),
@@ -282,22 +299,45 @@ def test_native_parser_shares_safe_prefix(prefix, expected_prefix, action_text,
             "invalid_action_prefix",
         ),
         ("<answer><search>France</search></answer>", "nested_protocol_marker"),
-        (
-            '{"name":"search","arguments":{"query":"France"}}\n'
-            "<answer>Paris</answer>",
-            "json_tool_call_not_supported",
-        ),
-        (
-            '<answer>{"name":"search","arguments":{"query":"France"}}'
-            "</answer>",
-            "json_tool_call_not_supported",
-        ),
     ],
 )
 def test_native_parser_rejects_invalid_terminal_answers(text, error):
     parsed = parse_action(text, QWEN35_NATIVE)
 
     assert parsed == ParsedAction(None, "", error)
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        (
+            '<answer>{"name":"search","arguments":{"query":"France"}}'
+            "</answer>",
+            ParsedAction(
+                "answer",
+                '{"name":"search","arguments":{"query":"France"}}',
+            ),
+        ),
+        (
+            "<tool_call><function=search><parameter=query>"
+            '{"query":"France","operator":"and"}'
+            "</parameter></function></tool_call>",
+            ParsedAction("search", '{"query":"France","operator":"and"}'),
+        ),
+        (
+            '{"name":"search","arguments":{"query":"France"}}\n'
+            "</think>\n\n<answer>Paris</answer>",
+            ParsedAction(
+                "answer",
+                "Paris",
+                prefix='{"name":"search","arguments":{"query":"France"}}',
+            ),
+        ),
+    ],
+)
+def test_native_parser_does_not_interpret_valid_payloads_as_json_tool_calls(
+        text, expected):
+    assert parse_action(text, QWEN35_NATIVE) == expected
 
 
 def test_legacy_parser_keeps_historical_first_match_behavior():
@@ -318,36 +358,44 @@ def test_tool_schema_copy_and_digest_are_stable():
 
 
 def test_native_message_contract_preserves_question_text():
-    messages = qwen35_messages("Who wrote Hamlet?")
+    messages = qwen35_messages("  Who   wrote\nHamlet  ")
 
-    expected_system = (
-        "Call at most one tool per assistant turn. Use search when external "
-        "evidence is needed. After each search result, decide whether another "
-        "search is needed. Use at most four searches. When you have enough "
-        "evidence, output the opening tag <answer>, then only the short final "
-        "answer text, then the closing tag </answer>, and end the response. Do "
-        "not combine a tool call with a final answer in the same assistant "
-        "response, and do not output any text after the closing tag."
+    original_user = (
+        "Answer the given question. You must conduct reasoning inside <think> "
+        "and </think> first every time you get new information. After "
+        "reasoning, if you find you lack some knowledge, you can call a search "
+        "engine by <search> query </search> and it will return the top searched "
+        "results between <information> and </information>. You can search as "
+        "many times as your want. If you find no further external knowledge "
+        "needed, you can "
+        "directly provide the answer inside <answer> and </answer>, without "
+        "detailed illustrations. For example, <answer> Beijing </answer>. "
+        "Question: Who wrote Hamlet?\n"
     )
-    assert QWEN35_PROMPT_VERSION == "qwen35-native-search-v2-answer-tag"
-    assert qwen35_system_prompt() == expected_system
-    assert messages[0]["content"] == expected_system
-    assert messages[1]["content"] == "Question: Who wrote Hamlet?\n"
+    expected_user = original_user.replace(
+        "call a search engine by <search> query </search> and",
+        "call the available search tool with a query, and",
+    ).replace(
+        "between <information> and </information>",
+        "in a tool response",
+    ).replace("as your want", "as you want")
+    assert QWEN35_PROMPT_VERSION == "qwen35-native-search-v3-original-aligned"
+    assert messages == [{"role": "user", "content": expected_user}]
     assert validate_qwen35_messages(messages) == messages
-    with pytest.raises(ProtocolError, match="system contract"):
+    with pytest.raises(ProtocolError, match="exactly one user"):
         validate_qwen35_messages([{
             "role": "system",
-            "content": "different"
-        }, messages[1]])
+            "content": "custom policy"
+        }, messages[0]])
 
 
-def test_native_retry_prompt_uses_the_same_tagged_answer_contract():
-    assert "opening tag <answer>" in QWEN35_RETRY_PROMPT
-    assert "closing tag </answer>" in QWEN35_RETRY_PROMPT
-    for placeholder in ("<answer>xxx</answer>",
-                        "<answer>Beijing</answer>",
-                        "<answer>short answer</answer>"):
-        assert placeholder not in QWEN35_RETRY_PROMPT
+def test_native_contract_contains_no_added_search_policy():
+    assert QWEN35_RETRY_PROMPT == "My action is not correct. Let me rethink."
+    contract = json.dumps(qwen35_messages("Question")) + json.dumps(
+        qwen35_tools()) + QWEN35_RETRY_PROMPT
+    for forbidden in ("at least once", "at most four", "exactly one search",
+                      "call search once", "specific factual"):
+        assert forbidden not in contract.casefold()
 
 
 def test_native_conversation_preserves_prefix_and_masks_complete_wrapper():
@@ -356,7 +404,8 @@ def test_native_conversation_preserves_prefix_and_masks_complete_wrapper():
     initial = render_qwen35_prompt(tokenizer, messages)
     initial_ids = tokenizer(initial, add_special_tokens=False)["input_ids"]
     conversation = Qwen35Conversation(tokenizer, messages, initial_ids)
-    response = ("<tool_call><function=search><parameter=query>"
+    response = ("I need current evidence.\n</think>\n\n"
+                "<tool_call><function=search><parameter=query>"
                 "Eiffel Tower location</parameter></function></tool_call>")
     response_ids = tokenizer(response, add_special_tokens=False)["input_ids"]
 
@@ -370,11 +419,18 @@ def test_native_conversation_preserves_prefix_and_masks_complete_wrapper():
 
     suffix = tokenizer.decode(followup.token_ids)
     assert len(followup.token_ids) <= 160
-    assert suffix.endswith("<|im_start|>assistant\n<think>\n\n</think>\n\n")
+    assert suffix.endswith("<|im_start|>assistant\n<think>\n")
     assert "<tool_response>" in suffix
     assert "</tool_response>" in suffix
     assert conversation.prompt_token_ids == initial_ids + response_ids + list(
         followup.token_ids)
+    assert conversation.messages[1] == {
+        "role": "assistant",
+        "content": ("<tool_call><function=search><parameter=query>"
+                    "Eiffel Tower location</parameter></function></tool_call>"),
+        "reasoning_content": "I need current evidence.",
+    }
+    assert conversation.messages[2]["role"] == "tool"
 
 
 def test_native_conversation_uses_complete_invalid_retry_wrapper():
@@ -398,10 +454,50 @@ def test_native_conversation_uses_complete_invalid_retry_wrapper():
     sampled_prefix = initial_ids + response_ids
     actual_prefix = conversation.prompt_token_ids[:len(sampled_prefix)]
     assert actual_prefix == sampled_prefix
-    assert "<tool_response>" in suffix
-    assert "</tool_response>" in suffix
+    assert "<tool_response>" not in suffix
+    assert "</tool_response>" not in suffix
     assert QWEN35_RETRY_PROMPT in suffix
-    assert suffix.endswith("<|im_start|>assistant\n<think>\n\n</think>\n\n")
+    assert "<|im_start|>user\n" in suffix
+    assert suffix.endswith("<|im_start|>assistant\n<think>\n")
+    assert conversation.messages[-1] == {
+        "role": "user",
+        "content": QWEN35_RETRY_PROMPT,
+    }
+
+
+def test_native_user_retry_does_not_rewrite_prior_search_tokens():
+    tokenizer = _CharacterTokenizer()
+    messages = qwen35_messages("Who wrote Hamlet?")
+    initial = render_qwen35_prompt(tokenizer, messages)
+    initial_ids = tokenizer(initial, add_special_tokens=False)["input_ids"]
+    conversation = Qwen35Conversation(tokenizer, messages, initial_ids)
+    search = (
+        "I should verify.\n</think>\n\n<tool_call><function=search>"
+        "<parameter=query>Hamlet author</parameter></function></tool_call>")
+    search_ids = tokenizer(search, add_special_tokens=False)["input_ids"]
+    conversation.append_followup(
+        search,
+        parse_action(search, QWEN35_NATIVE),
+        "William Shakespeare wrote Hamlet.",
+        max_obs_length=200,
+        response_token_ids=search_ids,
+    )
+    before_retry = list(conversation.prompt_token_ids)
+    invalid = "<tool_call>broken"
+    invalid_ids = tokenizer(invalid, add_special_tokens=False)["input_ids"]
+
+    retry = conversation.append_followup(
+        invalid,
+        parse_action(invalid, QWEN35_NATIVE),
+        "",
+        max_obs_length=200,
+        response_token_ids=invalid_ids,
+    )
+
+    assert conversation.prompt_token_ids == (
+        before_retry + invalid_ids + list(retry.token_ids))
+    assert render_qwen35_prompt(tokenizer, conversation.messages) == (
+        tokenizer.decode(conversation.prompt_token_ids))
 
 
 @pytest.mark.parametrize("sampled_eos", [True, False])
@@ -443,6 +539,55 @@ def test_native_conversation_preserves_trimmed_noncanonical_sample(
         assert suffix_ids[0] != tokenizer.eos_token_id
     else:
         assert suffix_ids[0] == tokenizer.eos_token_id
+
+
+def test_native_conversation_rejects_inconsistent_sampled_token_ids():
+    tokenizer = _TrimNoncanonicalTokenizer()
+    messages = qwen35_messages("Capital of France?")
+    initial = render_qwen35_prompt(tokenizer, messages)
+    initial_ids = tokenizer(initial, add_special_tokens=False)["input_ids"]
+    conversation = Qwen35Conversation(tokenizer, messages, initial_ids)
+    response = (
+        "<tool_call><function=search><parameter=query>capital France"
+        "</parameter></function></tool_call>")
+    response_ids = tokenizer(response,
+                             add_special_tokens=False)["input_ids"]
+    action = parse_action(response, QWEN35_NATIVE)
+
+    with pytest.raises(ProtocolError, match="decode exactly"):
+        conversation.append_followup(
+            response,
+            action,
+            "Paris",
+            400,
+            tokenizer(response.replace("France", "Lyon"),
+                      add_special_tokens=False)["input_ids"],
+        )
+    with pytest.raises(ProtocolError, match="internal EOS"):
+        conversation.append_followup(
+            response,
+            action,
+            "Paris",
+            400,
+            response_ids[:2] + [tokenizer.eos_token_id] + response_ids[2:],
+        )
+    with pytest.raises(ProtocolError, match="padding token"):
+        conversation.append_followup(
+            response,
+            action,
+            "Paris",
+            400,
+            response_ids + [tokenizer.pad_token_id],
+        )
+    with pytest.raises(ProtocolError, match="internal EOS"):
+        conversation.append_followup(
+            response,
+            action,
+            "Paris",
+            400,
+            response_ids + [tokenizer.eos_token_id, tokenizer.eos_token_id],
+        )
+    assert conversation.prompt_token_ids == initial_ids
 
 
 def test_native_conversation_rejects_noncanonical_initial_tokens():

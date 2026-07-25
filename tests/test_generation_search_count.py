@@ -67,7 +67,7 @@ def test_execute_predictions_preserves_raw_retrieval_metadata_out_of_band():
     }]
 
 
-def test_forced_final_search_is_not_counted_or_executed():
+def test_explicitly_disabled_search_is_not_counted_or_executed():
     manager = _manager()
     manager.batch_search = lambda _: (_ for _ in ()).throw(AssertionError('retriever was called'))
 
@@ -91,10 +91,12 @@ def test_search_count_is_a_reorderable_batch_tensor():
             'responses_with_info_mask': torch.tensor([[3, 0], [4, 5]]),
         },
         meta_info={},
+        action_count=torch.tensor([1, 2]),
         executed_search_count=torch.tensor([0, 2]),
     )
 
     output.reorder(torch.tensor([1, 0]))
+    assert output.batch['action_count'].tolist() == [2, 1]
     assert output.batch['executed_search_count'].tolist() == [2, 0]
 
 
@@ -107,6 +109,7 @@ def test_retrieval_metadata_stays_aligned_after_batch_reorder():
             'responses_with_info_mask': torch.tensor([[3], [4]]),
         },
         meta_info={},
+        action_count=torch.tensor([1, 1]),
         executed_search_count=torch.tensor([1, 0]),
         retrieval_events=[
             [{'turn': 0, 'query': 'first', 'documents': []}],
@@ -165,11 +168,11 @@ def test_retrieval_trace_records_post_truncation_visible_observation():
                                      max_start_length=8,
                                      max_prompt_length=512,
                                      max_response_length=8,
-                                     max_obs_length=384)
+                                     max_obs_length=500)
     manager.tensor_fn = TensorHelper(
         TensorConfig(pad_token_id=0,
                      max_prompt_length=512,
-                     max_obs_length=384,
+                     max_obs_length=500,
                      max_start_length=8))
 
     class WorkerGroup:
@@ -189,7 +192,7 @@ def test_retrieval_trace_records_post_truncation_visible_observation():
         '<search>topic</search>'
         if int(responses[0, 0]) == 11 else '<answer>done</answer>'
     ])
-    full_observation = ' '.join(['visible'] * 384 + ['HIDDEN'])
+    full_observation = ' '.join(['visible'] * 500 + ['HIDDEN'])
     documents = [{
         'document_id': '42',
         'document': {
@@ -219,7 +222,7 @@ def test_retrieval_trace_records_post_truncation_visible_observation():
 
     assert 'HIDDEN' in event['observation']
     assert 'HIDDEN' not in event['visible_observation']
-    assert len(event['visible_observation'].split()) == 384
+    assert len(event['visible_observation'].split()) == 500
 
 
 def test_legacy_retokenized_responses_and_observations_follow_rollout_device():
@@ -262,9 +265,10 @@ def test_odd_active_validation_batch_keeps_deterministic_sampling_metadata():
     manager.tokenizer.pad_token = '<pad>'
     manager.config = SimpleNamespace(
         num_gpus=2,
-        max_turns=0,
+        max_turns=1,
         max_start_length=8,
         max_prompt_length=8,
+        max_obs_length=8,
     )
     captured = {}
 
@@ -281,12 +285,17 @@ def test_odd_active_validation_batch_keeps_deterministic_sampling_metadata():
         responses,
         ['<answer>x</answer>'] * len(responses),
     )
+    manager._process_next_obs = lambda observations, device=None: (
+        torch.empty((len(observations), 0), dtype=torch.long, device=device),
+        [''] * len(observations),
+    )
     manager.execute_predictions = lambda predictions, pad_token, active_mask, do_search=False: (
         [''] * len(predictions),
         [1] * len(predictions),
         [1] * len(predictions),
         [0] * len(predictions),
     )
+    manager._last_execution_retrieval_events = [None, None, None]
     gen_batch = DataProto.from_dict(
         {
             'input_ids': torch.tensor([[1, 2], [3, 4], [5, 6]]),

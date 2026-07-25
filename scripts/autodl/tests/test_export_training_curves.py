@@ -13,6 +13,11 @@ SPEC.loader.exec_module(MODULE)
 
 class ExportTrainingCurvesTest(unittest.TestCase):
 
+    def test_comparison_label_identifies_post_trained_parent(self):
+        self.assertIn("A=Parent (post-trained)",
+                      MODULE.COMPARISON_STAGE_DESCRIPTION)
+        self.assertNotIn("A=Base", MODULE.COMPARISON_STAGE_DESCRIPTION)
+
     def test_parses_ansi_training_record_and_derives_utility(self):
         metrics = (
             "\x1b[36m(worker)\x1b[0m step:1 - actor/pg_loss:-0.125 - "

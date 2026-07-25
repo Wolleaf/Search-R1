@@ -16,16 +16,36 @@ def _eval_record(sample_index=7, raw_trajectory=None):
         raw_trajectory = ("<think>I can answer directly.</think>"
                           "<answer>Paris</answer>")
     turns = parse_search_r1_transcript(raw_trajectory)
+    action_text = raw_trajectory
+    action_ids = [101, 102]
     return {
         "sample_id": stable_sample_id("nq", "test", sample_index),
         "source_index": sample_index,
         "question": "What is the capital of France?",
         "gold_answers": ["Paris"],
         "raw_trajectory": raw_trajectory,
+        "raw_generations": [{
+            "turn": 0,
+            "raw_text": action_text,
+            "raw_token_ids": action_ids,
+            "raw_token_count": len(action_ids),
+            "action_text": action_text,
+            "action_token_ids": action_ids,
+            "action_token_count": len(action_ids),
+            "boundary": "answer",
+            "tail_dropped": False,
+            "raw_clipped": False,
+        }],
         "turns": turns,
         "extracted_answer": "Paris",
         "em": 1,
         "executed_search_count": 0,
+        "max_action_budget": 4,
+        "action_count": 1,
+        "policy_token_count": len(action_ids),
+        "observation_token_count": 0,
+        "observation_policy_token_count": 0,
+        "info_mask_consistent": True,
         "posthoc_utility": 1.0,
         "response_tokens": 12,
         "response_clipped": False,
@@ -50,6 +70,17 @@ def _train_record(sample_index=7):
         "group_reward_std": 0.4,
         "sequence_advantage": 2.0,
     })
+    return record
+
+
+def _v1_eval_record(sample_index=7):
+    record = _eval_record(sample_index)
+    for name in (
+            "raw_generations", "max_action_budget", "action_count",
+            "policy_token_count", "observation_token_count",
+            "observation_policy_token_count", "info_mask_consistent"):
+        record.pop(name)
+    record["max_searches"] = 4
     return record
 
 
@@ -153,6 +184,91 @@ def test_writer_finalizes_exact_rows_with_manifest_and_sha256(tmp_path):
         for line in trace_path.read_text(encoding="utf-8").splitlines()
     ]
     assert len({record["record_id"] for record in records}) == 2
+
+
+def test_reader_accepts_historical_v1_without_rewriting_it(tmp_path):
+    record = _v1_eval_record()
+    record.update({
+        "schema": TRACE_SCHEMA,
+        "schema_version": 1,
+        "record_type": "eval",
+        "record_id": "trace:historical-v1",
+        "run_id": "historical",
+        "stage": "control",
+    })
+    path = tmp_path / "historical.jsonl"
+    path.write_bytes((json.dumps(record,
+                                 ensure_ascii=False,
+                                 sort_keys=True,
+                                 separators=(",", ":")) + "\n").encode("utf-8"))
+
+    inspected = inspect_trace_jsonl(path, 1, "eval", "historical",
+                                    "control", schema_version=1)
+
+    assert inspected["rows"] == 1
+    assert json.loads(path.read_text(encoding="utf-8"))["max_searches"] == 4
+
+
+def test_writer_explicitly_publishes_v1_record_and_manifest(tmp_path):
+    trace_path = tmp_path / "legacy_eval_predictions.jsonl"
+    writer = TraceJsonlWriter(
+        trace_path,
+        record_type="eval",
+        expected_rows=1,
+        run_id="legacy-eval",
+        stage="legacy-control",
+        schema_version=1,
+    )
+    writer.append(_v1_eval_record())
+
+    manifest = writer.finalize()
+    record = json.loads(trace_path.read_text(encoding="utf-8"))
+
+    assert record["schema_version"] == 1
+    assert record["max_searches"] == 4
+    assert "raw_generations" not in record
+    assert manifest["artifact"]["record_schema_version"] == 1
+    assert verify_trace_manifest(writer.manifest_path) == manifest
+
+
+def test_writer_rejects_unpublishable_or_mixed_schema_versions(tmp_path):
+    with pytest.raises(ValueError, match="explicitly publishable"):
+        TraceJsonlWriter(
+            tmp_path / "v2.jsonl",
+            record_type="eval",
+            expected_rows=1,
+            run_id="v2",
+            stage="legacy",
+            schema_version=2,
+        )
+
+    writer = TraceJsonlWriter(
+        tmp_path / "mixed.jsonl",
+        record_type="eval",
+        expected_rows=1,
+        run_id="mixed",
+        stage="legacy",
+        schema_version=1,
+    )
+    with pytest.raises(ValueError, match="v3-only audit fields"):
+        writer.append(_eval_record())
+    writer.close()
+
+
+def test_v3_rejects_legacy_max_searches_field(tmp_path):
+    writer = TraceJsonlWriter(
+        tmp_path / "eval_predictions.jsonl",
+        record_type="eval",
+        expected_rows=1,
+        run_id="v3-only",
+        stage="control",
+    )
+    record = _eval_record()
+    record["max_searches"] = 4
+
+    with pytest.raises(ValueError, match="must not contain max_searches"):
+        writer.append(record)
+    writer.close()
 
 
 def test_writer_validates_training_specific_fields(tmp_path):

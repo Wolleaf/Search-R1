@@ -15,10 +15,11 @@ from typing import Any, Mapping, Sequence
 
 
 SCHEMA = "search-r1.qwen-native-protocol-probe"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
+PROMPT_VERSION = "qwen35-native-search-v3-original-aligned"
 EXPECTED_QUESTIONS = 8
 GROUP_SIZE = 2
-MODES = ("direct", "native_manager", "legacy_manager")
+MODES = ("direct", "native_manager")
 SAMPLING = {
     "temperature": 1.0,
     "top_p": 1.0,
@@ -82,10 +83,37 @@ def parsed_record(parsed: Any) -> dict[str, Any]:
     }
 
 
+def _valid_token_ids(value: Any) -> bool:
+    return (isinstance(value, list)
+            and all(isinstance(item, int) and not isinstance(item, bool)
+                    and item >= 0 for item in value))
+
+
+def thinking_record(text: str, context: str = "initial_question") -> dict[str, Any]:
+    action_positions = [position for marker in ("<tool_call>", "<answer>")
+                        if (position := text.find(marker)) >= 0]
+    action_position = min(action_positions) if action_positions else len(text)
+    close_position = text.find("</think>")
+    closing_before_action = (close_position >= 0
+                             and close_position < action_position
+                             and text.count("</think>") == 1)
+    reasoning = text[:close_position] if closing_before_action else ""
+    if reasoning.lstrip().startswith("<think>"):
+        reasoning = reasoning.lstrip()[len("<think>"):]
+    return {
+        "context": context,
+        "template_opening_provided": True,
+        "nonempty_reasoning": bool(reasoning.strip()),
+        "closing_before_action": closing_before_action,
+    }
+
+
 def validate_record(record: Mapping[str, Any]) -> None:
     expected = {
         "sample_id", "group_slot", "mode", "prompt_token_sha256", "raw_text",
-        "parsed_action", "generation_events", "retrieval_events", "final_answer",
+        "raw_token_ids", "action_text", "action_token_ids", "action_boundary",
+        "tail_dropped", "parsed_action", "thinking", "generation_events",
+        "retrieval_events", "final_answer",
     }
     if set(record) != expected:
         raise ValueError("protocol probe record has missing or unknown fields")
@@ -97,6 +125,19 @@ def validate_record(record: Mapping[str, Any]) -> None:
         raise ValueError("protocol probe prompt digest is invalid")
     if not isinstance(record["raw_text"], str):
         raise ValueError("protocol probe raw_text must be a string")
+    if not isinstance(record["action_text"], str) \
+            or not _valid_token_ids(record["raw_token_ids"]) \
+            or not _valid_token_ids(record["action_token_ids"]):
+        raise ValueError("protocol probe raw/action token evidence is invalid")
+    if record["raw_token_ids"][:len(record["action_token_ids"])] \
+            != record["action_token_ids"]:
+        raise ValueError("protocol probe action tokens are not a raw-token prefix")
+    if record["tail_dropped"] != (
+            len(record["action_token_ids"]) < len(record["raw_token_ids"])):
+        raise ValueError("protocol probe tail flag is not aligned with token IDs")
+    if not isinstance(record["action_boundary"], str) \
+            or not isinstance(record["thinking"], Mapping):
+        raise ValueError("protocol probe action/thinking evidence is invalid")
     action = record["parsed_action"]
     if not isinstance(action, Mapping) or set(action) != {
             "action", "content", "error", "prefix", "valid"}:
@@ -106,12 +147,45 @@ def validate_record(record: Mapping[str, Any]) -> None:
         raise ValueError("protocol probe events must be lists")
 
 
+def validate_environment_replay(replay: Mapping[str, Any]) -> None:
+    required = {
+        "sample_id", "query", "action_text", "requested_search_count",
+        "executed_search_count", "retrieval_event_count",
+        "nonempty_tool_response_count", "retrieved_document_count",
+        "visible_tool_response", "tool_role_rendered", "policy_token_count",
+        "tool_response_token_count", "tool_response_policy_token_count",
+        "info_mask_consistent", "scientific_metric",
+    }
+    if set(replay) != required:
+        raise ValueError("E0 environment replay has missing or unknown fields")
+    count_fields = required & {
+        "requested_search_count", "executed_search_count",
+        "retrieval_event_count", "nonempty_tool_response_count",
+        "retrieved_document_count", "policy_token_count",
+        "tool_response_token_count", "tool_response_policy_token_count",
+    }
+    if any(isinstance(replay[name], bool) or not isinstance(replay[name], int)
+           or replay[name] < 0 for name in count_fields):
+        raise ValueError("E0 environment replay counts are invalid")
+    if not all(isinstance(replay[name], str)
+               for name in ("sample_id", "query", "action_text",
+                            "visible_tool_response")):
+        raise ValueError("E0 environment replay text fields are invalid")
+    if not isinstance(replay["tool_role_rendered"], bool) \
+            or not isinstance(replay["info_mask_consistent"], bool):
+        raise ValueError("E0 environment replay flags are invalid")
+    if replay["scientific_metric"] is not False:
+        raise ValueError("E0 must be marked as non-scientific")
+
+
 def publish(output_dir: Path, resolved: Mapping[str, Any],
-            records: list[dict[str, Any]], checkpoint_digest: str) -> None:
+            records: list[dict[str, Any]], environment_replay: Mapping[str, Any],
+            checkpoint_digest: str) -> None:
     if output_dir.exists() or output_dir.is_symlink():
         raise ValueError(f"refusing to overwrite protocol probe output: {output_dir}")
     if len(records) != EXPECTED_QUESTIONS * GROUP_SIZE * len(MODES):
-        raise ValueError("protocol probe must contain exactly 48 records")
+        raise ValueError("protocol probe must contain exactly 32 records")
+    validate_environment_replay(environment_replay)
     identities = set()
     mode_counts = {mode: 0 for mode in MODES}
     for record in records:
@@ -129,6 +203,8 @@ def publish(output_dir: Path, resolved: Mapping[str, Any],
         records, key=lambda item: (item["mode"], item["sample_id"], item["group_slot"])))
     atomic_write(output_dir / "records.jsonl", records_bytes)
     atomic_write(output_dir / "resolved-config.json", canonical_bytes(dict(resolved)))
+    atomic_write(output_dir / "environment-replay.json",
+                 canonical_bytes(dict(environment_replay)))
     manifest = {
         "schema": SCHEMA,
         "schema_version": SCHEMA_VERSION,
@@ -136,14 +212,18 @@ def publish(output_dir: Path, resolved: Mapping[str, Any],
         "mode_counts": mode_counts,
         "records_sha256": sha256_bytes(records_bytes),
         "resolved_config_sha256": sha256_file(output_dir / "resolved-config.json"),
+        "environment_replay_sha256": sha256_file(
+            output_dir / "environment-replay.json"),
     }
     atomic_write(output_dir / "manifest.json", canonical_bytes(manifest))
 
 
-def load_fixture(path: Path, checkpoint_digest: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+def load_fixture(path: Path, checkpoint_digest: str) -> tuple[
+        dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
     payload = json.loads(path.read_bytes())
-    if not isinstance(payload, Mapping) or set(payload) != {"resolved_config", "records"}:
-        raise ValueError("fixture must contain only resolved_config and records")
+    if not isinstance(payload, Mapping) or set(payload) != {
+            "resolved_config", "records", "environment_replay"}:
+        raise ValueError("fixture must contain resolved_config, records, and E0")
     resolved = payload["resolved_config"]
     records = payload["records"]
     if not isinstance(resolved, dict) or not isinstance(records, list):
@@ -152,7 +232,10 @@ def load_fixture(path: Path, checkpoint_digest: str) -> tuple[dict[str, Any], li
         raise ValueError("fixture sampling does not match the registered G0 config")
     if resolved.get("checkpoint_digest") != checkpoint_digest:
         raise ValueError("fixture checkpoint digest mismatch")
-    return resolved, records
+    replay = payload["environment_replay"]
+    if not isinstance(replay, dict):
+        raise ValueError("fixture E0 environment replay is invalid")
+    return resolved, records, replay
 
 
 def normalize_messages(value: Any) -> list[dict[str, Any]]:
@@ -212,6 +295,8 @@ def make_batch(tokenizer: Any, rows: list[tuple[str, list[dict[str, Any]]]],
     expanded_ids, expanded_messages, texts = [], [], []
     for sample_id, messages in rows:
         rendered = prompt_text(tokenizer, messages, native)
+        if native and not rendered.endswith("<think>\n"):
+            raise ValueError("native generation prefix does not open thinking")
         for _ in range(GROUP_SIZE):
             expanded_ids.append(sample_id)
             expanded_messages.append(messages)
@@ -272,23 +357,38 @@ def set_seed(seed: int) -> None:
 
 def direct_records(actor: Any, batch: Any, tokenizer: Any, sample_ids: list[str],
                    slots: list[int], seed: int) -> list[dict[str, Any]]:
+    from search_r1.llm_agent.generation import slice_first_complete_native_action
     from search_r1.llm_agent.tool_protocol import QWEN35_NATIVE, parse_action
 
     set_seed(seed)
     output = actor.generate_sequences(batch)
-    texts = decode_responses(tokenizer, output.batch["responses"])
     records = []
-    for index, text in enumerate(texts):
-        parsed = parse_action(text, QWEN35_NATIVE)
+    for index, response in enumerate(output.batch["responses"]):
+        sliced = slice_first_complete_native_action(tokenizer, response)
+        parsed = parse_action(sliced.action_text, QWEN35_NATIVE)
         records.append({
             "sample_id": sample_ids[index],
             "group_slot": slots[index],
             "mode": "direct",
             "prompt_token_sha256": prompt_digest(
                 batch.batch["input_ids"][index], batch.batch["attention_mask"][index]),
-            "raw_text": text,
+            "raw_text": sliced.raw_text,
+            "raw_token_ids": list(sliced.raw_token_ids),
+            "action_text": sliced.action_text,
+            "action_token_ids": list(sliced.action_token_ids),
+            "action_boundary": sliced.boundary,
+            "tail_dropped": sliced.tail_dropped,
             "parsed_action": parsed_record(parsed),
-            "generation_events": [{"turn": 0, "text": text}],
+            "thinking": thinking_record(sliced.action_text),
+            "generation_events": [{
+                "turn": 0,
+                "text": sliced.action_text,
+                "raw_text": sliced.raw_text,
+                "raw_token_ids": list(sliced.raw_token_ids),
+                "action_token_ids": list(sliced.action_token_ids),
+                "tail_dropped": sliced.tail_dropped,
+                "generation_context": "initial_question",
+            }],
             "retrieval_events": [],
             "final_answer": parsed.content if parsed.action == "answer" else None,
         })
@@ -307,7 +407,7 @@ def manager_records(actor: Any, batch: Any, tokenizer: Any, sample_ids: list[str
         max_start_length=1024,
         max_prompt_length=4096,
         max_response_length=500,
-        max_obs_length=384,
+        max_obs_length=500,
         num_gpus=1,
         no_think_rl=False,
         search_url=retriever_url,
@@ -328,15 +428,29 @@ def manager_records(actor: Any, batch: Any, tokenizer: Any, sample_ids: list[str
                if "final_answer" in output.non_tensor_batch else [None] * len(sample_ids))
     records = []
     for index, events in enumerate(generations):
-        first_text = events[0]["text"] if events else ""
+        if not events:
+            raise ValueError("native manager produced no generation event")
+        first = events[0]
+        first_text = first["text"]
+        raw_text = first.get("raw_text", first_text)
+        raw_ids = first.get("raw_token_ids")
+        action_ids = first.get("action_token_ids")
+        if not _valid_token_ids(raw_ids) or not _valid_token_ids(action_ids):
+            raise ValueError("native manager omitted raw/action token evidence")
         parsed = parse_action(first_text, protocol)
         records.append({
             "sample_id": sample_ids[index],
             "group_slot": slots[index],
             "mode": "native_manager" if protocol == "qwen35_native" else "legacy_manager",
             "prompt_token_sha256": prompt_hashes[index],
-            "raw_text": first_text,
+            "raw_text": raw_text,
+            "raw_token_ids": list(raw_ids),
+            "action_text": first_text,
+            "action_token_ids": list(action_ids),
+            "action_boundary": str(first.get("boundary", "unknown")),
+            "tail_dropped": bool(first.get("tail_dropped", False)),
             "parsed_action": parsed_record(parsed),
+            "thinking": thinking_record(first_text),
             "generation_events": events,
             "retrieval_events": retrievals[index],
             "final_answer": answers[index],
@@ -344,7 +458,88 @@ def manager_records(actor: Any, batch: Any, tokenizer: Any, sample_ids: list[str
     return records
 
 
-def run_real(args: argparse.Namespace) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+def run_environment_replay(tokenizer: Any, batch: Any, raw_messages: list[Any],
+                           sample_id: str, retriever_url: str) -> dict[str, Any]:
+    """Inject one fixed native action through the real manager environment."""
+    import torch
+    from verl import DataProto
+
+    from search_r1.llm_agent.generation import (GenerationConfig,
+                                                LLMGenerationManager)
+    from search_r1.llm_agent.tool_protocol import QWEN35_NATIVE, parse_action
+
+    config = GenerationConfig(
+        max_turns=4,
+        max_start_length=1024,
+        max_prompt_length=4096,
+        max_response_length=500,
+        max_obs_length=500,
+        num_gpus=1,
+        no_think_rl=False,
+        search_url=retriever_url,
+        topk=3,
+        tool_protocol=QWEN35_NATIVE,
+    )
+    manager = LLMGenerationManager(tokenizer, None, config, is_validation=True)
+    one = DataProto(
+        batch=batch.batch[:1],
+        non_tensor_batch={name: values[:1]
+                          for name, values in batch.non_tensor_batch.items()},
+        meta_info=batch.meta_info.copy(),
+    )
+    conversations = manager._prepare_native_conversations(one, raw_messages[:1])
+    action_text = (
+        "Use the external evidence.</think>\n"
+        "<tool_call>\n<function=search>\n<parameter=query>\n"
+        "Barack Obama\n</parameter>\n</function>\n</tool_call>"
+    )
+    parsed = parse_action(action_text, QWEN35_NATIVE)
+    if not parsed.valid or parsed.action != "search":
+        raise ValueError("E0 fixed native search action is not parseable")
+    observations, dones, valid, executed = manager.execute_predictions(
+        [action_text], tokenizer.pad_token, active_mask=[True], do_search=True)
+    retrievals = manager._last_execution_retrieval_events
+    action_ids = tokenizer(action_text, add_special_tokens=False,
+                           return_tensors="pt")["input_ids"].to(
+                               batch.batch["input_ids"].device)
+    suffix_ids, visible = manager._process_native_followups(
+        conversations, action_ids, [action_text], [parsed], observations,
+        torch.tensor([True], device=action_ids.device), device=action_ids.device)
+    empty = action_ids[:, :0]
+    right = manager._update_right_side(
+        {"responses": empty, "responses_with_info_mask": empty},
+        action_ids, suffix_ids)
+    attention = manager.tensor_fn.create_attention_mask(right["responses"])
+    policy = manager.tensor_fn.create_attention_mask(
+        right["responses_with_info_mask"])
+    policy_count = int(policy.sum().item())
+    total_count = int(attention.sum().item())
+    docs = retrievals[0]["documents"] if retrievals and retrievals[0] else []
+    return {
+        "sample_id": sample_id,
+        "query": parsed.content,
+        "action_text": action_text,
+        "requested_search_count": 1,
+        "executed_search_count": int(executed[0]),
+        "retrieval_event_count": len([item for item in retrievals if item]),
+        "nonempty_tool_response_count": int(bool(visible[0].strip())),
+        "retrieved_document_count": len(docs),
+        "visible_tool_response": visible[0],
+        "tool_role_rendered": bool(conversations[0].messages
+                                   and conversations[0].messages[-1].get("role") == "tool"),
+        "policy_token_count": policy_count,
+        "tool_response_token_count": total_count - len(action_ids[0]),
+        "tool_response_policy_token_count": max(0, policy_count - len(action_ids[0])),
+        "info_mask_consistent": bool(
+            valid == [1] and dones == [0]
+            and policy_count == len(action_ids[0])
+            and total_count > policy_count),
+        "scientific_metric": False,
+    }
+
+
+def run_real(args: argparse.Namespace) -> tuple[
+        dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
     import torch
     from omegaconf import OmegaConf
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -354,10 +549,6 @@ def run_real(args: argparse.Namespace) -> tuple[dict[str, Any], list[dict[str, A
         raise ValueError("the real G0 probe requires CUDA")
     native_rows = load_probe_rows(args.native_data, args.native_manifest,
                                   "probe_g0", EXPECTED_QUESTIONS)
-    legacy_rows = load_probe_rows(args.legacy_data, args.legacy_manifest,
-                                  "probe", 64)[:EXPECTED_QUESTIONS]
-    if [item[0] for item in native_rows] != [item[0] for item in legacy_rows]:
-        raise ValueError("native and legacy G0 sample IDs differ")
     tokenizer = AutoTokenizer.from_pretrained(args.model_dir, local_files_only=True)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
@@ -382,28 +573,29 @@ def run_real(args: argparse.Namespace) -> tuple[dict[str, Any], list[dict[str, A
     records.extend(manager_records(actor, native_batch, tokenizer, sample_ids, slots,
                                    native_messages, args.seed, "qwen35_native",
                                    args.retriever_url))
-    legacy_batch, legacy_ids, legacy_slots, legacy_messages = make_batch(
-        tokenizer, legacy_rows, False, device)
-    records.extend(manager_records(actor, legacy_batch, tokenizer, legacy_ids,
-                                   legacy_slots, legacy_messages, args.seed,
-                                   "legacy_xml", args.retriever_url))
+    replay_batch, _, _, replay_messages = make_batch(
+        tokenizer, native_rows, True, device)
+    environment_replay = run_environment_replay(
+        tokenizer, replay_batch, replay_messages, native_rows[0][0],
+        args.retriever_url)
     resolved = {
         "schema": SCHEMA,
         "schema_version": SCHEMA_VERSION,
         "checkpoint_digest": args.checkpoint_digest,
+        "prompt_version": PROMPT_VERSION,
         "model_tree_sha256": sha256_tree(args.model_dir),
         "seed": args.seed,
         "questions": EXPECTED_QUESTIONS,
         "group_size": GROUP_SIZE,
-        "max_turns": 4,
+        "max_action_budget": 4,
         "max_start_length": 1024,
         "max_prompt_length": 4096,
         "max_response_length": 500,
-        "max_obs_length": 384,
+        "max_obs_length": 500,
         "retriever_topk": 3,
         "sampling": SAMPLING,
     }
-    return resolved, records
+    return resolved, records, environment_replay
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -411,8 +603,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-dir", type=Path)
     parser.add_argument("--native-data", type=Path)
     parser.add_argument("--native-manifest", type=Path)
-    parser.add_argument("--legacy-data", type=Path)
-    parser.add_argument("--legacy-manifest", type=Path)
     parser.add_argument("--retriever-url", default="http://127.0.0.1:8000/retrieve")
     parser.add_argument("--checkpoint-digest", required=True)
     parser.add_argument("--seed", type=int, default=42)
@@ -429,17 +619,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.seed != 42:
             raise ValueError("G0 seed is fixed at 42")
         if args.fixture_input is not None:
-            resolved, records = load_fixture(args.fixture_input, args.checkpoint_digest)
+            resolved, records, environment_replay = load_fixture(
+                args.fixture_input, args.checkpoint_digest)
         else:
-            required = (args.model_dir, args.native_data, args.native_manifest,
-                        args.legacy_data, args.legacy_manifest)
+            required = (args.model_dir, args.native_data, args.native_manifest)
             if any(path is None for path in required):
-                raise ValueError("real G0 requires model and native/legacy data manifests")
+                raise ValueError("real G0 requires model and native data manifest")
             for path in required:
                 if not path.exists() or path.is_symlink():
                     raise ValueError(f"G0 input is missing or symlinked: {path}")
-            resolved, records = run_real(args)
-        publish(args.output_dir, resolved, records, args.checkpoint_digest)
+            resolved, records, environment_replay = run_real(args)
+        publish(args.output_dir, resolved, records, environment_replay,
+                args.checkpoint_digest)
     except (OSError, ValueError, json.JSONDecodeError) as error:
         print(f"Qwen native protocol probe error: {error}", file=sys.stderr)
         return 1

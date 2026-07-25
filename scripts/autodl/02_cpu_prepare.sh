@@ -19,7 +19,7 @@ DATA_ROOT="$PROJECT_ROOT/data"
 SMALL_DATA_DIR="$DATA_ROOT/nq_small"
 SEARCH_GATE_DATA_DIR="$DATA_ROOT/search_opportunity_gate"
 SEARCH_MIX_DATA_DIR="$DATA_ROOT/search_mix"
-QWEN_NATIVE_DATA_DIR="$DATA_ROOT/search_mix_qwen35_native_v2"
+QWEN_NATIVE_DATA_DIR="$DATA_ROOT/search_mix_qwen35_native_v3"
 BM25_ROOT="$DATA_ROOT/wiki-18-bm25-index"
 CORPUS_SOURCE_ROOT="$DATA_ROOT/wiki-18-corpus-source"
 CORPUS_ROOT="$DATA_ROOT/wiki-18-corpus"
@@ -409,6 +409,7 @@ cpu_action() {
     local config_response_length eval_group_size
     local trace_digest_placeholder trace_checkpoint_digest trace_parent_digest trace_output trace_stage
     local -a command_args previous_handoff_args search_mix_handoff_args qwen_native_handoff_args
+    local -a native_handoff_contract_args native_handoff_verify_args
     commit="$(expected_commit)"
     verify_checkout "$commit"
     config_manifest_dir="$MANIFEST_DIR"
@@ -741,6 +742,7 @@ from transformers import AutoTokenizer
 from search_r1.llm_agent.tool_protocol import (
     QWEN35_CHAT_TEMPLATE_SHA256,
     QWEN35_NATIVE,
+    QWEN35_RETRY_PROMPT,
     Qwen35Conversation,
     parse_action,
     qwen35_messages,
@@ -762,34 +764,77 @@ messages = qwen35_messages("Who wrote Hamlet?")
 prompt_ids = tokenizer(render_qwen35_prompt(tokenizer, messages),
                        add_special_tokens=False)["input_ids"]
 direct_prompt_ids = tokenizer.apply_chat_template(
-    messages, tools=qwen35_tools(), enable_thinking=False,
+    messages, tools=qwen35_tools(), enable_thinking=True,
     add_generation_prompt=True, tokenize=True, return_dict=False)
 if direct_prompt_ids != prompt_ids:
     raise SystemExit("Qwen native rendered-string and direct template tokens differ")
 conversation = Qwen35Conversation(tokenizer, messages, prompt_ids)
 
-search_text = (
-    "  <tool_call><function=search><parameter=query>Hamlet author"
-    "</parameter></function></tool_call>  ")
+def native_search(reasoning, query):
+    return (
+        f"{reasoning}\n</think>\n\n"
+        "<tool_call>\n<function=search>\n<parameter=query>\n"
+        f"{query}\n</parameter>\n</function>\n</tool_call>"
+    )
+
+def assert_roundtrip(value, expected_prefix, label):
+    if value.prompt_token_ids[:len(expected_prefix)] != expected_prefix:
+        raise SystemExit(f"{label} did not preserve cumulative sampled tokens")
+    rerendered = tokenizer(
+        render_qwen35_prompt(tokenizer, value.messages),
+        add_special_tokens=False)["input_ids"]
+    if rerendered != value.prompt_token_ids:
+        raise SystemExit(f"{label} cumulative token roundtrip differs")
+
+search_text = native_search("I should verify the author.", "Hamlet author")
 search_ids = tokenizer(search_text, add_special_tokens=False)["input_ids"]
 search_prefix = list(conversation.prompt_token_ids) + list(search_ids)
 search = conversation.append_followup(
     search_text, parse_action(search_text, QWEN35_NATIVE),
-    "  Hamlet was written by William Shakespeare.  ", 384,
+    "  Hamlet was written by William Shakespeare.  ", 500,
     response_token_ids=search_ids)
-if (conversation.prompt_token_ids[:len(search_prefix)] != search_prefix
-        or not search.token_ids or not search.visible_observation):
+if not search.token_ids or not search.visible_observation:
     raise SystemExit("Qwen native search wrapper did not preserve sampled tokens")
+assert_roundtrip(conversation, search_prefix, "first search/tool response")
 
-invalid_text = '  {"name":"search","arguments":{"query":"Hamlet author"}}  '
+second_text = native_search("I need a second source.", "Shakespeare Hamlet")
+second_ids = tokenizer(second_text, add_special_tokens=False)["input_ids"]
+second_prefix = list(conversation.prompt_token_ids) + list(second_ids)
+second = conversation.append_followup(
+    second_text, parse_action(second_text, QWEN35_NATIVE),
+    "  Shakespeare is credited as the author of Hamlet.  ", 500,
+    response_token_ids=second_ids)
+if not second.token_ids or not second.visible_observation:
+    raise SystemExit("Qwen native second search wrapper is empty")
+assert_roundtrip(conversation, second_prefix, "second search/tool response")
+
+retry_conversation = Qwen35Conversation(tokenizer, messages, prompt_ids)
+retry_search_ids = tokenizer(search_text,
+                             add_special_tokens=False)["input_ids"]
+retry_search_prefix = (list(retry_conversation.prompt_token_ids)
+                       + list(retry_search_ids))
+retry_conversation.append_followup(
+    search_text, parse_action(search_text, QWEN35_NATIVE),
+    "  Hamlet was written by William Shakespeare.  ", 500,
+    response_token_ids=retry_search_ids)
+assert_roundtrip(retry_conversation, retry_search_prefix,
+                 "search before invalid retry")
+
+invalid_text = (
+    "I used the wrong action syntax.\n</think>\n\n"
+    '{"name":"search","arguments":{"query":"Hamlet author"}}')
 invalid_ids = tokenizer(invalid_text, add_special_tokens=False)["input_ids"]
-invalid_prefix = list(conversation.prompt_token_ids) + list(invalid_ids)
-retry = conversation.append_followup(
-    invalid_text, parse_action(invalid_text, QWEN35_NATIVE), "", 384,
+invalid_prefix = (list(retry_conversation.prompt_token_ids)
+                  + list(invalid_ids))
+retry = retry_conversation.append_followup(
+    invalid_text, parse_action(invalid_text, QWEN35_NATIVE), "", 500,
     response_token_ids=invalid_ids)
-if (conversation.prompt_token_ids[:len(invalid_prefix)] != invalid_prefix
-        or not retry.token_ids):
+if (not retry.token_ids
+        or retry_conversation.messages[-1] != {
+            "role": "user", "content": QWEN35_RETRY_PROMPT}):
     raise SystemExit("Qwen native retry wrapper did not preserve sampled tokens")
+assert_roundtrip(retry_conversation, invalid_prefix,
+                 "search/invalid user retry")
 PY
         # New output was fully verified before its atomic publication.
         if [[ "$build_qwen_native" != 1 ]]; then
@@ -802,6 +847,13 @@ PY
                 --eval-parquet "$SMALL_DATA_DIR/test_128.parquet" \
                 --expected-tool-protocol qwen35_native
         fi
+        "$train_python" "$CHECKOUT_DIR/scripts/data_process/search_mix.py" \
+            validate-native-evidence \
+            --manifest "$QWEN_NATIVE_DATA_DIR/manifest.json" \
+            --source-manifest "$SEARCH_MIX_DATA_DIR/manifest.json" \
+            --model-dir "$MODEL_DIR" \
+            --eval-catalog "$SEARCH_GATE_DATA_DIR/catalog.jsonl" \
+            --eval-parquet "$SMALL_DATA_DIR/test_128.parquet"
     fi
 
     "$train_python" - "$MODEL_DIR" "$SMALL_DATA_DIR" <<'PY'
@@ -986,8 +1038,7 @@ PY
 
     if [[ "$seal_qwen_native" == 1 ]]; then
         for spec in \
-            "qwen_native_g1|$QWEN_NATIVE_DATA_DIR/probe_forced_16.parquet|2" \
-            "qwen_native_g2|$QWEN_NATIVE_DATA_DIR/probe_autonomous_32.parquet|3" \
+            "qwen_native_g1|$QWEN_NATIVE_DATA_DIR/probe_autonomous_16.parquet|2" \
             "qwen_native_g3|$QWEN_NATIVE_DATA_DIR/probe_multi_64.parquet|5"; do
             IFS='|' read -r variant eval_data_file eval_group_size <<<"$spec"
             AUTODL_CONFIG_ONLY=1 \
@@ -1007,7 +1058,13 @@ PY
                 eval "$variant" "$MODEL_DIR" \
                 >"$config_manifest_dir/config-2gpu-$variant-eval.yaml"
         done
-        for variant in qwen_native_b qwen_native_c; do
+        for variant in \
+            qwen_native_a_val qwen_native_r_val \
+            qwen_native_b_val qwen_native_c_val \
+            qwen_native_a_nq_test qwen_native_r_nq_test \
+            qwen_native_b_nq_test qwen_native_c_nq_test \
+            qwen_native_a_multihop qwen_native_r_multihop \
+            qwen_native_b_multihop qwen_native_c_multihop; do
             AUTODL_CONFIG_ONLY=1 \
                 AUTODL_ROOT="$PROJECT_ROOT" \
                 GPU_COUNT=2 \
@@ -1068,11 +1125,20 @@ manifest_dir, data_dir, model_dir, parent_placeholder, trace_placeholder = map(
     Path, sys.argv[1:]
 )
 specs = {
-    "qwen_native_g1": ("probe_forced_16.parquet", 2, model_dir),
-    "qwen_native_g2": ("probe_autonomous_32.parquet", 3, model_dir),
+    "qwen_native_g1": ("probe_autonomous_16.parquet", 2, model_dir),
     "qwen_native_g3": ("probe_multi_64.parquet", 5, model_dir),
-    "qwen_native_b": ("val_128.parquet", 1, parent_placeholder),
-    "qwen_native_c": ("val_128.parquet", 1, parent_placeholder),
+    "qwen_native_a_val": ("val_128.parquet", 1, model_dir),
+    "qwen_native_r_val": ("val_128.parquet", 1, parent_placeholder),
+    "qwen_native_b_val": ("val_128.parquet", 1, parent_placeholder),
+    "qwen_native_c_val": ("val_128.parquet", 1, parent_placeholder),
+    "qwen_native_a_nq_test": ("nq_test_128_native_v3.parquet", 1, model_dir),
+    "qwen_native_r_nq_test": ("nq_test_128_native_v3.parquet", 1, parent_placeholder),
+    "qwen_native_b_nq_test": ("nq_test_128_native_v3.parquet", 1, parent_placeholder),
+    "qwen_native_c_nq_test": ("nq_test_128_native_v3.parquet", 1, parent_placeholder),
+    "qwen_native_a_multihop": ("multihop_eval_256_native_v3.parquet", 1, model_dir),
+    "qwen_native_r_multihop": ("multihop_eval_256_native_v3.parquet", 1, parent_placeholder),
+    "qwen_native_b_multihop": ("multihop_eval_256_native_v3.parquet", 1, parent_placeholder),
+    "qwen_native_c_multihop": ("multihop_eval_256_native_v3.parquet", 1, parent_placeholder),
 }
 for variant, (filename, group_size, checkpoint) in specs.items():
     path = manifest_dir / f"config-2gpu-{variant}-eval.yaml"
@@ -1088,6 +1154,7 @@ for variant, (filename, group_size, checkpoint) in specs.items():
             or config.data.eval_group_size != group_size
             or config.data.val_batch_size != 8
             or config.data.max_response_length != 500
+            or config.data.max_obs_length != 500
             or config.data.max_prompt_length != 4096
             or Path(config.actor_rollout_ref.model.path) != checkpoint
             or float(rollout.temperature) != 1.0
@@ -1096,6 +1163,7 @@ for variant, (filename, group_size, checkpoint) in specs.items():
             or float(rollout.min_p) != 0.0
             or float(rollout.presence_penalty) != 0.0
             or float(rollout.repetition_penalty) != 1.0
+            or rollout.do_sample != (group_size > 1)
             or config.trainer.n_gpus_per_node != 2
             or config.trainer.val_only is not True
             or Path(trace_output) != trace_placeholder
@@ -1122,7 +1190,7 @@ for variant, (steps, model_path, cost_lambda, reward_mode) in train_specs.items(
     trace_checkpoint = config.trainer.get("trace_checkpoint_digest", None)
     trace_parent = config.trainer.get("trace_parent_checkpoint_digest", None)
     if (config.tool_protocol != "qwen35_native"
-            or config.qwen35_prompt_version != "qwen35-native-search-v2-answer-tag"
+            or config.qwen35_prompt_version != "qwen35-native-search-v3-original-aligned"
             or config.trainer.native_training_variant != variant
             or Path(config.data.train_files) != data_dir / "train_512.parquet"
             or Path(config.data.val_files) != data_dir / "val_128.parquet"
@@ -1133,7 +1201,7 @@ for variant, (steps, model_path, cost_lambda, reward_mode) in train_specs.items(
             or config.data.max_response_length != 500
             or config.data.max_prompt_length != 4096
             or config.data.max_start_length != 1024
-            or config.data.max_obs_length != 384
+            or config.data.max_obs_length != 500
             or rollout.n_agent != 5
             or float(rollout.temperature) != 1.0
             or float(rollout.top_p) != 1.0
@@ -1141,6 +1209,7 @@ for variant, (steps, model_path, cost_lambda, reward_mode) in train_specs.items(
             or float(rollout.min_p) != 0.0
             or float(rollout.presence_penalty) != 0.0
             or float(rollout.repetition_penalty) != 1.0
+            or rollout.do_sample is not True
             or config.actor_rollout_ref.actor.ppo_mini_batch_size != 40
             or config.actor_rollout_ref.actor.ppo_micro_batch_size != 2
             or config.actor_rollout_ref.rollout.log_prob_micro_batch_size != 2
@@ -1152,6 +1221,8 @@ for variant, (steps, model_path, cost_lambda, reward_mode) in train_specs.items(
             or config.actor_rollout_ref.actor.state_masking is not True
             or config.trainer.n_gpus_per_node != 2
             or config.max_turns != 4
+            or config.max_turns * (config.data.max_response_length
+                                   + config.data.max_obs_length) > 4096
             or config.retriever.topk != 3
             or config.trainer.total_training_steps != steps
             or config.trainer.save_freq != steps
@@ -1381,18 +1452,51 @@ PY
         )
     fi
     qwen_native_handoff_args=()
+    native_handoff_contract_args=()
+    native_handoff_verify_args=()
     if [[ "$seal_qwen_native" == 1 ]]; then
         qwen_native_handoff_args+=(
             --data "$QWEN_NATIVE_DATA_DIR"
             --extra-file "$config_manifest_dir/config-2gpu-qwen_native_g1-eval.yaml"
-            --extra-file "$config_manifest_dir/config-2gpu-qwen_native_g2-eval.yaml"
             --extra-file "$config_manifest_dir/config-2gpu-qwen_native_g3-eval.yaml"
-            --extra-file "$config_manifest_dir/config-2gpu-qwen_native_b-eval.yaml"
-            --extra-file "$config_manifest_dir/config-2gpu-qwen_native_c-eval.yaml"
+            --extra-file "$config_manifest_dir/config-2gpu-qwen_native_a_val-eval.yaml"
+            --extra-file "$config_manifest_dir/config-2gpu-qwen_native_r_val-eval.yaml"
+            --extra-file "$config_manifest_dir/config-2gpu-qwen_native_b_val-eval.yaml"
+            --extra-file "$config_manifest_dir/config-2gpu-qwen_native_c_val-eval.yaml"
+            --extra-file "$config_manifest_dir/config-2gpu-qwen_native_a_nq_test-eval.yaml"
+            --extra-file "$config_manifest_dir/config-2gpu-qwen_native_r_nq_test-eval.yaml"
+            --extra-file "$config_manifest_dir/config-2gpu-qwen_native_b_nq_test-eval.yaml"
+            --extra-file "$config_manifest_dir/config-2gpu-qwen_native_c_nq_test-eval.yaml"
+            --extra-file "$config_manifest_dir/config-2gpu-qwen_native_a_multihop-eval.yaml"
+            --extra-file "$config_manifest_dir/config-2gpu-qwen_native_r_multihop-eval.yaml"
+            --extra-file "$config_manifest_dir/config-2gpu-qwen_native_b_multihop-eval.yaml"
+            --extra-file "$config_manifest_dir/config-2gpu-qwen_native_c_multihop-eval.yaml"
             --extra-file "$config_manifest_dir/config-2gpu-qwen-native-smoke-train.yaml"
             --extra-file "$config_manifest_dir/config-2gpu-qwen-native-reproduce-train.yaml"
             --extra-file "$config_manifest_dir/config-2gpu-qwen-native-control-train.yaml"
             --extra-file "$config_manifest_dir/config-2gpu-qwen-native-cost_aware_gated-train.yaml"
+        )
+        native_handoff_contract_args+=(
+            --native-prompt-version qwen35-native-search-v3-original-aligned
+            --native-thinking-enabled
+            --max-action-budget 4
+            --selection-observation-length 384
+            --rollout-observation-length 500
+        )
+        native_handoff_verify_args+=(
+            --expect-native-prompt-version qwen35-native-search-v3-original-aligned
+            --expect-native-thinking-enabled
+            --expect-max-action-budget 4
+            --expect-selection-observation-length 384
+            --expect-rollout-observation-length 500
+            --require-artifact data/search_mix_qwen35_native_v3/manifest.json
+            --require-artifact data/search_mix_qwen35_native_v3/train_512.parquet
+            --require-artifact data/search_mix_qwen35_native_v3/val_128.parquet
+            --require-artifact data/search_mix_qwen35_native_v3/probe_g0_8.parquet
+            --require-artifact data/search_mix_qwen35_native_v3/probe_autonomous_16.parquet
+            --require-artifact data/search_mix_qwen35_native_v3/probe_multi_64.parquet
+            --require-artifact data/search_mix_qwen35_native_v3/nq_test_128_native_v3.parquet
+            --require-artifact data/search_mix_qwen35_native_v3/multihop_eval_256_native_v3.parquet
         )
     fi
 
@@ -1446,13 +1550,15 @@ PY
         --extra-file "$config_manifest_dir/config-2gpu-search_opportunity-eval.yaml" \
         --python-version "$python_version" \
         --torch-version "$torch_version" \
+        "${native_handoff_contract_args[@]}" \
         --output "$candidate_handoff"
     "$train_python" "$CHECKOUT_DIR/scripts/autodl/handoff.py" verify \
         --root "$PROJECT_ROOT" \
         --commit "$commit" \
         --python-version "$python_version" \
         --torch-version "$torch_version" \
-        --manifest "$candidate_handoff"
+        --manifest "$candidate_handoff" \
+        "${native_handoff_verify_args[@]}"
     verify_checkout "$commit"
 
     handoff_digest="$(cut -d' ' -f1 "$candidate_handoff.sha256")"
@@ -1468,7 +1574,8 @@ PY
         --commit "$commit" \
         --python-version "$python_version" \
         --torch-version "$torch_version" \
-        --manifest "$HANDOFF"
+        --manifest "$HANDOFF" \
+        "${native_handoff_verify_args[@]}"
     handoff_digest="$(sha256sum -- "$HANDOFF" | cut -d' ' -f1)"
     [[ "$(tr -d '\r\n' <"$MANIFEST_DIR/cpu.ok")" == "$handoff_digest" ]] || {
         printf 'Published cpu.ok does not match the canonical handoff.\n' >&2

@@ -133,7 +133,7 @@ def test_native_uses_qwen_template_and_always_returns_raw_prompt(monkeypatch):
         "messages": chat.tolist(),
         "kwargs": {
             "tools": qwen35_tools(),
-            "enable_thinking": False,
+            "enable_thinking": True,
             "add_generation_prompt": True,
             "tokenize": False,
         },
@@ -149,8 +149,8 @@ def test_native_uses_qwen_template_and_always_returns_raw_prompt(monkeypatch):
 
 def test_native_raw_prompts_remain_batch_aligned(monkeypatch):
     chats = [
-        np.array(qwen35_messages(f"Item {index}?", force_search=bool(index)),
-                 dtype=object) for index in range(2)
+        np.array(qwen35_messages(f"Item {index}?"), dtype=object)
+        for index in range(2)
     ]
     dataset = _dataset(
         monkeypatch,
@@ -183,8 +183,11 @@ def test_dataset_rejects_unknown_tool_protocol_before_loading(monkeypatch):
 
 def test_native_rejects_noncanonical_message_shape(monkeypatch):
     chat = np.array([{
+        "role": "system",
+        "content": "custom policy",
+    }, {
         "role": "user",
-        "content": "Question: Missing system message?\n",
+        "content": qwen35_messages("Question?")[0]["content"],
     }],
                     dtype=object)
     dataset = _dataset(
@@ -194,5 +197,5 @@ def test_native_rejects_noncanonical_message_shape(monkeypatch):
         tool_protocol=QWEN35_NATIVE,
     )
 
-    with pytest.raises(ProtocolError, match="system and user messages"):
+    with pytest.raises(ProtocolError, match="exactly one user message"):
         dataset[0]

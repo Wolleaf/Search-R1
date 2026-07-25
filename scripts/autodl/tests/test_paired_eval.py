@@ -11,6 +11,7 @@ from argparse import Namespace
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "paired_eval.py"
@@ -21,6 +22,8 @@ SPEC.loader.exec_module(PAIRED_EVAL)
 
 FORMAL_CONTROL_DIGEST = "a" * 64
 FORMAL_COST_DIGEST = "b" * 64
+FORMAL_PARENT_DIGEST = "d" * 64
+FORMAL_REPRODUCED_DIGEST = "e" * 64
 
 
 class PairedEvalTest(unittest.TestCase):
@@ -129,7 +132,10 @@ class PairedEvalTest(unittest.TestCase):
             json.dumps(
                 {
                     "schema_version": 3,
-                    "prompt_contract": {"tool_protocol": "qwen35_native"},
+                    "prompt_contract": {
+                        "tool_protocol": "qwen35_native",
+                        "prompt_version": PAIRED_EVAL.V2_PROMPT_VERSION,
+                    },
                     "artifacts": {
                         "catalog": {
                             "file": "catalog.jsonl",
@@ -161,6 +167,8 @@ class PairedEvalTest(unittest.TestCase):
         data_manifest: Path | None = None,
         control_digest: str | None = None,
         cost_digest: str | None = None,
+        eval_artifact: str | None = None,
+        expected_rows: int = 128,
     ) -> Namespace:
         return Namespace(
             control=paths["control"],
@@ -168,14 +176,136 @@ class PairedEvalTest(unittest.TestCase):
             cost_aware_gated=paths["cost_aware_gated"],
             catalog=catalog,
             data_manifest=data_manifest,
+            eval_artifact=eval_artifact,
             expected_control_checkpoint_digest=control_digest,
             expected_cost_aware_gated_checkpoint_digest=cost_digest,
             output_dir=output_dir,
-            expected_rows=128,
+            expected_rows=expected_rows,
             cost_lambda=0.10,
             max_searches=4,
             utility_tolerance=1e-6,
         )
+
+    def make_v3_formal_inputs(
+        self, root: Path, artifact_key: str = "nq_test_eval"
+    ) -> tuple[dict[str, Path], Path, dict[object, dict[str, object]]]:
+        spec = PAIRED_EVAL.V3_EVAL_ARTIFACTS[artifact_key]
+        rows = int(spec["rows"])
+        paths = {
+            "control": root / "control-v3.jsonl",
+            "cost_aware_old": root / "unused-old-v3.jsonl",
+            "cost_aware_gated": root / "cost-v3.jsonl",
+        }
+        stage_suffix = str(spec["stage_suffix"])
+        catalog = {}
+        sample_ids = []
+        records_by_role = {"control": [], "cost_aware_gated": []}
+        for index in range(rows):
+            sample_id = f"fixture:test:{index}"
+            sample_ids.append(sample_id)
+            question = f"Question {index}?"
+            gold = f"gold-{index}"
+            catalog[PAIRED_EVAL._sample_key(sample_id)] = {
+                "sample_id": sample_id,
+                "question": question,
+                "golden_answers": [gold],
+            }
+            for role, prefix in (("control", "b"), ("cost_aware_gated", "c")):
+                em = int((index + (role == "cost_aware_gated")) % 4 != 0)
+                searches = (index + (role == "cost_aware_gated")) % 5
+                clipped = index % 31 == 0
+                invalid_count = int(index % 2 == 1 and searches < 4)
+                turns = []
+                for turn in range(4):
+                    if turn < searches:
+                        action = "search"
+                    elif turn == searches and invalid_count:
+                        action = "invalid"
+                    else:
+                        action = "answer"
+                    turns.append({
+                        "turn": turn,
+                        "think": "fixture",
+                        "action": action,
+                        "search_query": f"query-{turn}" if action == "search" else None,
+                        "answer": gold if action == "answer" else None,
+                        "observation": "fixture observation" if action == "search" else None,
+                        "invalid_text": ["invalid"] if action == "invalid" else [],
+                        "valid_action": action != "invalid",
+                    })
+                raw_generations = [{
+                    "turn": turn,
+                    "raw_text": "x",
+                    "raw_token_ids": [turn + 1],
+                    "raw_token_count": 1,
+                    "action_text": "x",
+                    "action_token_ids": [turn + 1],
+                    "action_token_count": 1,
+                    "boundary": "length" if clipped and turn == 0 else "eos",
+                    "tail_dropped": False,
+                    "raw_clipped": clipped and turn == 0,
+                } for turn in range(4)]
+                record = self.record(
+                    f"qwen_native_{prefix}_{stage_suffix}",
+                    sample_id,
+                    em,
+                    searches,
+                    question=question,
+                )
+                record.update({
+                    "gold_answers": [gold],
+                    "extracted_answer": gold if em else f"wrong-{role}-{index}",
+                    "schema": "search-r1.trajectory",
+                    "schema_version": 3,
+                    "record_type": "eval",
+                    "record_id": f"{role}-{sample_id}",
+                    "run_id": f"run-{role}",
+                    "source_index": index,
+                    "group_uid": sample_id,
+                    "group_slot": 0,
+                    "group_size": 1,
+                    "response_tokens": 80 + index,
+                    "response_clipped": clipped,
+                    "turns_used": 4,
+                    "invalid_action_count": invalid_count,
+                    "generation_clipped_count": int(clipped),
+                    "max_action_budget": 4,
+                    "action_count": 4,
+                    "raw_generations": raw_generations,
+                    "policy_token_count": 4,
+                    "observation_token_count": 50,
+                    "observation_policy_token_count": 0,
+                    "info_mask_consistent": True,
+                    "turns": turns,
+                })
+                records_by_role[role].append(record)
+        for role in records_by_role:
+            self.write_jsonl(paths[role], records_by_role[role])
+
+        artifact_path = root / str(spec["file"])
+        artifact_path.write_bytes(f"sealed-{artifact_key}".encode())
+        manifest = root / "manifest.json"
+        manifest.write_text(json.dumps({
+            "schema_version": 4,
+            "prompt_contract": {
+                "tool_protocol": "qwen35_native",
+                "prompt_version": PAIRED_EVAL.V3_PROMPT_VERSION,
+            },
+            "tokenizer": {
+                "revision": "revision-fixture",
+                "selection_observation_length": 384,
+                "rollout_observation_length": 500,
+            },
+            "artifacts": {
+                artifact_key: {
+                    "file": spec["file"],
+                    "rows": rows,
+                    "sha256": hashlib.sha256(artifact_path.read_bytes()).hexdigest(),
+                    "sample_ids": sample_ids,
+                },
+            },
+        }) + "\n", encoding="utf-8")
+        return paths, manifest, catalog
 
     def formal_args(
         self,
@@ -193,6 +323,57 @@ class PairedEvalTest(unittest.TestCase):
             control_digest=FORMAL_CONTROL_DIGEST,
             cost_digest=FORMAL_COST_DIGEST,
         )
+
+    def capability_args(
+        self,
+        paths: dict[str, Path],
+        output_dir: Path,
+        manifest: Path,
+        artifact_key: str,
+    ) -> Namespace:
+        return Namespace(
+            control=None,
+            cost_aware_old=None,
+            cost_aware_gated=None,
+            parent=paths["parent"],
+            reproduced=paths["reproduced"],
+            catalog=None,
+            data_manifest=manifest,
+            eval_artifact=artifact_key,
+            expected_control_checkpoint_digest=None,
+            expected_cost_aware_gated_checkpoint_digest=None,
+            expected_parent_checkpoint_digest=FORMAL_PARENT_DIGEST,
+            expected_reproduced_checkpoint_digest=FORMAL_REPRODUCED_DIGEST,
+            output_dir=output_dir,
+            expected_rows=int(PAIRED_EVAL.V3_EVAL_ARTIFACTS[artifact_key]["rows"]),
+            cost_lambda=0.10,
+            max_searches=4,
+            utility_tolerance=1e-6,
+        )
+
+    def make_v3_capability_inputs(
+        self, root: Path, artifact_key: str
+    ) -> tuple[dict[str, Path], Path, dict[object, dict[str, object]]]:
+        efficiency, manifest, catalog = self.make_v3_formal_inputs(root, artifact_key)
+        paths = {
+            "parent": efficiency["control"],
+            "reproduced": efficiency["cost_aware_gated"],
+        }
+        for role, source_prefix, target_prefix, digest in (
+            ("parent", "qwen_native_b_", "qwen_native_a_", FORMAL_PARENT_DIGEST),
+            (
+                "reproduced",
+                "qwen_native_c_",
+                "qwen_native_r_",
+                FORMAL_REPRODUCED_DIGEST,
+            ),
+        ):
+            records = [json.loads(line) for line in paths[role].read_text().splitlines()]
+            for record in records:
+                record["stage"] = record["stage"].replace(source_prefix, target_prefix, 1)
+                record["checkpoint_digest"] = digest
+            self.write_jsonl(paths[role], records)
+        return paths, manifest, catalog
 
     def test_writes_paired_outputs_and_four_category_summary(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -605,6 +786,208 @@ class PairedEvalTest(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "only control"):
                 PAIRED_EVAL.analyze(three_arm)
+
+    def test_v3_contract_reports_greedy_metrics_and_paired_bootstrap(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths, manifest, catalog = self.make_v3_formal_inputs(root)
+            output = root / "v3-results"
+            args = self.args(
+                paths,
+                output,
+                include_old=False,
+                data_manifest=manifest,
+                control_digest=FORMAL_CONTROL_DIGEST,
+                cost_digest=FORMAL_COST_DIGEST,
+                eval_artifact="nq_test_eval",
+            )
+            # Bind the fixture records to the formal endpoint digests.
+            for role, digest in (
+                ("control", FORMAL_CONTROL_DIGEST),
+                ("cost_aware_gated", FORMAL_COST_DIGEST),
+            ):
+                records = [json.loads(line) for line in paths[role].read_text().splitlines()]
+                for record in records:
+                    record["checkpoint_digest"] = digest
+                self.write_jsonl(paths[role], records)
+
+            order = tuple(catalog)
+            with mock.patch.object(
+                PAIRED_EVAL,
+                "read_eval_parquet_catalog",
+                return_value=(catalog, order),
+            ):
+                PAIRED_EVAL.analyze(args)
+
+            summary = json.loads((output / "summary.json").read_text())
+            contract = summary["formal_contract"]
+            self.assertEqual(summary["schema_version"], 2)
+            self.assertEqual(contract["mode"], "qwen35_native_v3_b_c_efficiency")
+            self.assertEqual(contract["evaluation_artifact"]["key"], "nq_test_eval")
+            self.assertEqual(contract["endpoint_evaluation"]["group_size"], 1)
+            self.assertFalse(contract["endpoint_evaluation"]["do_sample"])
+            self.assertEqual(contract["endpoint_evaluation"]["decoding"], "greedy")
+            self.assertEqual(contract["endpoint_evaluation"]["seed"], 42)
+            self.assertEqual(
+                {
+                    key: contract["endpoint_evaluation"][key]
+                    for key in (
+                        "rollouts_per_question",
+                        "temperature",
+                        "top_p",
+                        "top_k",
+                        "min_p",
+                        "presence_penalty",
+                        "repetition_penalty",
+                    )
+                },
+                {
+                    "rollouts_per_question": 1,
+                    "temperature": 1.0,
+                    "top_p": 1.0,
+                    "top_k": 0,
+                    "min_p": 0.0,
+                    "presence_penalty": 0.0,
+                    "repetition_penalty": 1.0,
+                },
+            )
+            stage = summary["stages"]["control"]
+            for metric in (
+                "correct_only_mean_searches",
+                "mean_action_count",
+                "mean_trajectory_tokens",
+                "mean_invalid_action_count",
+                "clipped_trajectory_ratio",
+            ):
+                self.assertIn(metric, stage)
+            bootstrap = summary["comparisons"]["cost_aware_gated"]["paired_bootstrap"]
+            self.assertEqual(bootstrap["seed"], 42)
+            self.assertEqual(bootstrap["resamples"], 10_000)
+            self.assertIn("correct_only_searches", bootstrap["metrics"])
+            for metric in bootstrap["metrics"].values():
+                self.assertIn("estimate_candidate_minus_baseline", metric)
+                self.assertIn("estimate_candidate_minus_control", metric)
+            markdown = (output / "summary.md").read_text()
+            self.assertIn("`do_sample=false` (greedy)", markdown)
+            self.assertIn("Mean trajectory tokens", markdown)
+
+    def test_v3_multihop_contract_and_trace_order_are_fixed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths, manifest, catalog = self.make_v3_formal_inputs(
+                root, "multihop_eval"
+            )
+            args = self.args(
+                paths,
+                root / "unused",
+                include_old=False,
+                data_manifest=manifest,
+                control_digest=FORMAL_CONTROL_DIGEST,
+                cost_digest=FORMAL_COST_DIGEST,
+                eval_artifact="multihop_eval",
+                expected_rows=256,
+            )
+            contract = PAIRED_EVAL._load_formal_contract(args)
+            self.assertEqual(
+                contract["stage_names"],
+                {
+                    "control": "qwen_native_b_multihop",
+                    "cost_aware_gated": "qwen_native_c_multihop",
+                },
+            )
+
+            records = [
+                json.loads(line)
+                for line in paths["cost_aware_gated"].read_text().splitlines()
+            ]
+            records.reverse()
+            for record in records:
+                record["checkpoint_digest"] = FORMAL_COST_DIGEST
+            self.write_jsonl(paths["cost_aware_gated"], records)
+            control = [json.loads(line) for line in paths["control"].read_text().splitlines()]
+            for record in control:
+                record["checkpoint_digest"] = FORMAL_CONTROL_DIGEST
+            self.write_jsonl(paths["control"], control)
+            with mock.patch.object(
+                PAIRED_EVAL,
+                "read_eval_parquet_catalog",
+                return_value=(catalog, tuple(catalog)),
+            ), self.assertRaisesRegex(ValueError, "sample order mismatch"):
+                PAIRED_EVAL.analyze(args)
+
+    def test_manifest_schema_and_prompt_version_must_match(self) -> None:
+        cases = (
+            ("v3_with_schema3", 3, PAIRED_EVAL.V3_PROMPT_VERSION,
+             "v3 prompt requires.*schema_version 4"),
+            ("v2_with_schema4", 4, PAIRED_EVAL.V2_PROMPT_VERSION,
+             "v2 prompt requires.*schema_version 3"),
+            ("unknown_prompt", 4, "unknown-prompt", "unsupported formal prompt_version"),
+        )
+        for name, schema, prompt, error in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                paths, manifest, _ = self.make_v3_formal_inputs(root)
+                payload = json.loads(manifest.read_text())
+                payload["schema_version"] = schema
+                payload["prompt_contract"]["prompt_version"] = prompt
+                manifest.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+                args = self.args(
+                    paths,
+                    root / "unused",
+                    include_old=False,
+                    data_manifest=manifest,
+                    control_digest=FORMAL_CONTROL_DIGEST,
+                    cost_digest=FORMAL_COST_DIGEST,
+                    eval_artifact="nq_test_eval",
+                )
+                with self.assertRaisesRegex(ValueError, error):
+                    PAIRED_EVAL._load_formal_contract(args)
+
+    def test_parent_reproduced_capability_reports_all_sealed_artifacts(self) -> None:
+        for artifact_key in PAIRED_EVAL.V3_EVAL_ARTIFACTS:
+            with self.subTest(artifact=artifact_key), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                paths, manifest, catalog = self.make_v3_capability_inputs(
+                    root, artifact_key
+                )
+                output = root / f"parent-r-{artifact_key}"
+                args = self.capability_args(paths, output, manifest, artifact_key)
+                with mock.patch.object(
+                    PAIRED_EVAL,
+                    "read_eval_parquet_catalog",
+                    return_value=(catalog, tuple(catalog)),
+                ):
+                    PAIRED_EVAL.analyze(args)
+
+                summary = json.loads((output / "summary.json").read_text())
+                self.assertEqual(summary["report_type"], "parent_reproduced_capability")
+                self.assertEqual(
+                    summary["formal_contract"]["data_manifest"]["schema_version"], 4
+                )
+                self.assertEqual(
+                    list(summary["stages"]), ["parent", "reproduced"]
+                )
+                comparison = summary["comparisons"]["reproduced"]
+                self.assertEqual(
+                    comparison["paired_bootstrap"]["baseline_role"], "parent"
+                )
+                for metric in (
+                    "em",
+                    "executed_searches",
+                    "correct_only_searches",
+                    "action_count",
+                    "trajectory_tokens",
+                    "invalid_actions",
+                    "clipping_rate",
+                ):
+                    self.assertIn(metric, comparison["paired_bootstrap"]["metrics"])
+                for metric in comparison["paired_bootstrap"]["metrics"].values():
+                    self.assertIn("estimate_candidate_minus_baseline", metric)
+                    self.assertNotIn("estimate_candidate_minus_control", metric)
+                markdown = (output / "summary.md").read_text()
+                self.assertIn("Parent vs Reproduced Capability Report", markdown)
+                self.assertIn("A / Parent (post-trained)", markdown)
+                self.assertIn("separate from the B/C cost-efficiency", markdown)
 
     def test_rejects_duplicate_ids_and_wrong_row_count(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 NATIVE_PROJECT_ROOT="${AUTODL_ROOT:-/root/autodl-tmp/search-r1}"
 NATIVE_STAGE="${QWEN_NATIVE_GATE_STAGE:-}"
 NATIVE_PREDECESSOR_EVIDENCE="${QWEN_NATIVE_PREDECESSOR_EVIDENCE:-}"
-NATIVE_DATA_DIR="$NATIVE_PROJECT_ROOT/data/search_mix_qwen35_native_v2"
+NATIVE_DATA_DIR="$NATIVE_PROJECT_ROOT/data/search_mix_qwen35_native_v3"
 export DATA_DIR="$NATIVE_DATA_DIR"
 
 export AUTODL_RUN_BUDGET_PROFILE=gated_followup
@@ -14,19 +14,9 @@ export TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-8}"
 export MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-500}"
 case "$NATIVE_STAGE" in
     g0_g1)
-        export EVAL_DATA_FILE="$NATIVE_DATA_DIR/probe_forced_16.parquet"
+        export EVAL_DATA_FILE="$NATIVE_DATA_DIR/probe_autonomous_16.parquet"
         export EVAL_EXPECTED_ROWS=16
         export EVAL_GROUP_SIZE=2
-        ;;
-    g2)
-        export EVAL_DATA_FILE="$NATIVE_DATA_DIR/probe_autonomous_32.parquet"
-        export EVAL_EXPECTED_ROWS=32
-        export EVAL_GROUP_SIZE=3
-        ;;
-    g3)
-        export EVAL_DATA_FILE="$NATIVE_DATA_DIR/probe_multi_64.parquet"
-        export EVAL_EXPECTED_ROWS=64
-        export EVAL_GROUP_SIZE=5
         ;;
     *)
         export EVAL_DATA_FILE=''
@@ -69,31 +59,15 @@ require_native_gate() {
     }
     case "$NATIVE_STAGE" in
         g0_g1)
-            [[ "$EVAL_DATA_FILE" == "$NATIVE_DATA_DIR/probe_forced_16.parquet" &&
+            [[ "$EVAL_DATA_FILE" == "$NATIVE_DATA_DIR/probe_autonomous_16.parquet" &&
                 "$EVAL_EXPECTED_ROWS" == 16 && "$EVAL_GROUP_SIZE" == 2 &&
                 -z "$NATIVE_PREDECESSOR_EVIDENCE" ]] || {
                 printf 'G0+G1 is fixed to 16x2 and must not name a predecessor.\n' >&2
                 return 64
             }
             ;;
-        g2)
-            [[ "$EVAL_DATA_FILE" == "$NATIVE_DATA_DIR/probe_autonomous_32.parquet" &&
-                "$EVAL_EXPECTED_ROWS" == 32 && "$EVAL_GROUP_SIZE" == 3 &&
-                -n "$NATIVE_PREDECESSOR_EVIDENCE" ]] || {
-                printf 'G2 is fixed to 32x3 and requires exact G0+G1 evidence.\n' >&2
-                return 64
-            }
-            ;;
-        g3)
-            [[ "$EVAL_DATA_FILE" == "$NATIVE_DATA_DIR/probe_multi_64.parquet" &&
-                "$EVAL_EXPECTED_ROWS" == 64 && "$EVAL_GROUP_SIZE" == 5 &&
-                -n "$NATIVE_PREDECESSOR_EVIDENCE" ]] || {
-                printf 'G3 is fixed to 64x5 and requires exact G2 evidence.\n' >&2
-                return 64
-            }
-            ;;
         *)
-            printf 'Set QWEN_NATIVE_GATE_STAGE to g0_g1, g2, or g3.\n' >&2
+            printf 'Set QWEN_NATIVE_GATE_STAGE to g0_g1. R-after G3 is owned by the training pipeline.\n' >&2
             return 64
             ;;
     esac
@@ -102,8 +76,6 @@ require_native_gate() {
 native_stage_budget_rmb() {
     case "$NATIVE_STAGE" in
         g0_g1) printf '2\n' ;;
-        g2) printf '3\n' ;;
-        g3) printf '10\n' ;;
         *) return 64 ;;
     esac
 }
@@ -160,8 +132,7 @@ verify_native_data_contract() {
         "$NATIVE_MANIFEST.sha256"
         "$NATIVE_CATALOG"
         "$NATIVE_DATA_DIR/probe_g0_8.parquet"
-        "$NATIVE_DATA_DIR/probe_forced_16.parquet"
-        "$NATIVE_DATA_DIR/probe_autonomous_32.parquet"
+        "$NATIVE_DATA_DIR/probe_autonomous_16.parquet"
         "$NATIVE_DATA_DIR/probe_multi_64.parquet"
         "$LEGACY_REPLAY_RECEIPT"
         "$LEGACY_REPLAY_RECEIPT.sha256"
@@ -253,7 +224,7 @@ verify_native_attempt_binding() {
     recorded_results="$(tr -d '\r\n' <"$outer/result-root")" || return 1
     recorded_marker="$(tr -d '\r\n' <"$outer/evidence-marker")" || return 1
     recorded_digest="$(tr -d '\r\n' <"$outer/evidence-digest")" || return 1
-    [[ "$contract" == qwen-native-gate-v1 &&
+    [[ ("$contract" == qwen-native-gate-v1 || "$contract" == qwen-native-gate-v3) &&
         "$recorded_results" == "$results" &&
         "$recorded_marker" == "$marker" &&
         "$recorded_digest" == "$evidence_digest" ]] || {
@@ -643,7 +614,7 @@ checks = {
     "max_prompt_length": value("data", "max_prompt_length") == 4096,
     "max_response_length": value("data", "max_response_length") == 500,
     "max_start_length": value("data", "max_start_length") == 1024,
-    "max_obs_length": value("data", "max_obs_length") == 384,
+    "max_obs_length": value("data", "max_obs_length") == 500,
     "max_turns": value("max_turns") == 4,
     "retriever_topk": value("retriever", "topk") == 3,
 }
@@ -771,8 +742,6 @@ run_protocol_probe() {
         --model-dir "$base_model" \
         --native-data "$NATIVE_DATA_DIR/probe_g0_8.parquet" \
         --native-manifest "$NATIVE_MANIFEST" \
-        --legacy-data "$LEGACY_DATA_DIR/probe_multi_64.parquet" \
-        --legacy-manifest "$LEGACY_DATA_DIR/manifest.json" \
         --retriever-url http://127.0.0.1:8000/retrieve \
         --checkpoint-digest "$base_digest" \
         --seed 42 \
@@ -783,6 +752,7 @@ run_protocol_probe() {
     if ((rc == 0)); then
         [[ -s "$run_dir/output/records.jsonl" &&
             -s "$run_dir/output/resolved-config.json" &&
+            -s "$run_dir/output/environment-replay.json" &&
             -s "$run_dir/output/manifest.json" ]] || rc=1
     fi
     finish_protocol_probe_run "$run_dir" "$rc" "$started_epoch" "$timeout_seconds"
@@ -822,6 +792,7 @@ publish_native_gate_evidence() {
             "$g0_run/probe.log" "$g0_run/run.env" "$g0_run/exit-code"
             "$g0_run/terminal" "$g0_run/output/records.jsonl"
             "$g0_run/output/resolved-config.json" "$g0_run/output/manifest.json"
+            "$g0_run/output/environment-replay.json"
             "$results_dir/protocol_records.jsonl"
         )
     fi
@@ -877,7 +848,7 @@ publish_native_gate_evidence() {
     }
     atomic_write "$marker" "$evidence_digest"$'\n'
     sync_path "$marker_dir"
-    atomic_write "$outer_attempt/result-contract" 'qwen-native-gate-v1'$'\n'
+    atomic_write "$outer_attempt/result-contract" 'qwen-native-gate-v3'$'\n'
     atomic_write "$outer_attempt/result-root" "$results_dir"$'\n'
     atomic_write "$outer_attempt/evidence-marker" "$marker"$'\n'
     atomic_write "$outer_attempt/evidence-digest" "$evidence_digest"$'\n'
@@ -920,8 +891,6 @@ qwen_native_gate_pipeline() {
             g0_run="$LAST_G0_RUN_DIR"
             variant=qwen_native_g1
             ;;
-        g2) variant=qwen_native_g2 ;;
-        g3) variant=qwen_native_g3 ;;
     esac
     run_job eval "$variant" "$base_model" '' "$base_digest"
     eval_run="$LAST_RUN_DIR"
@@ -1014,13 +983,10 @@ qwen_native_main() {
             ;;
         '')
             require_native_gate
-            if [[ "$NATIVE_STAGE" == g2 || "$NATIVE_STAGE" == g3 ]]; then
-                verify_native_predecessor
-            fi
             phase_launch gpu "$0"
             ;;
         *)
-            printf 'Usage: QWEN_NATIVE_GATE_STAGE={g0_g1|g2|g3} GPU_COUNT=2 AUTODL_PRICE_PER_HOUR=<price> bash %s\n' "$0" >&2
+            printf 'Usage: QWEN_NATIVE_GATE_STAGE=g0_g1 GPU_COUNT=2 AUTODL_PRICE_PER_HOUR=<price> bash %s\n' "$0" >&2
             exit 64
             ;;
     esac

@@ -9,6 +9,7 @@ from types import ModuleType
 import pytest
 
 from scripts.data_process import search_mix
+from search_r1.llm_agent.tool_protocol import parse_action
 
 PARQUET_FIELDS = {
     "data_source",
@@ -207,21 +208,70 @@ def test_registered_mix_uses_hotpot_majority_with_bridge_weighting():
     assert verify_no_reselection.command == "verify-no-reselection"
     assert verify_no_reselection.source_manifest == Path(
         "source/manifest.json")
+    visibility = search_mix.parse_args([
+        "validate-native-evidence", "--manifest", "native/manifest.json",
+        "--source-manifest", "source/manifest.json", "--model-dir", "model"
+    ])
+    assert visibility.command == "validate-native-evidence"
+    assert visibility.source_manifest == Path("source/manifest.json")
+    assert search_mix.NATIVE_EVAL_FILES == {
+        "nq_test_eval": "nq_test_128_native_v3.parquet",
+        "multihop_eval": "multihop_eval_256_native_v3.parquet",
+    }
 
 
-def test_native_prompt_contract_registers_v2_answer_tags():
+def test_native_prompt_contract_registers_v3_original_alignment():
     contract = search_mix.prompt_contract(search_mix.QWEN35_NATIVE)
     messages = search_mix.make_prompt("Who wrote Hamlet?",
                                       search_mix.QWEN35_NATIVE)
 
-    assert contract["prompt_version"] == "qwen35-native-search-v2-answer-tag"
+    assert contract[
+        "prompt_version"] == "qwen35-native-search-v3-original-aligned"
     assert contract["tool_protocol"] == search_mix.QWEN35_NATIVE
     assert messages == search_mix.qwen35_messages("Who wrote Hamlet?")
-    system_prompt = messages[0]["content"]
-    assert "<answer>" in system_prompt
-    assert "</answer>" in system_prompt
-    assert "Beijing" not in system_prompt
-    assert "<answer>short answer</answer>" not in system_prompt
+    assert [message["role"] for message in messages] == ["user"]
+    prompt = messages[0]["content"]
+    assert "<answer> Beijing </answer>" in prompt
+    assert "at least once" not in prompt
+    assert "at most four" not in prompt
+
+
+def test_native_eval_materializations_bind_sealed_sources(tmp_path,
+                                                          monkeypatch):
+    from scripts.data_process import multihop_search_gate, nq_small
+
+    nq_dir = tmp_path / "nq"
+    multihop_dir = tmp_path / "multihop"
+    nq_dir.mkdir()
+    multihop_dir.mkdir()
+    nq_manifest = nq_dir / "manifest.json"
+    nq_file = nq_dir / "test_128.parquet"
+    multihop_manifest = multihop_dir / "manifest.json"
+    multihop_catalog = multihop_dir / "catalog.jsonl"
+    multihop_file = multihop_dir / "eval_256.parquet"
+    for path in (nq_manifest, nq_file, multihop_manifest, multihop_catalog,
+                 multihop_file):
+        path.write_text(path.name, encoding="utf-8")
+    nq_rows = [{"prompt": search_mix.qwen35_messages("NQ?")}]
+    multihop_rows = [{"prompt": search_mix.qwen35_messages("Multi?")}]
+    monkeypatch.setattr(
+        nq_small, "load_native_test_records",
+        lambda manifest, parquet: (nq_rows, ["nq:test:1"], Path(parquet)))
+    monkeypatch.setattr(
+        multihop_search_gate, "load_native_eval_records",
+        lambda manifest, catalog: (multihop_rows, ["hotpotqa:test:2"],
+                                   multihop_file))
+
+    loaded = search_mix._native_eval_materializations([multihop_catalog],
+                                                       [nq_file])
+
+    assert loaded["nq_test_eval"]["sample_ids"] == ["nq:test:1"]
+    assert loaded["multihop_eval"]["sample_ids"] == ["hotpotqa:test:2"]
+    contract = search_mix._native_eval_source_contract(loaded)
+    assert contract["nq_test_eval"]["source_manifest_sha256"] == (
+        search_mix.sha256_file(nq_manifest))
+    assert contract["multihop_eval"]["source_artifact_file"] == (
+        "eval_256.parquet")
 
 
 def test_no_reselection_cli_dispatches_explicit_mode(tmp_path, monkeypatch):
@@ -653,30 +703,22 @@ def test_native_prompt_changes_only_model_facing_messages(monkeypatch):
         assert {key: value for key, value in old.items() if key != "prompt"} == {
             key: value for key, value in new.items() if key != "prompt"
         }
-        assert [message["role"] for message in new["prompt"]] == [
-            "system", "user"
-        ]
+        assert [message["role"] for message in new["prompt"]] == ["user"]
         source_index = new["extra_info"]["index"]
         selected = next(item for item in catalog
                         if item["source_index"] == source_index)
-        assert new["prompt"][1]["content"] == (
-            f"Question: {selected['question']}\n")
-        assert not any(tag in new["prompt"][1]["content"] for tag in (
-            "<think>", "<search>", "<answer>", "<tool_call>"))
+        assert new["prompt"] == search_mix.qwen35_messages(
+            selected["question"])
+        assert "at least once" not in new["prompt"][0]["content"]
 
 
-def test_native_probe_subsets_use_fixed_probe_prefix(monkeypatch):
+def test_native_probe_subsets_use_same_autonomous_probe_prefix(monkeypatch):
     monkeypatch.setattr(search_mix, "QUOTAS", deepcopy(SMALL_QUOTAS))
     catalog, _, _ = search_mix.select_catalog(_small_evidence(),
                                               CharacterTokenizer(),
                                               excluded_questions=set())
     probe = search_mix._ordered_records(catalog, "probe",
                                         search_mix.QWEN35_NATIVE)
-    forced = search_mix._ordered_records(catalog,
-                                         "probe",
-                                         search_mix.QWEN35_NATIVE,
-                                         limit=2,
-                                         force_search=True)
     autonomous = search_mix._ordered_records(catalog,
                                              "probe",
                                              search_mix.QWEN35_NATIVE,
@@ -684,16 +726,14 @@ def test_native_probe_subsets_use_fixed_probe_prefix(monkeypatch):
 
     identity = lambda row: (row["data_source"], row["extra_info"]["split"],
                             row["extra_info"]["index"])
-    assert [identity(row) for row in forced] == [
-        identity(row) for row in probe[:2]
-    ]
     assert [identity(row) for row in autonomous] == [
         identity(row) for row in probe[:2]
     ]
-    assert forced[0]["prompt"] != autonomous[0]["prompt"]
-    assert forced[0]["prompt"][0] == autonomous[0]["prompt"][0]
-    assert forced[0]["prompt"][1]["content"].endswith(
-        autonomous[0]["prompt"][1]["content"])
+    assert search_mix.NATIVE_PROBE_FILES["probe_autonomous"] == (
+        "probe_autonomous_16.parquet", 16)
+    assert not any("forced" in label or "forced" in filename
+                   for label, (filename, _) in
+                   search_mix.NATIVE_PROBE_FILES.items())
 
 
 def test_output_records_expose_only_five_trainer_fields(monkeypatch):
@@ -1005,9 +1045,8 @@ def _prepare_native_fixture_source(tmp_path, monkeypatch):
                         lambda records, path: _write_json_rows(path, records))
     monkeypatch.setattr(
         search_mix, "NATIVE_PROBE_FILES", {
-            "probe_g0": ("probe_g0_8.parquet", 1, False),
-            "probe_forced": ("probe_forced_16.parquet", 2, True),
-            "probe_autonomous": ("probe_autonomous_32.parquet", 3, False),
+            "probe_g0": ("probe_g0_8.parquet", 1),
+            "probe_autonomous": ("probe_autonomous_16.parquet", 2),
         })
     source_snapshot_before = _regular_file_snapshot(source_dir)
 
@@ -1174,6 +1213,12 @@ def test_materialize_native_is_prompt_only_and_preserves_source_and_selection(
     assert native["schema_version"] == search_mix.MATERIALIZED_SCHEMA_VERSION
     assert native["prompt_contract"] == search_mix.prompt_contract(
         search_mix.QWEN35_NATIVE)
+    assert native["tokenizer"] == {
+        "revision": search_mix.MODEL_REVISION,
+        "selection_observation_length": 384,
+        "rollout_observation_length": 500,
+    }
+    assert native["evaluation_sources"] == {}
     assert native["derived_from"] == {
         "source_manifest_sha256": search_mix.sha256_file(paths["manifest"]),
         "source_catalog_sha256": search_mix.sha256_file(paths["catalog"]),
@@ -1215,12 +1260,11 @@ def test_materialize_native_is_prompt_only_and_preserves_source_and_selection(
         } for row in source_rows]
     probe_ids = native["artifacts"]["probe"]["sample_ids"]
     assert native["artifacts"]["probe_g0"]["sample_ids"] == probe_ids[:1]
-    assert native["artifacts"]["probe_forced"]["sample_ids"] == probe_ids[:2]
     assert native["artifacts"]["probe_autonomous"][
-        "sample_ids"] == probe_ids[:3]
+        "sample_ids"] == probe_ids[:2]
     native_probe_rows = search_mix._read_parquet(
         output_dir / search_mix.OUTPUT_FILES["probe"])
-    for label, (filename, rows, _) in search_mix.NATIVE_PROBE_FILES.items():
+    for label, (filename, rows) in search_mix.NATIVE_PROBE_FILES.items():
         probe_rows = search_mix._read_parquet(output_dir / filename)
         assert [{
             key: value
@@ -1258,8 +1302,8 @@ def test_native_prompt_validation_rejects_reserved_markers_and_token_drift():
     assert search_mix._validate_native_prompt(tokenizer, messages) > 0
 
     poisoned = deepcopy(messages)
-    poisoned[1]["content"] = "Question: Where is <search>Paris</search>?\n"
-    with pytest.raises(ValueError, match="reserved protocol marker"):
+    poisoned[0]["content"] = "Question: Where is <search>Paris</search>?\n"
+    with pytest.raises(ValueError, match="original prompt"):
         search_mix._validate_native_prompt(tokenizer, poisoned)
 
     class DriftTokenizer(CharacterTokenizer):
@@ -1272,6 +1316,14 @@ def test_native_prompt_validation_rejects_reserved_markers_and_token_drift():
 
     with pytest.raises(ValueError, match="prompt tokens differ"):
         search_mix._validate_native_prompt(DriftTokenizer(), messages)
+
+
+def test_native_search_response_matches_thinking_continuation():
+    text, expected = search_mix._native_search_response("Hamlet author")
+
+    assert text.startswith("Inspect the retrieved evidence.\n</think>\n\n")
+    assert not text.startswith("<think>")
+    assert parse_action(text, search_mix.QWEN35_NATIVE) == expected
 
 
 def test_native_prompt_validation_enforces_exact_start_limit():

@@ -55,6 +55,23 @@ def _turn(
     }
 
 
+def _raw_generation(turn: int, action_text: str,
+                    boundary: str) -> dict[str, object]:
+    token_ids = list(action_text.encode("utf-8"))
+    return {
+        "turn": turn,
+        "raw_text": action_text,
+        "raw_token_ids": token_ids,
+        "raw_token_count": len(token_ids),
+        "action_text": action_text,
+        "action_token_ids": token_ids,
+        "action_token_count": len(token_ids),
+        "boundary": boundary,
+        "tail_dropped": False,
+        "raw_clipped": False,
+    }
+
+
 def _record(sample_index: int,
             slot: int,
             *,
@@ -67,6 +84,7 @@ def _record(sample_index: int,
     titles = (f"Alpha {sample_index}", f"Beta {sample_index}")
     events: list[dict[str, object]] = []
     turns: list[dict[str, object]] = []
+    raw_generations: list[dict[str, object]] = []
     raw_parts: list[str] = []
     for search_index in range(searches):
         if search_index == 0:
@@ -95,14 +113,26 @@ def _record(sample_index: int,
                   query=query,
                   observation=observation,
                   documents=documents))
-        raw_parts.append(f"<think>search</think><search>{query}</search>"
-                         f"<information>{observation}</information>")
+        action_text = (
+            "<think>search</think><tool_call>"
+            f'{{"name":"search","arguments":{{"query":{json.dumps(query)}}}}}'
+            "</tool_call>")
+        raw_generations.append(
+            _raw_generation(search_index, action_text, "tool_call"))
+        raw_parts.append(
+            f"{action_text}<information>{observation}</information>")
     extracted = answer if em else f"Wrong {sample_index}"
     turns.append(_turn(len(turns), "answer", answer=extracted))
-    raw_parts.append(f"<think>answer</think><answer>{extracted}</answer>")
+    answer_text = f"<think>answer</think><answer>{extracted}</answer>"
+    raw_generations.append(
+        _raw_generation(len(raw_generations), answer_text, "answer"))
+    raw_parts.append(answer_text)
+    policy_token_count = sum(
+        int(generation["action_token_count"])
+        for generation in raw_generations)
     record: dict[str, object] = {
         "schema": "search-r1.trajectory",
-        "schema_version": 1,
+        "schema_version": 3,
         "record_type": "eval",
         "record_id": f"trace-{sample_index}-{slot}",
         "run_id": "base-probe",
@@ -123,10 +153,18 @@ def _record(sample_index: int,
         "response_clipped": False,
         "turns_used": len(turns),
         "invalid_action_count": 0,
+        "raw_generations": raw_generations,
+        "max_action_budget": 4,
+        "action_count": len(raw_generations),
+        "policy_token_count": policy_token_count,
+        "observation_token_count": sum(
+            len(str(event["visible_observation"]).encode("utf-8"))
+            for event in events),
+        "observation_policy_token_count": 0,
+        "info_mask_consistent": True,
         "checkpoint_digest": DIGEST,
         "group_slot": slot,
         "group_size": 5,
-        "max_searches": 4,
         "retrieval_events": events,
     }
     if group_uid:
@@ -220,8 +258,23 @@ def _add_invalid_turn(record: dict[str, object]) -> None:
     turns = record["turns"]
     assert isinstance(turns, list)
     turns.append(_turn(len(turns), "invalid"))
+    raw_generations = record["raw_generations"]
+    assert isinstance(raw_generations, list)
+    generation = _raw_generation(len(raw_generations),
+                                 "<think>invalid</think>unparsed", "eos")
+    raw_generations.append(generation)
+    record["raw_trajectory"] += generation["action_text"]
+    record["action_count"] = len(raw_generations)
+    record["policy_token_count"] += generation["action_token_count"]
     record["turns_used"] = len(turns)
     record["invalid_action_count"] = 1
+
+
+def _mark_response_clipped(record: dict[str, object]) -> None:
+    record["response_clipped"] = True
+    raw_generations = record["raw_generations"]
+    assert isinstance(raw_generations, list)
+    raw_generations[-1]["raw_clipped"] = True
 
 
 def test_go_outputs_strict_metrics_and_traceable_artifacts(
@@ -481,7 +534,7 @@ def test_clipped_and_invalid_rates_use_trajectory_denominator(
         tmp_path: Path) -> None:
     records = _passing_records()
     for record in records[:17]:
-        record["response_clipped"] = True
+        _mark_response_clipped(record)
     for record in records[17:34]:
         _add_invalid_turn(record)
     trace, catalog = _fixture(tmp_path, records)

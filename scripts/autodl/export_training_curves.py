@@ -10,6 +10,9 @@ from typing import Any
 
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 STEP_LINE = re.compile(r"\bstep:(\d+)\s+-\s+(.*)$")
+COMPARISON_STAGE_DESCRIPTION = (
+    "A=Parent (post-trained), R=Reproduced, B=Control, C=Cost-aware"
+)
 
 STAGES = (
     ("R", "Reproduced", "reproduced_log", 60),
@@ -237,7 +240,7 @@ def plot_comparison(path: Path, rows: list[dict[str, Any]],
                         color=colors,
                         width=0.68)
         axis.set_title(title, fontsize=11, fontweight="bold")
-        axis.set_xlabel("A=Base, R=Reproduced, B=Control, C=Cost-aware")
+        axis.set_xlabel(COMPARISON_STAGE_DESCRIPTION)
         axis.grid(axis="y", alpha=0.2, linewidth=0.7)
         _annotate_bars(axis, bars, digits)
         maximum = max(float(row[field]) for row in rows)

@@ -1,0 +1,10 @@
+[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+[transformers] The fast path is not available because one of the required library is not installed. Falling back to torch implementation. To install follow https://github.com/fla-org/flash-linear-attention#installation and https://github.com/Dao-AILab/causal-conv1d
+Loading weights:   0%|          | 0/320 [00:00<?, ?it/s]Loading weights: 100%|██████████| 320/320 [00:00<00:00, 7516.17it/s]
+[transformers] The following generation flags are not valid and may be ignored: ['top_k']. Set `TRANSFORMERS_VERBOSITY=info` for more details.
+[transformers] Passing `generation_config` together with generation-related arguments=({'do_sample', 'output_scores', 'max_new_tokens', 'return_dict_in_generate', 'eos_token_id', 'use_cache', 'pad_token_id'}) is deprecated and will be removed in future versions. Please pass either a `generation_config` object OR all generation parameters explicitly, but not both.
+ACTIVE_TRAJ_NUM: [16, 15, 15, 14, 14, 13]
+[WARNING] OBSERVATION TOO LONG, CONSIDER CHANGING YOUR CONFIG, 536 & 384
+[WARNING] OBSERVATION TOO LONG, CONSIDER CHANGING YOUR CONFIG, 413 & 384
+ACTIVE_TRAJ_NUM: [16, 9, 6, 4, 1, 1]
+Wrote Qwen native protocol probe: /root/autodl-tmp/search-r1/runs/eval/qwen_native_g0/attempts/20260725T034515Z-1685-14070/output

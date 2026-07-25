@@ -13,7 +13,8 @@ import sys
 import tempfile
 from typing import Iterable
 
-SCHEMA = 2
+SCHEMA = 3
+LEGACY_SCHEMA = 2
 MODEL_REVISION = "15852e8c16360a2fea060d615a32b45270f8a8fc"
 DATA_REVISION = "bcafb8dd07d453be3cbeeeb3f78be1841bddf92c"
 BM25_REVISION = "2c7554f25f425038c4bcb155735a0f831851fd78"
@@ -80,6 +81,22 @@ def contained_relative(root: Path, path: Path) -> str:
 
 def create(args: argparse.Namespace) -> None:
     root = args.root.resolve()
+    native_values = (
+        args.native_prompt_version,
+        args.max_action_budget,
+        args.selection_observation_length,
+        args.rollout_observation_length,
+    )
+    if any(value is not None for value in native_values):
+        if (not all(value is not None for value in native_values)
+                or not args.native_thinking_enabled):
+            raise ValueError("native handoff contract must be supplied as one complete set")
+        if not args.native_prompt_version.strip():
+            raise ValueError("native prompt version must be non-empty")
+        if any(value <= 0 for value in native_values[1:]):
+            raise ValueError("native handoff lengths and action budget must be positive")
+    elif args.native_thinking_enabled:
+        raise ValueError("native thinking cannot be sealed without the native contract")
     artifacts = []
     paths = iter_artifacts([args.model, args.bm25, args.corpus, *args.data],
                            [args.requirements, *args.extra_file])
@@ -98,9 +115,14 @@ def create(args: argparse.Namespace) -> None:
         "corpus_revision": CORPUS_REVISION,
         "data_revision": DATA_REVISION,
         "model_revision": MODEL_REVISION,
+        "max_action_budget": args.max_action_budget,
+        "native_prompt_version": args.native_prompt_version,
+        "native_thinking_enabled": args.native_thinking_enabled,
         "persistent_root": str(root),
         "python_version": args.python_version,
+        "rollout_observation_length": args.rollout_observation_length,
         "schema": SCHEMA,
+        "selection_observation_length": args.selection_observation_length,
         "torch_version": args.torch_version,
     }
     raw = canonical_bytes(payload)
@@ -130,15 +152,21 @@ def verify(args: argparse.Namespace) -> None:
     payload = json.loads(raw)
     if canonical_bytes(payload) != raw:
         raise ValueError("handoff manifest is not canonical JSON")
-    expected_keys = {
+    legacy_keys = {
         "artifacts", "bm25_revision", "checkout_commit", "corpus_revision",
         "data_revision", "model_revision", "persistent_root", "python_version",
         "schema", "torch_version",
     }
-    if set(payload) != expected_keys:
+    native_keys = legacy_keys | {
+        "max_action_budget", "native_prompt_version",
+        "native_thinking_enabled", "rollout_observation_length",
+        "selection_observation_length",
+    }
+    schema = payload.get("schema")
+    expected_keys = native_keys if schema == SCHEMA else legacy_keys
+    if schema not in {LEGACY_SCHEMA, SCHEMA} or set(payload) != expected_keys:
         raise ValueError("handoff manifest has missing or unknown fields")
     expected = {
-        "schema": SCHEMA,
         "persistent_root": str(args.root.resolve()),
         "checkout_commit": args.commit.lower(),
         "model_revision": MODEL_REVISION,
@@ -151,6 +179,27 @@ def verify(args: argparse.Namespace) -> None:
     for key, value in expected.items():
         if payload[key] != value:
             raise ValueError(f"handoff {key} mismatch: expected {value!r}, got {payload[key]!r}")
+
+    native_expectations = {
+        "native_prompt_version": args.expect_native_prompt_version,
+        "max_action_budget": args.expect_max_action_budget,
+        "selection_observation_length": args.expect_selection_observation_length,
+        "rollout_observation_length": args.expect_rollout_observation_length,
+    }
+    requires_native = (args.expect_native_thinking_enabled
+                       or any(value is not None
+                              for value in native_expectations.values()))
+    if requires_native:
+        if schema != SCHEMA:
+            raise ValueError("handoff does not contain the required native v3 contract")
+        if args.expect_native_thinking_enabled and payload[
+                "native_thinking_enabled"] is not True:
+            raise ValueError("handoff native thinking contract mismatch")
+        for key, value in native_expectations.items():
+            if value is not None and payload[key] != value:
+                raise ValueError(
+                    f"handoff {key} mismatch: expected {value!r}, got {payload[key]!r}"
+                )
 
     root = args.root.resolve()
     previous = ""
@@ -193,6 +242,11 @@ def parser() -> argparse.ArgumentParser:
     create_parser.add_argument("--extra-file", type=Path, action="append", default=[])
     create_parser.add_argument("--python-version", required=True)
     create_parser.add_argument("--torch-version", required=True)
+    create_parser.add_argument("--native-prompt-version", default=None)
+    create_parser.add_argument("--native-thinking-enabled", action="store_true")
+    create_parser.add_argument("--max-action-budget", type=int, default=None)
+    create_parser.add_argument("--selection-observation-length", type=int, default=None)
+    create_parser.add_argument("--rollout-observation-length", type=int, default=None)
     create_parser.add_argument("--output", type=Path, required=True)
     create_parser.set_defaults(handler=create)
 
@@ -203,6 +257,11 @@ def parser() -> argparse.ArgumentParser:
     verify_parser.add_argument("--torch-version", required=True)
     verify_parser.add_argument("--manifest", type=Path, required=True)
     verify_parser.add_argument("--require-artifact", action="append", default=[])
+    verify_parser.add_argument("--expect-native-prompt-version")
+    verify_parser.add_argument("--expect-native-thinking-enabled", action="store_true")
+    verify_parser.add_argument("--expect-max-action-budget", type=int)
+    verify_parser.add_argument("--expect-selection-observation-length", type=int)
+    verify_parser.add_argument("--expect-rollout-observation-length", type=int)
     verify_parser.set_defaults(handler=verify)
     return result
 

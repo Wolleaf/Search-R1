@@ -25,14 +25,17 @@ import qa_em  # noqa: E402
 
 
 SCHEMA = "search-r1.qwen-native-gate"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
+ACTIVE_PROMPT_VERSION = "qwen35-native-search-v3-original-aligned"
+ACTIVE_DATA_SCHEMA_VERSION = 4
+LEGACY_DATA_SCHEMA_VERSION = 3
 STAGE_SHAPES = {
     "g0_g1": (16, 2),
     "g2": (32, 3),
     "g3": (64, 5),
 }
 STAGE_ARTIFACTS = {
-    "g0_g1": "probe_forced",
+    "g0_g1": "probe_autonomous",
     "g2": "probe_autonomous",
     "g3": "probe",
 }
@@ -102,10 +105,12 @@ def load_json(path: Path) -> dict[str, Any]:
 def load_data_contract(
         manifest_path: Path, catalog_path: Path,
         stage: str) -> tuple[list[str], dict[str, str],
-                             dict[str, list[str]], list[str]]:
+                             dict[str, list[str]], list[str], bool]:
     manifest = load_json(manifest_path)
     prompt_contract = manifest.get("prompt_contract")
-    if (manifest.get("schema_version") != 3
+    data_schema_version = manifest.get("schema_version")
+    if (data_schema_version not in {
+            LEGACY_DATA_SCHEMA_VERSION, ACTIVE_DATA_SCHEMA_VERSION}
             or not isinstance(prompt_contract, Mapping)
             or prompt_contract.get("tool_protocol") != "qwen35_native"):
         raise ValueError("Qwen native data manifest contract mismatch")
@@ -154,9 +159,18 @@ def load_data_contract(
         return sample_ids
 
     question_count, _ = STAGE_SHAPES[stage]
-    expected_ids = artifact_ids(STAGE_ARTIFACTS[stage], question_count)
+    active_v3 = (data_schema_version == ACTIVE_DATA_SCHEMA_VERSION
+                 and prompt_contract.get("prompt_version") == ACTIVE_PROMPT_VERSION)
+    if ((data_schema_version == ACTIVE_DATA_SCHEMA_VERSION) != active_v3
+            or (prompt_contract.get("prompt_version") == ACTIVE_PROMPT_VERSION
+                and not active_v3)):
+        raise ValueError("Qwen native data schema/prompt version mismatch")
+    artifact_label = STAGE_ARTIFACTS[stage]
+    if stage == "g0_g1" and not active_v3:
+        artifact_label = "probe_forced"
+    expected_ids = artifact_ids(artifact_label, question_count)
     g0_ids = artifact_ids("probe_g0", 8) if stage == "g0_g1" else []
-    return expected_ids, questions, gold_answers, g0_ids
+    return expected_ids, questions, gold_answers, g0_ids, active_v3
 
 
 def ratio(numerator: int, denominator: int) -> float:
@@ -165,7 +179,14 @@ def ratio(numerator: int, denominator: int) -> float:
 
 def criterion(observed: int | float, comparison: str,
               threshold: int | float) -> dict[str, Any]:
-    passed = observed >= threshold if comparison == ">=" else observed <= threshold
+    if comparison == ">=":
+        passed = observed >= threshold
+    elif comparison == "<=":
+        passed = observed <= threshold
+    elif comparison == "==":
+        passed = observed == threshold
+    else:
+        raise ValueError(f"unknown criterion comparison: {comparison}")
     return {
         "observed": observed,
         "comparison": comparison,
@@ -186,7 +207,8 @@ def trace_key(record: Mapping[str, Any]) -> tuple[str, int]:
 
 def validate_traces(records: list[dict[str, Any]], stage: str,
                     checkpoint_digest: str, expected_ids: Sequence[str],
-                    expected_questions: Mapping[str, str]) -> None:
+                    expected_questions: Mapping[str, str],
+                    active_v3: bool = False) -> None:
     questions, group_size = STAGE_SHAPES[stage]
     expected_rows = questions * group_size
     if len(records) != expected_rows:
@@ -210,6 +232,27 @@ def validate_traces(records: list[dict[str, Any]], stage: str,
         if record.get("executed_search_count") != sum(
                 turn.get("retrieval_executed") is True for turn in record["turns"]):
             raise ValueError(f"executed search count is not aligned for {key}")
+        if active_v3:
+            events = record.get("generation_events")
+            retrievals = record.get("retrieval_events")
+            if record.get("schema_version") != 3:
+                raise ValueError(f"active v3 trace schema mismatch for {key}")
+            if not isinstance(events, list) or not isinstance(retrievals, list):
+                raise ValueError(f"active v3 events are missing for {key}")
+            if (record.get("max_action_budget") != 4
+                    or record.get("action_count") != len(events)
+                    or "max_searches" in record
+                    or "terminal_search_request" in record):
+                raise ValueError(f"active v3 action-budget contract mismatch for {key}")
+            if record.get("executed_search_count") != len(retrievals):
+                raise ValueError(f"active v3 retrieval count mismatch for {key}")
+            for name in ("policy_token_count", "observation_token_count",
+                         "observation_policy_token_count"):
+                value = record.get(name)
+                if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                    raise ValueError(f"active v3 {name} is invalid for {key}")
+            if not isinstance(record.get("info_mask_consistent"), bool):
+                raise ValueError(f"active v3 info-mask evidence is missing for {key}")
     if set(groups) != set(expected_ids):
         raise ValueError(f"{stage} trace sample IDs do not match the fixed data artifact")
     expected_slots = set(range(group_size))
@@ -335,6 +378,80 @@ def first_turn_clipped(record: Mapping[str, Any]) -> bool:
     return record.get("response_clipped") is True
 
 
+def _token_prefix_integrity(event: Mapping[str, Any]) -> bool:
+    raw_ids = event.get("raw_token_ids")
+    action_ids = event.get("action_token_ids")
+    if (not isinstance(raw_ids, list) or not isinstance(action_ids, list)
+            or not all(isinstance(item, int) and not isinstance(item, bool)
+                       and item >= 0 for item in raw_ids + action_ids)):
+        return False
+    return (raw_ids[:len(action_ids)] == action_ids
+            and event.get("tail_dropped")
+            == (len(action_ids) < len(raw_ids)))
+
+
+def _thinking_diagnostic(event: Mapping[str, Any], context: str) -> dict[str, Any]:
+    text = event.get("text")
+    if not isinstance(text, str):
+        text = ""
+    action_positions = [position for marker in ("<tool_call>", "<answer>")
+                        if (position := text.find(marker)) >= 0]
+    action_position = min(action_positions) if action_positions else len(text)
+    close_position = text.find("</think>")
+    closing = (close_position >= 0 and close_position < action_position
+               and text.count("</think>") == 1)
+    reasoning = text[:close_position] if closing else ""
+    if reasoning.lstrip().startswith("<think>"):
+        reasoning = reasoning.lstrip()[len("<think>"):]
+    return {
+        "context": context,
+        # The active renderer contract opens thinking in every assistant prefix.
+        "template_opening_provided": True,
+        "nonempty_reasoning": bool(reasoning.strip()),
+        "closing_before_action": closing,
+    }
+
+
+def trace_structure(record: Mapping[str, Any]) -> dict[str, Any]:
+    events = record.get("generation_events")
+    if not isinstance(events, list):
+        events = []
+    requested = sum(event.get("action") == "search" for event in events
+                    if isinstance(event, Mapping))
+    if not events:
+        requested = sum(turn.get("action") == "search"
+                        for turn in record.get("turns", []))
+    executed = int(record.get("executed_search_count", 0))
+    retrievals = record.get("retrieval_events")
+    retrieval_count = len(retrievals) if isinstance(retrievals, list) else 0
+    tool_responses = sum(
+        turn.get("retrieval_executed") is True
+        and isinstance(turn.get("observation"), str)
+        and bool(turn["observation"].strip())
+        for turn in record.get("turns", []))
+    prefix_ok = sum(_token_prefix_integrity(event) for event in events
+                    if isinstance(event, Mapping))
+    thinking = []
+    for index, event in enumerate(events):
+        if not isinstance(event, Mapping):
+            continue
+        context = event.get("generation_context")
+        if context not in {"initial_question", "tool_response", "user_retry"}:
+            context = "initial_question" if index == 0 else "unknown"
+        thinking.append(_thinking_diagnostic(event, str(context)))
+    return {
+        "generation_turn_count": len(events),
+        "action_token_prefix_integrity_count": prefix_ok,
+        "action_tail_leak_count": len(events) - prefix_ok,
+        "requested_search_count": requested,
+        "executed_search_count": executed,
+        "retrieval_event_count": retrieval_count,
+        "nonempty_tool_response_count": tool_responses,
+        "retrieval_aligned": requested == executed == retrieval_count == tool_responses,
+        "thinking": thinking,
+    }
+
+
 def trace_diagnostics(record: Mapping[str, Any]) -> dict[str, Any]:
     turns = record["turns"]
     first = turns[0] if turns else {}
@@ -352,7 +469,7 @@ def trace_diagnostics(record: Mapping[str, Any]) -> dict[str, Any]:
         and bool(turn["retrieved_docs"])
     ]
     normalized_queries = [query.strip().casefold() for query in non_degenerate]
-    return {
+    result = {
         "first_action_legal": bool(first.get("valid_action") is True
                                    and first.get("action") in {"search", "answer"}),
         "first_search_non_degenerate": bool(first.get("action") == "search"
@@ -373,22 +490,26 @@ def trace_diagnostics(record: Mapping[str, Any]) -> dict[str, Any]:
             len(search_turns) >= 2 and len(aligned) == len(search_turns)
             and len(set(normalized_queries)) >= 2),
     }
+    result.update(trace_structure(record))
+    return result
 
 
 def analyze_protocol_probe(directory: Path, expected_sample_ids: Sequence[str],
-                           checkpoint_digest: str) -> tuple[dict[str, Any],
+                           checkpoint_digest: str,
+                           active_v3: bool = True) -> tuple[dict[str, Any],
                                                             list[dict[str, Any]]]:
     manifest = load_json(directory / "manifest.json")
     records = load_jsonl(directory / "records.jsonl")
     resolved = load_json(directory / "resolved-config.json")
+    version = manifest.get("schema_version")
     if manifest.get("schema") != "search-r1.qwen-native-protocol-probe" \
-            or manifest.get("schema_version") != 1:
+            or version not in {1, 3}:
         raise ValueError("G0 protocol probe manifest schema mismatch")
-    expected_mode_counts = {
-        "direct": 16,
-        "native_manager": 16,
-        "legacy_manager": 16,
-    }
+    if active_v3 and version != 3:
+        raise ValueError("active v3 gate requires a v3 protocol probe")
+    expected_modes = (("direct", "native_manager") if version == 3 else
+                      ("direct", "native_manager", "legacy_manager"))
+    expected_mode_counts = {mode: 16 for mode in expected_modes}
     if manifest.get("mode_counts") != expected_mode_counts:
         raise ValueError("G0 protocol probe mode-count manifest mismatch")
     if manifest.get("records_sha256") != sha256_file(directory / "records.jsonl"):
@@ -408,20 +529,23 @@ def analyze_protocol_probe(directory: Path, expected_sample_ids: Sequence[str],
     }
     if resolved.get("sampling") != expected_sampling:
         raise ValueError("G0 protocol probe sampling config mismatch")
+    if version == 3 and (resolved.get("prompt_version") != ACTIVE_PROMPT_VERSION
+                         or resolved.get("max_action_budget") != 4
+                         or resolved.get("max_obs_length") != 500):
+        raise ValueError("G0 v3 protocol probe contract mismatch")
     by_mode: dict[str, dict[tuple[str, int], Mapping[str, Any]]] = defaultdict(dict)
     for record in records:
         mode = record.get("mode")
-        if mode not in {"direct", "native_manager", "legacy_manager"}:
+        if mode not in expected_modes:
             raise ValueError(f"unknown G0 mode: {mode!r}")
         key = trace_key(record)
         if key in by_mode[mode]:
             raise ValueError(f"duplicate G0 record: {mode}:{key}")
         by_mode[mode][key] = record
-    if any(len(by_mode[mode]) != 16 for mode in
-           ("direct", "native_manager", "legacy_manager")):
+    if any(len(by_mode[mode]) != 16 for mode in expected_modes):
         raise ValueError("G0 requires 16 records for each comparison mode")
     keys = set(by_mode["direct"])
-    if set(by_mode["native_manager"]) != keys or set(by_mode["legacy_manager"]) != keys:
+    if any(set(by_mode[mode]) != keys for mode in expected_modes[1:]):
         raise ValueError("G0 comparison modes are not sample-aligned")
     expected_keys = {(sample_id, slot) for sample_id in expected_sample_ids
                      for slot in range(2)}
@@ -430,34 +554,71 @@ def analyze_protocol_probe(directory: Path, expected_sample_ids: Sequence[str],
     prompt_matches = sum(
         by_mode["direct"][key].get("prompt_token_sha256")
         == by_mode["native_manager"][key].get("prompt_token_sha256") for key in keys)
-    raw_text_matches = sum(
-        by_mode["direct"][key].get("raw_text")
-        == by_mode["native_manager"][key].get("raw_text") for key in keys)
-    direct_valid = sum(
-        by_mode["direct"][key].get("parsed_action", {}).get("valid") is True
-        for key in keys)
-    native_valid = sum(
-        by_mode["native_manager"][key].get("parsed_action", {}).get("valid") is True
-        for key in keys)
-    native_degenerate = sum(
-        by_mode["native_manager"][key].get("parsed_action", {}).get("action") == "search"
-        and query_is_degenerate(
-            by_mode["native_manager"][key].get("parsed_action", {}).get("content"))
-        for key in keys)
+    if version == 1:
+        raw_matches = sum(
+            by_mode["direct"][key].get("raw_text")
+            == by_mode["native_manager"][key].get("raw_text") for key in keys)
+        criteria = {
+            "prompt_token_match_count": criterion(prompt_matches, "==", 16),
+            "raw_text_match_count": criterion(raw_matches, "==", 16),
+        }
+        return {
+            "schema_version": 1,
+            "legacy_read_only": True,
+            "records": len(records),
+            "prompt_token_match_count": prompt_matches,
+            "raw_text_match_count": raw_matches,
+            "criteria": criteria,
+        }, records
+
+    if manifest.get("environment_replay_sha256") != sha256_file(
+            directory / "environment-replay.json"):
+        raise ValueError("G0 E0 environment replay digest mismatch")
+    replay = load_json(directory / "environment-replay.json")
+    replay_count_fields = (
+        "requested_search_count", "executed_search_count",
+        "retrieval_event_count", "nonempty_tool_response_count",
+        "retrieved_document_count", "tool_response_policy_token_count",
+    )
+    if any(isinstance(replay.get(name), bool)
+           or not isinstance(replay.get(name), int)
+           or replay[name] < 0 for name in replay_count_fields):
+        raise ValueError("G0 E0 environment replay counts are invalid")
+    first_action_matches = sum(
+        by_mode["direct"][key].get("action_token_ids")
+        == by_mode["native_manager"][key].get("action_token_ids") for key in keys)
+    direct_integrity = sum(_token_prefix_integrity(by_mode["direct"][key])
+                           for key in keys)
+    manager_integrity = sum(
+        _token_prefix_integrity(by_mode["native_manager"][key]) for key in keys)
+    roundtrip = int(
+        replay.get("requested_search_count") == 1
+        and replay.get("executed_search_count") == 1
+        and replay.get("retrieval_event_count") == 1
+        and replay.get("nonempty_tool_response_count") == 1)
+    tool_role = int(replay.get("tool_role_rendered") is True)
+    mask_leak = int(replay.get("tool_response_policy_token_count", -1))
+    if replay.get("info_mask_consistent") is not True:
+        mask_leak = max(mask_leak, 1)
     criteria = {
-        "prompt_token_match_count": criterion(prompt_matches, ">=", 16),
-        "raw_text_match_count": criterion(raw_text_matches, ">=", 16),
-        "direct_parseable_count": criterion(direct_valid, ">=", 15),
-        "native_parseable_count": criterion(native_valid, ">=", 15),
-        "native_degenerate_query_count": criterion(native_degenerate, "<=", 0),
+        "prompt_token_match_count": criterion(prompt_matches, "==", 16),
+        "first_action_token_match_count": criterion(first_action_matches, "==", 16),
+        "direct_action_prefix_integrity_count": criterion(direct_integrity, "==", 16),
+        "manager_action_prefix_integrity_count": criterion(manager_integrity, "==", 16),
+        "e0_search_roundtrip_count": criterion(roundtrip, "==", 1),
+        "e0_retrieved_document_count": criterion(
+            int(replay.get("retrieved_document_count", -1)), "==", 3),
+        "e0_tool_role_count": criterion(tool_role, "==", 1),
+        "e0_mask_leak_count": criterion(mask_leak, "==", 0),
     }
     return {
+        "schema_version": 3,
         "records": len(records),
         "prompt_token_match_count": prompt_matches,
-        "raw_text_match_count": raw_text_matches,
-        "direct_parseable_count": direct_valid,
-        "native_parseable_count": native_valid,
-        "native_degenerate_query_count": native_degenerate,
+        "first_action_token_match_count": first_action_matches,
+        "direct_action_prefix_integrity_count": direct_integrity,
+        "manager_action_prefix_integrity_count": manager_integrity,
+        "environment_replay": replay,
         "criteria": criteria,
     }, records
 
@@ -519,7 +680,8 @@ def per_question(records: list[dict[str, Any]],
 
 def analyze_trace_stage(
         stage: str, records: list[dict[str, Any]],
-        reward_replay: Mapping[tuple[str, int], Mapping[str, Any]] | None = None
+        reward_replay: Mapping[tuple[str, int], Mapping[str, Any]] | None = None,
+        active_v3: bool = False,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
     if stage == "g2" and reward_replay is None:
         raise ValueError("G2 analysis requires independent strict EM replay")
@@ -533,7 +695,89 @@ def analyze_trace_stage(
             diagnostic["strict_em"] = int(replay["strict_em"])
             diagnostic["subem"] = int(replay["subem"])
     questions = per_question(records, diagnostics)
-    if stage == "g0_g1":
+    if stage == "g0_g1" and active_v3:
+        generation_turns = sum(item["generation_turn_count"] for item in diagnostics)
+        prefix_integrity = sum(
+            item["action_token_prefix_integrity_count"] for item in diagnostics)
+        tail_leaks = sum(item["action_tail_leak_count"] for item in diagnostics)
+        mask_consistent = sum(record.get("info_mask_consistent") is True
+                              for record in records)
+        observation_policy_tokens = sum(
+            int(record.get("observation_policy_token_count", 0)) for record in records)
+        retrieval_errors = sum(not item["retrieval_aligned"] for item in diagnostics)
+        thinking_rows = [row for item in diagnostics for row in item["thinking"]]
+        contexts = {}
+        for context in ("initial_question", "tool_response", "user_retry", "unknown"):
+            rows = [row for row in thinking_rows if row["context"] == context]
+            if rows:
+                contexts[context] = {
+                    "generation_turn_count": len(rows),
+                    "template_opening_count": sum(
+                        row["template_opening_provided"] for row in rows),
+                    "nonempty_reasoning_count": sum(
+                        row["nonempty_reasoning"] for row in rows),
+                    "closing_before_action_count": sum(
+                        row["closing_before_action"] for row in rows),
+                }
+        criteria = {
+            "action_token_prefix_integrity_count": criterion(
+                prefix_integrity, "==", generation_turns),
+            "action_tail_leak_count": criterion(tail_leaks, "==", 0),
+            "info_mask_consistent_count": criterion(mask_consistent, "==", len(records)),
+            "observation_policy_token_count": criterion(
+                observation_policy_tokens, "==", 0),
+            "retrieval_alignment_error_count": criterion(retrieval_errors, "==", 0),
+        }
+        overall = {
+            "legal_first_action_count": sum(
+                item["first_action_legal"] for item in diagnostics),
+            "first_action_search_count": sum(
+                bool(record.get("turns"))
+                and record["turns"][0].get("action") == "search"
+                for record in records),
+            "first_action_answer_count": sum(
+                bool(record.get("turns"))
+                and record["turns"][0].get("action") == "answer"
+                for record in records),
+            "answer_trajectory_count": sum(
+                any(turn.get("action") == "answer"
+                    for turn in record.get("turns", [])) for record in records),
+            "invalid_trajectory_count": sum(
+                int(record.get("invalid_action_count", 0)) > 0
+                for record in records),
+            "first_turn_clipped_count": sum(
+                item["first_turn_clipped"] for item in diagnostics),
+            "search_turn_count": sum(item["search_turn_count"] for item in diagnostics),
+            "requested_search_count": sum(
+                item["requested_search_count"] for item in diagnostics),
+            "executed_search_count": sum(
+                item["executed_search_count"] for item in diagnostics),
+            "retrieval_event_count": sum(
+                item["retrieval_event_count"] for item in diagnostics),
+            "nonempty_tool_response_count": sum(
+                item["nonempty_tool_response_count"] for item in diagnostics),
+            "generation_turn_count": generation_turns,
+            "search_count_distribution": {
+                str(count): sum(int(record.get("executed_search_count", 0)) == count
+                                for record in records)
+                for count in range(5)
+            },
+            "thinking": {
+                "diagnostic_only": True,
+                "template_opening_source": "qwen35 v3 renderer contract",
+                "generation_turn_count": len(thinking_rows),
+                "template_opening_count": sum(
+                    row["template_opening_provided"] for row in thinking_rows),
+                "nonempty_reasoning_count": sum(
+                    row["nonempty_reasoning"] for row in thinking_rows),
+                "closing_before_action_count": sum(
+                    row["closing_before_action"] for row in thinking_rows),
+                "by_context": contexts,
+            },
+        }
+    elif stage == "g0_g1":
+        # Preserve the archived v2 interpretation without using its
+        # forced-search capability thresholds for active v3 admission.
         legal = sum(item["first_action_legal"] for item in diagnostics)
         non_degenerate = sum(item["first_search_non_degenerate"] for item in diagnostics)
         degenerate = sum(item["first_search_degenerate"] for item in diagnostics)
@@ -615,11 +859,11 @@ def analyze_g3_with_registered_gate(args: argparse.Namespace) -> int:
 def write_outputs(args: argparse.Namespace, expected_ids: Sequence[str],
                   expected_questions: Mapping[str, str],
                   expected_gold_answers: Mapping[str, Sequence[str]],
-                  g0_ids: Sequence[str]) -> dict[str, Any]:
+                  g0_ids: Sequence[str], active_v3: bool = False) -> dict[str, Any]:
     if args.stage == "g3":
         records = load_jsonl(args.trace)
         validate_traces(records, args.stage, args.expected_checkpoint_digest,
-                        expected_ids, expected_questions)
+                        expected_ids, expected_questions, active_v3=active_v3)
         reward_replay = replay_strict_exact_match(records,
                                                    expected_gold_answers)
         output = args.output_dir
@@ -664,19 +908,24 @@ def write_outputs(args: argparse.Namespace, expected_ids: Sequence[str],
 
     records = load_jsonl(args.trace)
     validate_traces(records, args.stage, args.expected_checkpoint_digest,
-                    expected_ids, expected_questions)
+                    expected_ids, expected_questions, active_v3=active_v3)
     reward_replay = (replay_strict_exact_match(records, expected_gold_answers)
                      if args.stage == "g2" else None)
     overall, decorated, questions = analyze_trace_stage(
-        args.stage, records, reward_replay)
+        args.stage, records, reward_replay, active_v3=active_v3)
     protocol = None
     protocol_records: list[dict[str, Any]] = []
     if args.stage == "g0_g1":
         if args.protocol_probe_dir is None:
             raise ValueError("G0+G1 analysis requires --protocol-probe-dir")
         protocol, protocol_records = analyze_protocol_probe(
-            args.protocol_probe_dir, g0_ids, args.expected_checkpoint_digest)
-    all_criteria = dict(overall["criteria"])
+            args.protocol_probe_dir, g0_ids, args.expected_checkpoint_digest,
+            active_v3=active_v3)
+    if args.stage == "g0_g1" and active_v3:
+        all_criteria = {f"g1_{name}": value
+                        for name, value in overall["criteria"].items()}
+    else:
+        all_criteria = dict(overall["criteria"])
     if protocol is not None:
         all_criteria.update({f"g0_{name}": value
                              for name, value in protocol["criteria"].items()})
@@ -758,12 +1007,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not re.fullmatch(r"[0-9a-f]{64}", args.expected_checkpoint_digest):
             raise ValueError("expected checkpoint digest must be 64 lowercase hex")
         (expected_ids, expected_questions, expected_gold_answers,
-         g0_ids) = load_data_contract(args.data_manifest, args.catalog,
-                                      args.stage)
+         g0_ids, active_v3) = load_data_contract(
+             args.data_manifest, args.catalog, args.stage)
         if args.stage != "g3":
             args.output_dir.mkdir(parents=True, exist_ok=False)
         result = write_outputs(args, expected_ids, expected_questions,
-                               expected_gold_answers, g0_ids)
+                               expected_gold_answers, g0_ids, active_v3)
     except (OSError, ValueError, json.JSONDecodeError) as error:
         print(f"Qwen native gate analysis error: {error}", file=sys.stderr)
         return 1

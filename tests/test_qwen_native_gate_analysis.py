@@ -39,6 +39,35 @@ def _record(slot: int, answer: str | None, em: int) -> dict[str, object]:
     }
 
 
+def _v3_record(slot: int, action: str = "answer") -> dict[str, object]:
+    record = _record(slot, "Paris" if action == "answer" else None,
+                     1 if action == "answer" else 0)
+    action_text = ("Reasoning</think><answer>Paris</answer>" if action == "answer"
+                   else "Reasoning</think><tool_call>x</tool_call>")
+    event = {
+        "turn": 0,
+        "text": action_text,
+        "raw_text": action_text + "ignored tail",
+        "raw_token_ids": [1, 2, 3],
+        "action_token_ids": [1, 2],
+        "tail_dropped": True,
+        "generation_context": "initial_question",
+        "action": action,
+    }
+    record.update({
+        "schema_version": 3,
+        "generation_events": [event],
+        "retrieval_events": [],
+        "max_action_budget": 4,
+        "action_count": 1,
+        "policy_token_count": 2,
+        "observation_token_count": 0,
+        "observation_policy_token_count": 0,
+        "info_mask_consistent": True,
+    })
+    return record
+
+
 def _g3_args(tmp_path: Path) -> SimpleNamespace:
     trace = tmp_path / "g3.jsonl"
     catalog = tmp_path / "catalog.jsonl"
@@ -50,6 +79,37 @@ def _g3_args(tmp_path: Path) -> SimpleNamespace:
         expected_checkpoint_digest="a" * 64,
         output_dir=tmp_path / "output",
     )
+
+
+def _data_contract(tmp_path: Path, schema_version: int,
+                   prompt_version: str) -> tuple[Path, Path]:
+    sample_ids = [f"hotpotqa:train:{index}" for index in range(16)]
+    catalog = tmp_path / "catalog.jsonl"
+    catalog.write_text("".join(
+        json.dumps({
+            "sample_id": sample_id,
+            "question": "What is the capital city?",
+            "golden_answers": ["Paris"],
+        }) + "\n" for sample_id in sample_ids), encoding="utf-8")
+    manifest = {
+        "schema_version": schema_version,
+        "prompt_contract": {
+            "tool_protocol": "qwen35_native",
+            "prompt_version": prompt_version,
+        },
+        "artifacts": {
+            "catalog": {
+                "file": "catalog.jsonl",
+                "sha256": ANALYSIS.sha256_file(catalog),
+            },
+            "probe_g0": {"rows": 8, "sample_ids": sample_ids[:8]},
+            "probe_autonomous": {"rows": 16, "sample_ids": sample_ids},
+            "probe_forced": {"rows": 16, "sample_ids": sample_ids},
+        },
+    }
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    return manifest_path, catalog
 
 
 def _write_fake_g3_outputs(args: SimpleNamespace, record: dict[str, object]) -> None:
@@ -260,3 +320,77 @@ def test_subem_only_signal_does_not_unlock_g2() -> None:
     assert overall["criteria"]["strict_em_positive_count"]["passed"] is False
     assert overall["criteria"]["strict_em_mixed_group_count"]["passed"] is False
     assert "subem_positive_count" not in overall["criteria"]
+
+
+def test_v3_g1_structure_does_not_gate_search_em_or_thinking() -> None:
+    records = [_v3_record(0), _v3_record(1)]
+
+    overall, _, _ = ANALYSIS.analyze_trace_stage(
+        "g0_g1", records, active_v3=True)
+
+    assert overall["search_turn_count"] == 0
+    assert overall["em_count"] == 2
+    assert overall["thinking"]["diagnostic_only"] is True
+    assert overall["thinking"]["nonempty_reasoning_count"] == 2
+    assert all(item["passed"] for item in overall["criteria"].values())
+    assert "legal_first_action_count" not in overall["criteria"]
+
+
+def test_data_contract_distinguishes_active_schema4_from_legacy_schema3(
+        tmp_path: Path) -> None:
+    active_dir = tmp_path / "active"
+    active_dir.mkdir()
+    manifest, catalog = _data_contract(
+        active_dir, 4, ANALYSIS.ACTIVE_PROMPT_VERSION)
+    expected_ids, _, _, _, active = ANALYSIS.load_data_contract(
+        manifest, catalog, "g0_g1")
+    assert active is True
+    assert len(expected_ids) == 16
+
+    legacy_dir = tmp_path / "legacy"
+    legacy_dir.mkdir()
+    manifest, catalog = _data_contract(
+        legacy_dir, 3, "qwen35-native-search-v2")
+    _, _, _, _, active = ANALYSIS.load_data_contract(
+        manifest, catalog, "g0_g1")
+    assert active is False
+
+
+def test_active_prompt_cannot_reuse_legacy_data_schema(tmp_path: Path) -> None:
+    manifest, catalog = _data_contract(
+        tmp_path, 3, ANALYSIS.ACTIVE_PROMPT_VERSION)
+
+    with pytest.raises(ValueError, match="schema/prompt version mismatch"):
+        ANALYSIS.load_data_contract(manifest, catalog, "g0_g1")
+
+
+def test_v3_g1_separates_requested_executed_retrieval_and_tool_response() -> None:
+    record = _v3_record(0, action="search")
+    record["executed_search_count"] = 0
+
+    overall, decorated, _ = ANALYSIS.analyze_trace_stage(
+        "g0_g1", [record], active_v3=True)
+
+    diagnostics = decorated[0]["diagnostics"]
+    assert diagnostics["requested_search_count"] == 1
+    assert diagnostics["executed_search_count"] == 0
+    assert diagnostics["retrieval_event_count"] == 0
+    assert diagnostics["nonempty_tool_response_count"] == 0
+    assert overall["criteria"]["retrieval_alignment_error_count"]["passed"] is False
+
+
+def test_v3_validation_rejects_terminal_search_compatibility_field(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    record = _v3_record(0)
+    record.update({
+        "sample_id": "hotpotqa:train:0",
+        "checkpoint_digest": "a" * 64,
+        "terminal_search_request": True,
+    })
+    monkeypatch.setitem(ANALYSIS.STAGE_SHAPES, "g0_g1", (1, 1))
+
+    with pytest.raises(ValueError, match="action-budget contract"):
+        ANALYSIS.validate_traces(
+            [record], "g0_g1", "a" * 64, ["hotpotqa:train:0"],
+            {"hotpotqa:train:0": "What is the capital city?"},
+            active_v3=True)

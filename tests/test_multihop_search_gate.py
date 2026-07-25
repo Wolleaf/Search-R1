@@ -146,6 +146,19 @@ class MultihopSearchGateTest(unittest.TestCase):
                 self.assertNotIn("metadata", prompt)
                 self.assertNotIn("context", prompt)
 
+            native, native_ids, source_eval = gate.load_native_eval_records(
+                first_manifest, Path(first_dir) / gate.CATALOG_FILE)
+            self.assertEqual(native_ids, manifest["sample_ids"])
+            self.assertEqual(source_eval, Path(first_dir) / gate.EVAL_FILE)
+            self.assertEqual([row["prompt"] for row in native], [
+                gate.qwen35_messages(item["question"]) for item in catalog
+            ])
+            self.assertEqual(
+                [{key: value for key, value in row.items() if key != "prompt"}
+                 for row in native],
+                [{key: value for key, value in row.items() if key != "prompt"}
+                 for row in eval_records])
+
         self.assertEqual(gate.parse_args([]).command, "build")
         self.assertEqual(
             gate.parse_args(["--local-dir", "unused"]).command, "build")

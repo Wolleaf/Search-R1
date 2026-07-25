@@ -25,10 +25,14 @@ GRPO_GROUP_SIZE=5
 PPO_MINI_BATCH_SIZE=$((TRAIN_BATCH_SIZE * GRPO_GROUP_SIZE))
 readonly MAX_TURNS=4
 readonly MAX_START_LENGTH=1024
-readonly MAX_OBS_LENGTH=384
+if [[ "$TOOL_PROTOCOL" == qwen35_native ]]; then
+    readonly MAX_OBS_LENGTH=500
+else
+    readonly MAX_OBS_LENGTH=384
+fi
 readonly RETRIEVER_TOPK=3
 readonly SMOKE_STEPS=2
-readonly QWEN35_PROMPT_VERSION=qwen35-native-search-v2-answer-tag
+readonly QWEN35_PROMPT_VERSION=qwen35-native-search-v3-original-aligned
 
 [[ "$GPU_COUNT" == 1 || "$GPU_COUNT" == 2 ]] || { printf 'GPU_COUNT must be 1 or 2.\n' >&2; exit 64; }
 [[ "$TOOL_PROTOCOL" == legacy_xml || "$TOOL_PROTOCOL" == qwen35_native ]] || {
@@ -64,11 +68,11 @@ case "$MAX_RESPONSE_LENGTH" in
 esac
 
 case "$TOOL_PROTOCOL:$MODE:$VARIANT" in
-    qwen35_native:eval:qwen_native_g1|qwen35_native:eval:qwen_native_g2|qwen35_native:eval:qwen_native_g3|qwen35_native:eval:qwen_native_b|qwen35_native:eval:qwen_native_c)
-        EXPECTED_DATA_DIR="$PROJECT_ROOT/data/search_mix_qwen35_native_v2"
+    qwen35_native:eval:qwen_native_g1|qwen35_native:eval:qwen_native_g3|qwen35_native:eval:qwen_native_a_val|qwen35_native:eval:qwen_native_r_val|qwen35_native:eval:qwen_native_b_val|qwen35_native:eval:qwen_native_c_val|qwen35_native:eval:qwen_native_a_nq_test|qwen35_native:eval:qwen_native_r_nq_test|qwen35_native:eval:qwen_native_b_nq_test|qwen35_native:eval:qwen_native_c_nq_test|qwen35_native:eval:qwen_native_a_multihop|qwen35_native:eval:qwen_native_r_multihop|qwen35_native:eval:qwen_native_b_multihop|qwen35_native:eval:qwen_native_c_multihop)
+        EXPECTED_DATA_DIR="$PROJECT_ROOT/data/search_mix_qwen35_native_v3"
         ;;
     qwen35_native:train:smoke|qwen35_native:train:reproduce|qwen35_native:train:control|qwen35_native:train:cost_aware_gated)
-        EXPECTED_DATA_DIR="$PROJECT_ROOT/data/search_mix_qwen35_native_v2"
+        EXPECTED_DATA_DIR="$PROJECT_ROOT/data/search_mix_qwen35_native_v3"
         ;;
     legacy_xml:eval:group_probe)
         EXPECTED_DATA_DIR="$PROJECT_ROOT/data/search_mix"
@@ -95,8 +99,9 @@ readonly DATA_DIR="$EXPECTED_DATA_DIR"
 if [[ "$TOOL_PROTOCOL" == qwen35_native ]]; then
     [[ "$GPU_COUNT" == 2 && "$TRAIN_BATCH_SIZE" == 8 &&
         "$MAX_RESPONSE_LENGTH" == 500 && "$GRPO_GROUP_SIZE" == 5 &&
-        "$MAX_OBS_LENGTH" == 384 ]] || {
-        printf 'Qwen native v2 requires two GPUs, batch 8, group 5, response 500, and observation 384.\n' >&2
+        "$MAX_OBS_LENGTH" == 500 &&
+        $((MAX_TURNS * (MAX_RESPONSE_LENGTH + MAX_OBS_LENGTH))) -le $MAX_PROMPT_LENGTH ]] || {
+        printf 'Qwen native v3 requires two GPUs, batch 8, group 5, response/observation 500, and a four-action budget within 4096 tokens.\n' >&2
         exit 64
     }
 fi
@@ -174,7 +179,7 @@ case "$MODE:$VARIANT" in
         fi
         if [[ "$TOOL_PROTOCOL" == qwen35_native ]]; then
             [[ "$VARIANT" != cost_aware && "$TOTAL_STEPS" == 20 ]] || {
-                printf 'Qwen native v2 only registers 20-step control and cost_aware_gated branches.\n' >&2
+                printf 'Qwen native v3 only registers 20-step control and cost_aware_gated branches.\n' >&2
                 exit 64
             }
         fi
@@ -189,7 +194,7 @@ case "$MODE:$VARIANT" in
         VAL_BEFORE_TRAIN=false
         USE_KL_LOSS=true
         ;;
-    eval:base|eval:reproduced|eval:control|eval:cost_aware|eval:cost_aware_gated|eval:search_opportunity|eval:group_probe|eval:qwen_native_g1|eval:qwen_native_g2|eval:qwen_native_g3|eval:qwen_native_b|eval:qwen_native_c)
+    eval:base|eval:reproduced|eval:control|eval:cost_aware|eval:cost_aware_gated|eval:search_opportunity|eval:group_probe|eval:qwen_native_g1|eval:qwen_native_g3|eval:qwen_native_a_val|eval:qwen_native_r_val|eval:qwen_native_b_val|eval:qwen_native_c_val|eval:qwen_native_a_nq_test|eval:qwen_native_r_nq_test|eval:qwen_native_b_nq_test|eval:qwen_native_c_nq_test|eval:qwen_native_a_multihop|eval:qwen_native_r_multihop|eval:qwen_native_b_multihop|eval:qwen_native_c_multihop)
         [[ $# == 3 ]] || {
             printf 'Pass exactly one model/checkpoint path for evaluation.\n' >&2
             exit 64
@@ -201,8 +206,7 @@ case "$MODE:$VARIANT" in
         TEST_FREQ=-1
         MODEL_PATH="${3:?Pass the selected checkpoint for evaluation}"
         if [[ "$VARIANT" == search_opportunity || "$VARIANT" == group_probe ||
-              "$VARIANT" == qwen_native_g1 || "$VARIANT" == qwen_native_g2 ||
-              "$VARIANT" == qwen_native_g3 ]]; then
+              "$VARIANT" == qwen_native_g1 || "$VARIANT" == qwen_native_g3 ]]; then
             [[ -n "$EVAL_DATA_FILE" ]] || {
                 printf 'EVAL_DATA_FILE is required for %s evaluation.\n' "$VARIANT" >&2
                 exit 64
@@ -218,12 +222,33 @@ case "$MODE:$VARIANT" in
                 exit 64
             }
             VAL_FILE="$eval_data_canonical"
-        elif [[ "$VARIANT" == qwen_native_b || "$VARIANT" == qwen_native_c ]]; then
+        elif [[ "$VARIANT" == qwen_native_a_val ||
+                "$VARIANT" == qwen_native_r_val ||
+                "$VARIANT" == qwen_native_b_val ||
+                "$VARIANT" == qwen_native_c_val ]]; then
             [[ -z "$EVAL_DATA_FILE" ]] || {
-                printf 'Native endpoint evaluation uses the sealed val_128.parquet.\n' >&2
+                printf 'Native curated endpoint evaluation uses sealed val_128.parquet.\n' >&2
                 exit 64
             }
             VAL_FILE="$DATA_DIR/val_128.parquet"
+        elif [[ "$VARIANT" == qwen_native_a_nq_test ||
+                "$VARIANT" == qwen_native_r_nq_test ||
+                "$VARIANT" == qwen_native_b_nq_test ||
+                "$VARIANT" == qwen_native_c_nq_test ]]; then
+            [[ -z "$EVAL_DATA_FILE" ]] || {
+                printf 'Native NQ endpoint evaluation uses its sealed v3 artifact.\n' >&2
+                exit 64
+            }
+            VAL_FILE="$DATA_DIR/nq_test_128_native_v3.parquet"
+        elif [[ "$VARIANT" == qwen_native_a_multihop ||
+                "$VARIANT" == qwen_native_r_multihop ||
+                "$VARIANT" == qwen_native_b_multihop ||
+                "$VARIANT" == qwen_native_c_multihop ]]; then
+            [[ -z "$EVAL_DATA_FILE" ]] || {
+                printf 'Native multihop endpoint evaluation uses its sealed v3 artifact.\n' >&2
+                exit 64
+            }
+            VAL_FILE="$DATA_DIR/multihop_eval_256_native_v3.parquet"
         else
             [[ -z "$EVAL_DATA_FILE" ]] || {
                 printf 'EVAL_DATA_FILE is only valid for a registered custom evaluation.\n' >&2
@@ -242,17 +267,16 @@ case "$MODE:$VARIANT" in
         printf '   or: %s eval {base|reproduced|control|cost_aware|cost_aware_gated} MODEL_PATH\n' "$0" >&2
         printf '   or: EVAL_DATA_FILE=<parquet> %s eval search_opportunity MODEL_PATH\n' "$0" >&2
         printf '   or: EVAL_DATA_FILE=<parquet> EVAL_GROUP_SIZE=5 %s eval group_probe MODEL_PATH\n' "$0" >&2
-        printf '   or: TOOL_PROTOCOL=qwen35_native EVAL_DATA_FILE=<parquet> %s eval qwen_native_g{1,2,3} MODEL_PATH\n' "$0" >&2
-        printf '   or: TOOL_PROTOCOL=qwen35_native %s eval {qwen_native_b|qwen_native_c} MODEL_PATH\n' "$0" >&2
+        printf '   or: TOOL_PROTOCOL=qwen35_native EVAL_DATA_FILE=<parquet> %s eval qwen_native_g{1,3} MODEL_PATH\n' "$0" >&2
+        printf '   or: TOOL_PROTOCOL=qwen35_native %s eval qwen_native_{a,r,b,c}_{val,nq_test,multihop} MODEL_PATH\n' "$0" >&2
         exit 64
         ;;
 esac
 
 if [[ "$MODE:$VARIANT" != eval:search_opportunity &&
       "$MODE:$VARIANT" != eval:group_probe &&
-      "$MODE:$VARIANT" != eval:qwen_native_g1 &&
-      "$MODE:$VARIANT" != eval:qwen_native_g2 &&
-      "$MODE:$VARIANT" != eval:qwen_native_g3 && -n "$EVAL_DATA_FILE" ]]; then
+       "$MODE:$VARIANT" != eval:qwen_native_g1 &&
+       "$MODE:$VARIANT" != eval:qwen_native_g3 && -n "$EVAL_DATA_FILE" ]]; then
     printf 'EVAL_DATA_FILE is only valid for a registered custom evaluation.\n' >&2
     exit 64
 fi
@@ -267,13 +291,6 @@ eval:group_probe)
 eval:qwen_native_g1)
     [[ "$TOOL_PROTOCOL" == qwen35_native && "$EVAL_GROUP_SIZE" == 2 ]] || {
         printf 'Qwen native G1 requires TOOL_PROTOCOL=qwen35_native and EVAL_GROUP_SIZE=2.\n' >&2
-        exit 64
-    }
-    VAL_BATCH_SIZE=8
-    ;;
-eval:qwen_native_g2)
-    [[ "$TOOL_PROTOCOL" == qwen35_native && "$EVAL_GROUP_SIZE" == 3 ]] || {
-        printf 'Qwen native G2 requires TOOL_PROTOCOL=qwen35_native and EVAL_GROUP_SIZE=3.\n' >&2
         exit 64
     }
     VAL_BATCH_SIZE=8
@@ -306,6 +323,11 @@ if [[ "$TOOL_PROTOCOL" == qwen35_native ]]; then
     RETURN_RAW_CHAT=true
 else
     RETURN_RAW_CHAT=false
+fi
+if [[ "$MODE" == eval && "$EVAL_GROUP_SIZE" == 1 ]]; then
+    ROLLOUT_DO_SAMPLE=false
+else
+    ROLLOUT_DO_SAMPLE=true
 fi
 
 [[ "$TOTAL_STEPS" =~ ^[1-9][0-9]*$ ]] || { printf 'steps must be a positive integer.\n' >&2; exit 64; }
@@ -405,6 +427,7 @@ HYDRA_ARGS=(
     "actor_rollout_ref.rollout.min_p=$ROLLOUT_MIN_P"
     "actor_rollout_ref.rollout.presence_penalty=$ROLLOUT_PRESENCE_PENALTY"
     "actor_rollout_ref.rollout.repetition_penalty=$ROLLOUT_REPETITION_PENALTY"
+    "actor_rollout_ref.rollout.do_sample=$ROLLOUT_DO_SAMPLE"
     ++actor_rollout_ref.rollout.micro_batch_size=1
     "actor_rollout_ref.ref.log_prob_micro_batch_size=$GPU_COUNT"
     "++actor_rollout_ref.ref.fsdp_config.wrap_policy.transformer_layer_cls_to_wrap=[Qwen3_5DecoderLayer]"

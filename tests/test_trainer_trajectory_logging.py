@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from search_r1.trajectory_trace import TraceJsonlWriter
+from search_r1.llm_agent.tool_protocol import QWEN35_PROMPT_VERSION
 from verl import DataProto
 from verl.trainer.ppo.ray_trainer import (RayPPOTrainer,
                                           _compute_group_metrics,
@@ -68,7 +69,7 @@ def _native_training_config(variant='reproduce'):
     return OmegaConf.create({
         'tool_protocol': 'qwen35_native',
         'do_search': True,
-        'qwen35_prompt_version': 'qwen35-native-search-v2-answer-tag',
+        'qwen35_prompt_version': QWEN35_PROMPT_VERSION,
         'trainer': {
             'val_only': False,
             'native_training_variant': variant,
@@ -108,7 +109,7 @@ def _native_training_config(variant='reproduce'):
             'max_prompt_length': 4096,
             'max_response_length': 500,
             'max_start_length': 1024,
-            'max_obs_length': 384,
+            'max_obs_length': 500,
         },
         'max_turns': 4,
         'retriever': {
@@ -161,7 +162,7 @@ def test_native_val_only_does_not_require_training_contract():
     ('data.max_prompt_length', 4036),
     ('data.max_response_length', 384),
     ('data.max_start_length', 512),
-    ('data.max_obs_length', 500),
+    ('data.max_obs_length', 384),
     ('trainer.total_training_steps', 59),
     ('max_turns', 3),
     ('retriever.topk', 5),
@@ -295,13 +296,16 @@ def test_training_trace_integration_keeps_group_fields_aligned(
     batch_size = 5
     tensors = {
         'prompts': torch.tensor([[1, 2]] * batch_size),
-        'responses': torch.tensor([[3, 4, 5]] * batch_size),
-        'attention_mask': torch.ones(batch_size, 5, dtype=torch.long),
+        'responses': torch.tensor([[3, 4, 5, 6, 7, 8, 9, 10, 11]] * batch_size),
+        'attention_mask': torch.ones(batch_size, 11, dtype=torch.long),
+        'info_mask': torch.tensor(
+            [[1, 1, 1, 1, 1, 0, 0, 1, 1, 1, 1]] * batch_size),
+        'action_count': torch.full((batch_size,), 2, dtype=torch.long),
         'executed_search_count': torch.ones(batch_size, dtype=torch.long),
         'sequence_em_scores': torch.tensor([1, 0, 0, 0, 0], dtype=torch.float32),
         'sequence_train_rewards': torch.tensor([0.975, 0, 0, 0, 0]),
         'sequence_posthoc_utilities': torch.tensor([0.975, -0.025, -0.025, -0.025, -0.025]),
-        'advantages': torch.tensor([[1.7888] * 3] + [[-0.4472] * 3] * 4),
+        'advantages': torch.tensor([[1.7888] * 9] + [[-0.4472] * 9] * 4),
     }
     retrieval = [[{
         'turn': 0,
@@ -313,23 +317,48 @@ def test_training_trace_integration_keeps_group_fields_aligned(
         }],
         'observation': 'Doc 1 says Paris.',
     }] for _ in range(batch_size)]
+    search_text = (
+        '<tool_call><function=search><parameter=query>France capital'
+        '</parameter></function></tool_call>')
+    answer_text = '<think>The evidence is clear.</think><answer>Paris</answer>'
     generations = [[{
         'turn': 0,
-        'text': '<search>France capital</search>',
+        'text': search_text,
+        'raw_text': search_text,
+        'raw_token_ids': [30, 31, 32],
+        'raw_token_count': 3,
+        'action_token_ids': [30, 31, 32],
+        'boundary': 'tool_call',
+        'tail_dropped': False,
+        'raw_clipped': False,
         'token_count': 3,
         'clipped': False,
         'valid_action': True,
         'done': False,
         'executed_search': True,
+        'action': 'search',
+        'content': 'France capital',
+        'parse_error': None,
+        'reasoning_prefix': '',
     }, {
         'turn': 1,
-        'text': ('<think>The evidence is clear.</think>'
-                 f'<answer>Paris</answer>{trailing_output}'),
+        'text': answer_text,
+        'raw_text': answer_text + trailing_output,
+        'raw_token_ids': ([40, 41, 42, 43] + ([44] if trailing_output else [])),
+        'raw_token_count': 4 + int(bool(trailing_output)),
+        'action_token_ids': [40, 41, 42, 43],
+        'boundary': 'answer',
+        'tail_dropped': bool(trailing_output),
+        'raw_clipped': False,
         'token_count': 4,
         'clipped': False,
         'valid_action': True,
         'done': True,
         'executed_search': False,
+        'action': 'answer',
+        'content': 'Paris',
+        'parse_error': None,
+        'reasoning_prefix': 'The evidence is clear.',
     }] for _ in range(batch_size)]
     batch = DataProto.from_dict(
         tensors=tensors,
@@ -350,9 +379,10 @@ def test_training_trace_integration_keeps_group_fields_aligned(
     )
 
     trainer = object.__new__(RayPPOTrainer)
-    trainer.tokenizer = _Tokenizer(decoded_query, trailing_output)
+    trainer.tokenizer = _Tokenizer(decoded_query)
     trainer.global_steps = 1
     trainer.config = OmegaConf.create({
+        'tool_protocol': 'qwen35_native',
         'data': {'max_prompt_length': 32},
         'algorithm': {'cost_reward_mode': 'correct_only', 'cost_lambda': 0.1},
         'actor_rollout_ref': {'rollout': {'n_agent': 5}},
@@ -387,14 +417,100 @@ def test_training_trace_integration_keeps_group_fields_aligned(
     assert executed_turns[0]['observation'] == 'Doc 1 says Paris.'
     assert decoded_query in records[0]['raw_trajectory']
     if trailing_output:
-        assert records[0]['turns'][-1]['action'] == 'search'
-        assert records[0]['turns'][-1]['retrieval_executed'] is False
+        assert records[0]['turns'][-1]['action'] == 'answer'
+        assert trailing_output in records[0]['raw_generations'][-1]['raw_text']
+        assert trailing_output not in records[0]['raw_trajectory']
+    assert records[0]['max_action_budget'] == 4
+    assert records[0]['action_count'] == 2
+    assert records[0]['policy_token_count'] == 7
+    assert records[0]['observation_token_count'] == 2
+    assert records[0]['observation_policy_token_count'] == 0
+    assert records[0]['info_mask_consistent'] is True
 
     metrics = _compute_group_metrics(batch)
     assert metrics['env/group/all_wrong_ratio'] == 0.0
     assert metrics['env/group/correct_count_1_ratio'] == 1.0
     assert metrics['env/search_count/correct_mean'] == 1.0
     assert metrics['env/search_count/wrong_mean'] == 1.0
+
+
+def test_legacy_trace_keeps_v1_shape_without_fake_raw_sampled_tokens():
+    batch = DataProto.from_dict(
+        tensors={
+            'prompts': torch.tensor([[1, 2]]),
+            'responses': torch.tensor([[3, 4]]),
+            'attention_mask': torch.ones(1, 4, dtype=torch.long),
+            'executed_search_count': torch.zeros(1, dtype=torch.long),
+            'sequence_em_scores': torch.ones(1),
+            'sequence_posthoc_utilities': torch.ones(1),
+        },
+        non_tensors={
+            'data_source': np.array(['nq'], dtype=object),
+            'index': np.array([17], dtype=object),
+            'extra_info': _object_array([{'split': 'train', 'index': 17}]),
+            'reward_model': _object_array([{
+                'ground_truth': {'target': ['Paris']},
+            }]),
+            'retrieval_events': _object_array([[]]),
+            'generation_events': _object_array([[{
+                'turn': 0,
+                'text': '<answer>Paris</answer>',
+                'token_count': 2,
+                'clipped': False,
+                'valid_action': True,
+                'done': True,
+                'executed_search': False,
+            }]]),
+        },
+    )
+    trainer = object.__new__(RayPPOTrainer)
+    trainer.tokenizer = _Tokenizer()
+    trainer.config = OmegaConf.create({
+        'tool_protocol': 'legacy_xml',
+        'data': {'max_prompt_length': 32},
+        'algorithm': {'cost_reward_mode': 'linear', 'cost_lambda': 0.0},
+        'max_turns': 4,
+    })
+
+    record = trainer._common_trace_records(batch)[0]
+
+    assert record['schema_version'] == 1
+    assert record['max_searches'] == 4
+    assert 'raw_generations' not in record
+    assert 'action_count' not in record
+    assert 'max_action_budget' not in record
+
+
+@pytest.mark.parametrize(('protocol', 'expected_schema_version'), [
+    ('legacy_xml', 1),
+    ('qwen35_native', 3),
+])
+def test_trainer_selects_trace_writer_schema_by_protocol(
+        tmp_path, protocol, expected_schema_version):
+    trainer = object.__new__(RayPPOTrainer)
+    trainer.val_dataloader = [None]
+    trainer.eval_trace_writer = None
+    trainer.train_trace_writer = None
+    trainer.config = OmegaConf.create({
+        'tool_protocol': protocol,
+        'data': {
+            'val_batch_size': 1,
+            'eval_group_size': 1,
+        },
+        'trainer': {
+            'trace_output_dir': str(tmp_path),
+            'trace_stage': 'schema-test',
+            'trace_run_id': 'schema-test',
+            'trace_checkpoint_digest': 'a' * 64,
+            'experiment_name': 'schema-test',
+            'val_only': True,
+        },
+    })
+
+    trainer._init_trace_writer()
+
+    assert trainer.eval_trace_writer.schema_version == expected_schema_version
+    trainer.eval_trace_writer.close()
 
 
 def test_trace_turns_respect_generation_boundaries_for_unclosed_tags():

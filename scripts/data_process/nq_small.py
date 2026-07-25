@@ -14,18 +14,23 @@
 """Build deterministic, non-overlapping NQ subsets for the small run."""
 
 import argparse
+from copy import deepcopy
 import hashlib
 import json
 import os
+from pathlib import Path
 import random
 import re
-from typing import Dict, Iterable, List, Mapping, MutableSet, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Mapping, MutableSet, Optional, Sequence
+
+from search_r1.llm_agent.tool_protocol import qwen35_messages
 
 
 DEFAULT_DATASET = "RUC-NLPIR/FlashRAG_datasets"
 DEFAULT_CONFIG = "nq"
 DEFAULT_REVISION = "bcafb8dd07d453be3cbeeeb3f78be1841bddf92c"
 DATA_SOURCE = "nq"
+NATIVE_EVAL_FILE = "nq_test_128_native_v3.parquet"
 
 
 def normalize_question(question: str) -> str:
@@ -185,6 +190,106 @@ def _sha256(path: str) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _read_parquet(path: Path) -> List[Dict[str, Any]]:
+    import datasets
+
+    dataset = datasets.Dataset.from_parquet(str(path))
+    return [dataset[index] for index in range(len(dataset))]
+
+
+def _legacy_question(record: Mapping[str, Any]) -> str:
+    prompt = record.get("prompt")
+    if (not isinstance(prompt, Sequence) or isinstance(prompt, (str, bytes))
+            or len(prompt) != 1 or not isinstance(prompt[0], Mapping)
+            or prompt[0].get("role") != "user"):
+        raise ValueError("NQ eval row has an invalid legacy prompt")
+    content = prompt[0].get("content")
+    if not isinstance(content, str):
+        raise ValueError("NQ eval row has a non-string legacy prompt")
+    match = re.search(r"Question:\s*(.+?)\s*$", content, re.DOTALL)
+    if match is None:
+        raise ValueError("NQ eval row has no question")
+    question = match.group(1).strip()
+    if content != make_prefix(question):
+        raise ValueError("NQ eval row does not use the sealed legacy prompt")
+    return question
+
+
+def load_native_test_records(
+        manifest_path: Path,
+        parquet_path: Optional[Path] = None,
+) -> tuple[List[Dict[str, Any]], List[str], Path]:
+    """Verify the sealed NQ test split and change only its model prompt."""
+    manifest_path = Path(manifest_path)
+    if manifest_path.is_symlink():
+        raise ValueError("NQ manifest must not be a symlink")
+    manifest_path = manifest_path.resolve()
+    if manifest_path.name != "manifest.json" or not manifest_path.is_file():
+        raise ValueError("NQ manifest must be a regular manifest.json")
+    try:
+        manifest = json.loads(manifest_path.read_bytes())
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("NQ manifest is not valid UTF-8 JSON") from error
+    if (not isinstance(manifest, Mapping) or set(manifest) != {
+            "schema_version", "dataset", "seed", "splits", "overlap_checks"
+    } or manifest.get("schema_version") != 1):
+        raise ValueError("NQ manifest contract mismatch")
+    if manifest.get("dataset") != {
+            "name": DEFAULT_DATASET,
+            "config": DEFAULT_CONFIG,
+            "revision": DEFAULT_REVISION,
+    }:
+        raise ValueError("NQ dataset provenance mismatch")
+    if manifest.get("overlap_checks", {}).get("passed") is not True:
+        raise ValueError("NQ manifest did not pass overlap checks")
+    splits = manifest.get("splits")
+    if not isinstance(splits, Mapping) or "test" not in splits:
+        raise ValueError("NQ manifest is missing the test split")
+    test = splits["test"]
+    if (not isinstance(test, Mapping) or set(test) != {
+            "file", "rows", "sha256", "source_split", "sample_ids"
+    } or test.get("source_split") != "test"):
+        raise ValueError("NQ test split contract mismatch")
+    source_path = ((manifest_path.parent / str(test["file"])).resolve()
+                   if parquet_path is None else Path(parquet_path).resolve())
+    if source_path.parent != manifest_path.parent or source_path.name != test[
+            "file"]:
+        raise ValueError("NQ test artifact does not match its manifest")
+    if (not source_path.is_file() or source_path.is_symlink()
+            or _sha256(str(source_path)) != test["sha256"]):
+        raise ValueError("NQ test artifact identity mismatch")
+    rows = _read_parquet(source_path)
+    sample_ids = test["sample_ids"]
+    if (type(test["rows"]) is not int or test["rows"] != len(rows)
+            or not isinstance(sample_ids, list)
+            or len(sample_ids) != len(rows)):
+        raise ValueError("NQ test row count or sample IDs mismatch")
+
+    native_rows: List[Dict[str, Any]] = []
+    actual_ids = []
+    for row in rows:
+        required_fields = {
+                "data_source", "prompt", "ability", "reward_model",
+                "extra_info"
+        }
+        if not isinstance(row, Mapping) or not required_fields.issubset(row):
+            raise ValueError("NQ eval row schema mismatch")
+        extra = row.get("extra_info")
+        if (row.get("data_source") != DATA_SOURCE
+                or not isinstance(extra, Mapping)
+                or extra.get("split") != "test"
+                or type(extra.get("index")) is not int):
+            raise ValueError("NQ eval row identity mismatch")
+        sample_id = f"{DATA_SOURCE}:test:{extra['index']}"
+        actual_ids.append(sample_id)
+        native = deepcopy(dict(row))
+        native["prompt"] = qwen35_messages(_legacy_question(row))
+        native_rows.append(native)
+    if actual_ids != sample_ids or len(set(actual_ids)) != len(actual_ids):
+        raise ValueError("NQ eval row order does not match sealed sample IDs")
+    return native_rows, list(sample_ids), source_path
 
 
 def _sample_ids(source_split: str, indices: Sequence[int]) -> List[str]:

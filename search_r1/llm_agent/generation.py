@@ -4,7 +4,7 @@ import numpy as np
 from copy import deepcopy
 from collections import defaultdict
 import os
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Sequence
 from dataclasses import dataclass
 from .tensor_helper import TensorHelper, TensorConfig
 from .tool_protocol import (LEGACY_XML, QWEN35_NATIVE, ParsedAction,
@@ -27,6 +27,91 @@ class GenerationConfig:
     search_url: str = None
     topk: int = 3
     tool_protocol: str = LEGACY_XML
+
+
+@dataclass(frozen=True)
+class NativeActionSlice:
+    """One sampled native response and its executable first-action prefix."""
+
+    raw_token_ids: Tuple[int, ...]
+    raw_text: str
+    action_token_ids: Tuple[int, ...]
+    action_text: str
+    boundary: str
+
+    @property
+    def tail_dropped(self) -> bool:
+        return self.raw_token_ids != self.action_token_ids
+
+
+def _decode_sampled_tokens(tokenizer, token_ids: Sequence[int]) -> str:
+    try:
+        return tokenizer.decode(
+            list(token_ids),
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        )
+    except TypeError:
+        return tokenizer.decode(list(token_ids), skip_special_tokens=False)
+
+
+def slice_first_complete_native_action(tokenizer,
+                                       token_ids) -> NativeActionSlice:
+    """Slice sampled IDs at the first native action close or EOS.
+
+    The returned action IDs are always a prefix of the original sampled IDs;
+    decoding is used only to locate the boundary and never to re-tokenize it.
+    """
+    if hasattr(token_ids, 'tolist'):
+        token_ids = token_ids.tolist()
+    raw_ids = []
+    text_ids = []
+    eos_token_id = getattr(tokenizer, 'eos_token_id', None)
+    pad_token_id = getattr(tokenizer, 'pad_token_id', None)
+    boundary = 'length'
+    for value in token_ids:
+        token_id = int(value)
+        if eos_token_id is not None and token_id == eos_token_id:
+            raw_ids.append(token_id)
+            boundary = 'eos'
+            break
+        if pad_token_id is not None and token_id == pad_token_id:
+            break
+        raw_ids.append(token_id)
+        text_ids.append(token_id)
+
+    raw_text = _decode_sampled_tokens(tokenizer, text_ids)
+    markers = (('</tool_call>', 'tool_call'), ('</answer>', 'answer'))
+    completed = [(raw_text.find(marker), name) for marker, name in markers]
+    completed = [(position, name) for position, name in completed
+                 if position >= 0]
+    if completed:
+        _, boundary = min(completed, key=lambda item: item[0])
+        marker = '</tool_call>' if boundary == 'tool_call' else '</answer>'
+        low, high = 1, len(text_ids)
+        while low < high:
+            middle = (low + high) // 2
+            prefix = _decode_sampled_tokens(tokenizer, text_ids[:middle])
+            if marker in prefix:
+                high = middle
+            else:
+                low = middle + 1
+        action_ids = raw_ids[:low]
+    else:
+        action_ids = raw_ids
+
+    action_text_ids = list(action_ids)
+    if (action_text_ids and eos_token_id is not None
+            and action_text_ids[-1] == eos_token_id):
+        action_text_ids.pop()
+    action_text = _decode_sampled_tokens(tokenizer, action_text_ids)
+    return NativeActionSlice(
+        raw_token_ids=tuple(raw_ids),
+        raw_text=raw_text,
+        action_token_ids=tuple(action_ids),
+        action_text=action_text,
+        boundary=boundary,
+    )
 
 class LLMGenerationManager:
     def __init__(
@@ -55,11 +140,8 @@ class LLMGenerationManager:
     def _validate_native_right_side_capacity(self) -> None:
         """Ensure PPO can retain every generated token across all turns."""
         response_length = self.config.max_response_length
-        required_length = (
-            self.config.max_turns
-            * (response_length + self.config.max_obs_length)
-            + response_length
-        )
+        required_length = self.config.max_turns * (
+            response_length + self.config.max_obs_length)
         if required_length > self.config.max_prompt_length:
             raise ValueError(
                 'qwen35_native right-side capacity requires '
@@ -100,34 +182,14 @@ class LLMGenerationManager:
 
     def _postprocess_native_responses(
             self, responses: torch.Tensor) -> Tuple[torch.Tensor, List[str]]:
-        """Drop post-EOS padding while preserving every sampled token."""
-        eos_token_id = self.tokenizer.eos_token_id
-        pad_token_id = self.tokenizer.pad_token_id
-        token_rows = []
-        response_texts = []
-        for response in responses:
-            sampled = []
-            text_tokens = []
-            for token_id in response.tolist():
-                token_id = int(token_id)
-                if token_id == eos_token_id:
-                    sampled.append(token_id)
-                    break
-                if token_id == pad_token_id:
-                    break
-                sampled.append(token_id)
-                text_tokens.append(token_id)
-            token_rows.append(sampled)
-            try:
-                text = self.tokenizer.decode(
-                    text_tokens,
-                    skip_special_tokens=False,
-                    clean_up_tokenization_spaces=False,
-                )
-            except TypeError:
-                text = self.tokenizer.decode(
-                    text_tokens, skip_special_tokens=False)
-            response_texts.append(text)
+        """Retain sampled IDs through the first complete executable action."""
+        slices = [
+            slice_first_complete_native_action(self.tokenizer, response)
+            for response in responses
+        ]
+        self._last_native_action_slices = slices
+        token_rows = [list(item.action_token_ids) for item in slices]
+        response_texts = [item.action_text for item in slices]
         return self._pad_token_rows(token_rows, responses.device), response_texts
 
     def _postprocess_responses(self, responses: torch.Tensor) -> torch.Tensor:
@@ -412,15 +474,19 @@ class LLMGenerationManager:
         original_right_side = {'responses': initial_input_ids[:, []], 'responses_with_info_mask': initial_input_ids[:, []]}
         
         active_mask = torch.ones(gen_batch.batch['input_ids'].shape[0], dtype=torch.bool)
-        turns_stats = torch.ones(gen_batch.batch['input_ids'].shape[0], dtype=torch.int)
+        action_count = torch.zeros(gen_batch.batch['input_ids'].shape[0],
+                                   dtype=torch.long)
         valid_action_stats = torch.zeros(gen_batch.batch['input_ids'].shape[0], dtype=torch.int)
         executed_search_count = torch.zeros(gen_batch.batch['input_ids'].shape[0], dtype=torch.long)
         retrieval_events = [[] for _ in range(gen_batch.batch['input_ids'].shape[0])]
         generation_events = [[] for _ in range(gen_batch.batch['input_ids'].shape[0])]
         final_answers = [None for _ in range(gen_batch.batch['input_ids'].shape[0])]
         parsed_action_history = [[] for _ in range(gen_batch.batch['input_ids'].shape[0])]
+        generation_contexts = ['initial_question'
+                               for _ in range(gen_batch.batch['input_ids'].shape[0])]
         active_num_list = [active_mask.sum().item()]
         rollings = gen_batch
+        meta_info = gen_batch.meta_info.copy()
 
         # Main generation loop
         for step in range(self.config.max_turns):
@@ -441,17 +507,43 @@ class LLMGenerationManager:
 
             meta_info = gen_output.meta_info            
             responses_ids, responses_str = self._postprocess_responses(gen_output.batch['responses'])
+            native_slices = (list(self._last_native_action_slices)
+                             if native_protocol else None)
             responses_ids, responses_str = self.tensor_fn._example_level_pad(responses_ids, responses_str, active_mask)
+            slice_index = 0
             for index, active in enumerate(active_mask.tolist()):
                 if active:
                     token_count = int((responses_ids[index] != self.tokenizer.pad_token_id).sum().item())
-                    generation_events[index].append({
+                    event = {
                         'turn': step,
                         'text': responses_str[index],
                         'token_count': token_count,
                         'clipped': token_count >= getattr(
                             self.config, 'max_response_length', responses_ids.shape[1]),
-                    })
+                    }
+                    if native_slices is not None:
+                        action_slice = native_slices[slice_index]
+                        raw_clipped = (
+                            len(action_slice.raw_token_ids) >= getattr(
+                                self.config, 'max_response_length',
+                                responses_ids.shape[1])
+                            and (not action_slice.raw_token_ids
+                                 or action_slice.raw_token_ids[-1]
+                                 != self.tokenizer.eos_token_id))
+                        event.update({
+                            'raw_text': action_slice.raw_text,
+                            'raw_token_ids': list(action_slice.raw_token_ids),
+                            'raw_token_count': len(action_slice.raw_token_ids),
+                            'action_token_ids': list(action_slice.action_token_ids),
+                            'boundary': action_slice.boundary,
+                            'tail_dropped': action_slice.tail_dropped,
+                            'raw_clipped': raw_clipped,
+                            'clipped': raw_clipped,
+                            'generation_context': generation_contexts[index],
+                        })
+                        slice_index += 1
+                    generation_events[index].append(event)
+            action_count += turn_active_mask.to(dtype=torch.long)
 
             # Execute in environment and process observations
             next_obs, dones, valid_action, executed_search = self.execute_predictions(
@@ -478,10 +570,13 @@ class LLMGenerationManager:
                         })
                         if parsed.action == 'answer' and parsed.valid:
                             final_answers[index] = parsed.content
+                        elif parsed.action == 'search' and parsed.valid:
+                            generation_contexts[index] = 'tool_response'
+                        else:
+                            generation_contexts[index] = 'user_retry'
             curr_active_mask = torch.tensor([not done for done in dones], dtype=torch.bool)
             active_mask = active_mask * curr_active_mask
             active_num_list.append(active_mask.sum().item())
-            turns_stats[curr_active_mask] += 1
             valid_action_stats += torch.tensor(valid_action, dtype=torch.int)
             executed_search_count += torch.tensor(executed_search, dtype=torch.long)
 
@@ -517,73 +612,8 @@ class LLMGenerationManager:
                 next_obs_ids
             )
             
-        # final LLM rollout
-        if active_mask.sum():
-            rollings.batch = self.tensor_fn.cut_to_effective_len(
-                rollings.batch,
-                keys=['input_ids', 'attention_mask', 'position_ids']
-            )
-
-            # gen_output = self.actor_rollout_wg.generate_sequences(rollings)
-            rollings_active = DataProto.from_dict(
-                {k: v[active_mask] for k, v in rollings.batch.items()},
-                meta_info=rollings.meta_info.copy(),
-            )
-            gen_output = self._generate_with_gpu_padding(rollings_active)
-
-            meta_info = gen_output.meta_info            
-            responses_ids, responses_str = self._postprocess_responses(gen_output.batch['responses'])
-            responses_ids, responses_str = self.tensor_fn._example_level_pad(responses_ids, responses_str, active_mask)
-            for index, active in enumerate(active_mask.tolist()):
-                if active:
-                    token_count = int((responses_ids[index] != self.tokenizer.pad_token_id).sum().item())
-                    generation_events[index].append({
-                        'turn': self.config.max_turns,
-                        'text': responses_str[index],
-                        'token_count': token_count,
-                        'clipped': token_count >= getattr(
-                            self.config, 'max_response_length', responses_ids.shape[1]),
-                    })
-
-            # # Execute in environment and process observations
-            _, dones, valid_action, executed_search = self.execute_predictions(
-                responses_str, self.tokenizer.pad_token, active_mask, do_search=False
-            )
-            parsed_actions = getattr(self, '_last_parsed_actions', None)
-            for index, active in enumerate(active_mask.tolist()):
-                if active:
-                    generation_events[index][-1].update({
-                        'valid_action': bool(valid_action[index]),
-                        'done': bool(dones[index]),
-                        'executed_search': bool(executed_search[index]),
-                    })
-                    if native_protocol:
-                        parsed = parsed_actions[index]
-                        parsed_record = self._parsed_action_record(
-                            self.config.max_turns, parsed)
-                        parsed_action_history[index].append(parsed_record)
-                        generation_events[index][-1].update({
-                            'tool_protocol': QWEN35_NATIVE,
-                            'action': parsed.action if parsed.valid else None,
-                            'content': parsed.content,
-                            'parse_error': parsed.error,
-                            'reasoning_prefix': parsed.prefix,
-                        })
-                        if parsed.action == 'answer' and parsed.valid:
-                            final_answers[index] = parsed.content
-
-            curr_active_mask = torch.tensor([not done for done in dones], dtype=torch.bool)
-            active_mask = active_mask * curr_active_mask
-            active_num_list.append(active_mask.sum().item())
-            valid_action_stats += torch.tensor(valid_action, dtype=torch.int)
-            
-
-            original_right_side = self._update_right_side(
-                original_right_side,
-                responses_ids,
-            )
-        
-        meta_info['turns_stats'] = turns_stats.tolist()
+        meta_info['turns_stats'] = action_count.tolist()
+        meta_info['max_action_budget'] = int(self.config.max_turns)
         meta_info['active_mask'] = active_mask.tolist()
         meta_info['valid_action_stats'] = valid_action_stats.tolist()
         # Keep the legacy aggregate for existing dashboards. Per-example reward
@@ -596,6 +626,7 @@ class LLMGenerationManager:
             original_left_side,
             original_right_side,
             meta_info,
+            action_count,
             executed_search_count,
             retrieval_events,
             generation_events,
@@ -607,6 +638,7 @@ class LLMGenerationManager:
     def _compose_final_output(self, left_side: Dict,
                             right_side: Dict,
                             meta_info: Dict,
+                            action_count: torch.Tensor,
                             executed_search_count: torch.Tensor,
                             retrieval_events=None,
                             generation_events=None,
@@ -635,6 +667,7 @@ class LLMGenerationManager:
         final_output['position_ids'] = self.tensor_fn.create_position_ids(
             final_output['attention_mask']
         )
+        final_output['action_count'] = action_count
         final_output['executed_search_count'] = executed_search_count
         
         non_tensors = None

@@ -91,6 +91,29 @@ class NqSmallTest(unittest.TestCase):
             self.assertEqual(len(manifest["splits"]["val"]["sample_ids"]), 2)
             self.assertTrue((Path(output_dir) / "test_3.parquet").is_file())
 
+            source_rows = json.loads(
+                (Path(output_dir) / "test_3.parquet").read_text(
+                    encoding="utf-8"))
+            with mock.patch.object(nq_small,
+                                   "_read_parquet",
+                                   return_value=source_rows):
+                native, sample_ids, source_path = (
+                    nq_small.load_native_test_records(
+                        Path(manifest_path),
+                        Path(output_dir) / "test_3.parquet"))
+            self.assertEqual(sample_ids, manifest["splits"]["test"]["sample_ids"])
+            self.assertEqual(source_path.name, "test_3.parquet")
+            self.assertEqual([row["prompt"] for row in native], [
+                nq_small.qwen35_messages(
+                    row["prompt"][0]["content"].rsplit("Question: ", 1)[1].strip())
+                for row in source_rows
+            ])
+            self.assertEqual(
+                [{key: value for key, value in row.items() if key != "prompt"}
+                 for row in native],
+                [{key: value for key, value in row.items() if key != "prompt"}
+                 for row in source_rows])
+
     def test_selection_fails_when_unique_examples_are_insufficient(self):
         duplicate_train = FakeDataset([{
             "question": "same question",

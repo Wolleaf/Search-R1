@@ -15,32 +15,35 @@ LEGACY_XML = "legacy_xml"
 QWEN35_NATIVE = "qwen35_native"
 SUPPORTED_TOOL_PROTOCOLS = (LEGACY_XML, QWEN35_NATIVE)
 
-QWEN35_PROMPT_VERSION = "qwen35-native-search-v2-answer-tag"
+QWEN35_PROMPT_VERSION = "qwen35-native-search-v3-original-aligned"
 QWEN35_MODEL_REVISION = "15852e8c16360a2fea060d615a32b45270f8a8fc"
 QWEN35_CHAT_TEMPLATE_SHA256 = (
     "273d8e0e683b885071fb17e08d71e5f2a5ddfb5309756181681de4f5a1822d80"
 )
-QWEN35_FORCE_SEARCH_INSTRUCTION = "Call search at least once before answering. "
-QWEN35_RETRY_PROMPT = (
-    "Invalid response. Call search once with specific terms, or output the "
-    "opening tag <answer>, only the short final answer text, and the closing "
-    "tag </answer>."
+QWEN35_RETRY_PROMPT = "My action is not correct. Let me rethink."
+
+_QWEN35_USER_PROMPT_PREFIX = (
+    "Answer the given question. You must conduct reasoning inside <think> and "
+    "</think> first every time you get new information. After reasoning, if "
+    "you find you lack some knowledge, you can call the available search tool "
+    "with a query, and it will return the top searched results in a tool "
+    "response. You can search as many times as you want. If you find no "
+    "further external knowledge needed, you can directly provide the answer "
+    "inside <answer> and </answer>, without detailed illustrations. For "
+    "example, <answer> Beijing </answer>. Question: "
 )
 
 _QWEN35_TOOLS = ({
     "type": "function",
     "function": {
         "name": "search",
-        "description": (
-            "Search the external knowledge base for evidence needed to answer "
-            "the question. Call exactly one search per assistant turn."
-        ),
+        "description": "Search an external knowledge base for relevant passages.",
         "parameters": {
             "type": "object",
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "A specific factual search query.",
+                    "description": "The text query to search for.",
                 }
             },
             "required": ["query"],
@@ -82,7 +85,7 @@ _NATIVE_ANSWER = re.compile(
     r"\A(?P<prefix>.*?)<answer>(?P<content>.*?)</answer>\s*\Z",
     flags=re.DOTALL,
 )
-_EMPTY_THINK_PREFIX = re.compile(
+_THINK_PREFIX = re.compile(
     r"\A<think>(?P<content>.*?)</think>",
     flags=re.DOTALL,
 )
@@ -133,65 +136,43 @@ def qwen35_tool_schema_sha256() -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def qwen35_system_prompt() -> str:
-    return (
-        "Call at most one tool per assistant turn. Use search when external "
-        "evidence is needed. After each search result, decide whether another "
-        "search is needed. Use at most four searches. "
-        "When you have enough evidence, output the opening tag <answer>, then "
-        "only the short final answer text, then the closing tag </answer>, and "
-        "end the response. Do not combine a tool call with a final answer in "
-        "the same assistant response, and do not output any text after the "
-        "closing tag."
-    )
-
-
-def qwen35_user_prompt(question: str, force_search: bool = False) -> str:
-    question = str(question).strip()
+def qwen35_user_prompt(question: str) -> str:
+    question = re.sub(r"\s+", " ", str(question)).strip()
     if not question:
         raise ValueError("question must not be empty")
-    force_instruction = QWEN35_FORCE_SEARCH_INSTRUCTION if force_search else ""
-    return f"{force_instruction}Question: {question}\n"
+    if any(marker in question for marker in _PROTOCOL_MARKERS):
+        raise ProtocolError("native question contains a reserved protocol marker")
+    if not question.endswith("?"):
+        question += "?"
+    return f"{_QWEN35_USER_PROMPT_PREFIX}{question}\n"
 
 
-def qwen35_messages(question: str,
-                    force_search: bool = False) -> list[dict[str, str]]:
-    return [
-        {
-            "role": "system",
-            "content": qwen35_system_prompt(),
-        },
-        {
-            "role": "user",
-            "content": qwen35_user_prompt(question,
-                                           force_search=force_search),
-        },
-    ]
+def qwen35_messages(question: str) -> list[dict[str, str]]:
+    return [{"role": "user", "content": qwen35_user_prompt(question)}]
 
 
 def validate_qwen35_messages(
         messages: Sequence[Mapping[str, Any]]) -> list[dict[str, str]]:
-    """Validate the materialized two-message native prompt contract."""
-    if len(messages) != 2:
-        raise ProtocolError("native prompt must contain system and user messages")
-    system, user = messages
-    if set(system) != {"role", "content"} or system.get("role") != "system":
-        raise ProtocolError("native prompt must start with the canonical system message")
-    if system.get("content") != qwen35_system_prompt():
-        raise ProtocolError("native prompt system contract does not match")
+    """Validate the materialized single-user native prompt contract."""
+    if len(messages) != 1:
+        raise ProtocolError("native prompt must contain exactly one user message")
+    user = messages[0]
     if set(user) != {"role", "content"} or user.get("role") != "user":
-        raise ProtocolError("native prompt must end with one user question")
+        raise ProtocolError("native prompt must contain exactly one user message")
     content = user.get("content")
-    if isinstance(content, str) and content.startswith(
-            QWEN35_FORCE_SEARCH_INSTRUCTION):
-        content = content[len(QWEN35_FORCE_SEARCH_INSTRUCTION):]
-    if (not isinstance(content, str) or not content.startswith("Question: ")
-            or not content.endswith("\n")
-            or not content[len("Question: "):-1].strip()):
-        raise ProtocolError("native user message must be 'Question: ...\\n'")
-    if any(marker in content for marker in _PROTOCOL_MARKERS):
-        raise ProtocolError("native question contains a reserved protocol marker")
-    return deepcopy([dict(system), dict(user)])
+    if (not isinstance(content, str)
+            or not content.startswith(_QWEN35_USER_PROMPT_PREFIX)
+            or not content.endswith("\n")):
+        raise ProtocolError("native user message does not match the original prompt")
+    question = content[len(_QWEN35_USER_PROMPT_PREFIX):-1]
+    try:
+        expected = qwen35_user_prompt(question)
+    except (ProtocolError, ValueError) as error:
+        raise ProtocolError(
+            "native user message does not contain a valid question") from error
+    if content != expected:
+        raise ProtocolError("native user message is not canonical")
+    return deepcopy([dict(user)])
 
 
 def render_qwen35_prompt(tokenizer: Any,
@@ -201,7 +182,7 @@ def render_qwen35_prompt(tokenizer: Any,
     return tokenizer.apply_chat_template(
         list(messages),
         tools=qwen35_tools(),
-        enable_thinking=False,
+        enable_thinking=True,
         add_generation_prompt=True,
         tokenize=False,
     )
@@ -241,8 +222,6 @@ def _parse_qwen35_action(text: str) -> ParsedAction:
             return ParsedAction(None, "", "empty_answer")
         if any(marker in answer for marker in _PROTOCOL_MARKERS):
             return ParsedAction(None, "", "nested_protocol_marker")
-        if _looks_like_json_tool_call(answer):
-            return ParsedAction(None, "", "json_tool_call_not_supported")
         return ParsedAction("answer", answer, prefix=prefix)
 
     has_marker = any(marker in candidate for marker in _PROTOCOL_MARKERS)
@@ -270,10 +249,6 @@ def _parse_qwen35_action(text: str) -> ParsedAction:
         return ParsedAction(None, "", "empty_search_query")
     if any(marker in query for marker in _PROTOCOL_MARKERS):
         return ParsedAction(None, "", "nested_protocol_marker")
-    if _looks_like_json_tool_call(query):
-        return ParsedAction(None, "", "json_tool_call_not_supported")
-    if query.casefold() in {"query", "and"}:
-        return ParsedAction(None, "", "placeholder_search_query")
     prefix, prefix_error = _normalize_qwen35_prefix(match.group("prefix"))
     if prefix_error is not None:
         return ParsedAction(None, "", prefix_error)
@@ -283,19 +258,28 @@ def _parse_qwen35_action(text: str) -> ParsedAction:
 
 
 def _normalize_qwen35_prefix(prefix: str) -> tuple[str, Optional[str]]:
-    """Accept one empty Qwen think echo, then marker-free reasoning."""
+    """Extract reasoning from Qwen's full or continuation-only think form."""
     candidate = prefix.strip()
     if candidate.startswith("<think"):
-        match = _EMPTY_THINK_PREFIX.match(candidate)
+        match = _THINK_PREFIX.match(candidate)
         if match is None:
             return "", "invalid_thinking_prefix"
-        if match.group("content").strip():
-            return "", "nonempty_thinking_prefix"
-        candidate = candidate[match.end():].strip()
+        reasoning = match.group("content").strip()
+        remainder = candidate[match.end():].strip()
+        if any(marker in remainder for marker in _PROTOCOL_MARKERS):
+            return "", "invalid_action_prefix"
+        candidate = "\n".join(part for part in (reasoning, remainder) if part)
+    elif "</think>" in candidate:
+        if candidate.count("</think>") != 1 or "<think" in candidate:
+            return "", "invalid_thinking_prefix"
+        reasoning, remainder = candidate.split("</think>", 1)
+        reasoning = reasoning.strip()
+        remainder = remainder.strip()
+        if any(marker in remainder for marker in _PROTOCOL_MARKERS):
+            return "", "invalid_action_prefix"
+        candidate = "\n".join(part for part in (reasoning, remainder) if part)
     if any(marker in candidate for marker in _PROTOCOL_MARKERS):
         return "", "invalid_action_prefix"
-    if _looks_like_json_tool_call(candidate):
-        return "", "json_tool_call_not_supported"
     return candidate, None
 
 
@@ -342,6 +326,38 @@ def _tokenize_text(tokenizer: Any, text: str) -> list[int]:
     return token_ids
 
 
+def _decode_token_ids(tokenizer: Any, token_ids: Sequence[int]) -> str:
+    try:
+        return tokenizer.decode(
+            list(token_ids),
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        )
+    except TypeError:
+        return tokenizer.decode(list(token_ids), skip_special_tokens=False)
+
+
+def _validate_response_token_ids(tokenizer: Any, response_text: str,
+                                 response_ids: Sequence[int]) -> None:
+    """Validate sampled IDs by decoding only; never canonicalize the sample."""
+    eos_token_id = getattr(tokenizer, "eos_token_id", None)
+    pad_token_id = getattr(tokenizer, "pad_token_id", None)
+    text_ids = list(response_ids)
+    for index, token_id in enumerate(text_ids):
+        if eos_token_id is not None and token_id == eos_token_id:
+            if index != len(text_ids) - 1:
+                raise ProtocolError(
+                    "response_token_ids contain an internal EOS token")
+            text_ids = text_ids[:-1]
+            break
+        if pad_token_id is not None and token_id == pad_token_id:
+            raise ProtocolError("response_token_ids contain a padding token")
+    decoded = _decode_token_ids(tokenizer, text_ids)
+    if decoded != response_text:
+        raise ProtocolError(
+            "response_token_ids do not decode exactly to response_text")
+
+
 class Qwen35Conversation:
     """Render exact native multi-turn suffixes while retaining model tokens."""
 
@@ -364,12 +380,40 @@ class Qwen35Conversation:
         observation_token_limit: Optional[int] = None,
     ) -> tuple[list[dict[str, Any]], list[int], str]:
         messages = deepcopy(self.messages)
+        if not action.valid:
+            # Qwen suppresses ``reasoning_content`` for every assistant turn
+            # before the latest ordinary user message. Materialize those
+            # wrappers before adding the user-role retry so rerendering cannot
+            # rewrite any already sampled token.
+            for message in messages:
+                if (message.get("role") == "assistant"
+                        and "reasoning_content" in message):
+                    reasoning = str(message["reasoning_content"]).strip()
+                    content = str(message.get("content", "")).strip()
+                    message["content"] = (
+                        f"<think>\n{reasoning}\n</think>\n\n{content}")
+                    message["reasoning_content"] = ""
         assistant_index = len(messages)
-        messages.append({
-            "role": "assistant",
-            "content": response_text,
-            "reasoning_content": "",
-        })
+        if action.valid:
+            marker = "<tool_call>" if action.action == "search" else "<answer>"
+            candidate = response_text.strip()
+            marker_index = candidate.find(marker)
+            if marker_index < 0:
+                raise ProtocolError("parsed native action marker is missing")
+            messages.append({
+                "role": "assistant",
+                "content": candidate[marker_index:],
+                "reasoning_content": action.prefix,
+            })
+        else:
+            # A later user retry makes Qwen stop adding the historical think
+            # wrapper, so retain the opening tag that was already in the
+            # sampled generation prefix as assistant content.
+            messages.append({
+                "role": "assistant",
+                "content": "<think>\n" + response_text,
+                "reasoning_content": "",
+            })
         visible_observation = ""
         if action.action == "search":
             observation_ids = _tokenize_text(self.tokenizer,
@@ -380,9 +424,7 @@ class Qwen35Conversation:
                 observation_ids, skip_special_tokens=True).strip()
             messages.append({"role": "tool", "content": visible_observation})
         elif not action.valid:
-            # A plain user retry makes Qwen's template rewrite the preceding
-            # assistant prefix. Tool role preserves the sampled token prefix.
-            messages.append({"role": "tool", "content": QWEN35_RETRY_PROMPT})
+            messages.append({"role": "user", "content": QWEN35_RETRY_PROMPT})
         else:
             raise ProtocolError("answer actions do not have a follow-up prompt")
 
@@ -428,6 +470,8 @@ class Qwen35Conversation:
             response_ids = _tokenize_text(self.tokenizer, response_text)
         else:
             response_ids = [int(token_id) for token_id in response_token_ids]
+            _validate_response_token_ids(self.tokenizer, response_text,
+                                         response_ids)
 
         def render(limit: Optional[int]):
             messages, template_suffix, visible = self._render_candidate(

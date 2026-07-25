@@ -1,0 +1,1 @@
+{"artifact":{"bytes":1550869,"expected_rows":32,"path":"eval_predictions.jsonl","record_schema":"search-r1.trajectory","record_schema_version":1,"record_type":"eval","rows":32,"sha256":"f9f78496a94e06829ac9219b2251f04d7cbd320157c145526386727e0c40bd79"},"run_id":"20260725T035137Z-1685-10976","schema":"search-r1.trajectory-manifest","schema_version":1,"stage":"qwen_native_g1"}

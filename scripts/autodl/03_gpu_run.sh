@@ -279,13 +279,10 @@ run_job() {
         eval:qwen_native_g1)
             budget_rmb=1
             ;;
-        eval:qwen_native_g2)
-            budget_rmb=3
-            ;;
         eval:qwen_native_g3)
             budget_rmb=10
             ;;
-        eval:qwen_native_b|eval:qwen_native_c)
+        eval:qwen_native_a_*|eval:qwen_native_r_*|eval:qwen_native_b_*|eval:qwen_native_c_*)
             budget_rmb=5
             ;;
         eval:base|eval:reproduced|eval:control|eval:cost_aware|eval:cost_aware_gated)
@@ -356,13 +353,6 @@ run_job() {
                 printf 'Qwen native G1 requires 16 rows and EVAL_GROUP_SIZE=2.\n' >&2
                 return 64
             }
-        elif [[ "$variant" == qwen_native_g2 ]]; then
-            [[ "$TOOL_PROTOCOL" == qwen35_native && -n "$EVAL_DATA_FILE" &&
-                -f "$EVAL_DATA_FILE" && "$EVAL_EXPECTED_ROWS" == 32 &&
-                "$EVAL_GROUP_SIZE" == 3 ]] || {
-                printf 'Qwen native G2 requires 32 rows and EVAL_GROUP_SIZE=3.\n' >&2
-                return 64
-            }
         elif [[ "$variant" == qwen_native_g3 ]]; then
             [[ "$TOOL_PROTOCOL" == qwen35_native && -n "$EVAL_DATA_FILE" &&
                 -f "$EVAL_DATA_FILE" && "$EVAL_EXPECTED_ROWS" == 64 &&
@@ -370,10 +360,11 @@ run_job() {
                 printf 'Qwen native G3 requires 64 rows and EVAL_GROUP_SIZE=5.\n' >&2
                 return 64
             }
-        elif [[ "$variant" == qwen_native_b || "$variant" == qwen_native_c ]]; then
+        elif [[ "$variant" == qwen_native_[arbc]_* ]]; then
             [[ "$TOOL_PROTOCOL" == qwen35_native && -z "$EVAL_DATA_FILE" &&
-                "$EVAL_EXPECTED_ROWS" == 128 && "$EVAL_GROUP_SIZE" == 1 ]] || {
-                printf 'Qwen native endpoint evaluation requires sealed val-128 with group size 1.\n' >&2
+                ( "$EVAL_EXPECTED_ROWS" == 128 || "$EVAL_EXPECTED_ROWS" == 256 ) &&
+                "$EVAL_GROUP_SIZE" == 1 ]] || {
+                printf 'Qwen native endpoint evaluation requires a sealed v3 artifact and group size 1.\n' >&2
                 return 64
             }
         elif [[ -n "$EVAL_DATA_FILE" ]]; then
@@ -458,8 +449,10 @@ run_job() {
             if [[ "$variant" == search_opportunity ]]; then
                 expected_trace_rows="$EVAL_EXPECTED_ROWS"
             elif [[ "$variant" == group_probe || "$variant" == qwen_native_g1 ||
-                   "$variant" == qwen_native_g2 || "$variant" == qwen_native_g3 ]]; then
+                   "$variant" == qwen_native_g3 ]]; then
                 expected_trace_rows=$((EVAL_EXPECTED_ROWS * EVAL_GROUP_SIZE))
+            elif [[ "$variant" == qwen_native_[arbc]_* ]]; then
+                expected_trace_rows="$EVAL_EXPECTED_ROWS"
             else
                 expected_trace_rows=128
             fi
@@ -718,14 +711,24 @@ PY
         handoff_verify_args+=(
             --require-artifact data/search_mix/retrieval_replay.json
             --require-artifact data/search_mix/retrieval_replay.json.sha256
+            --require-artifact data/search_mix_qwen35_native_v3/manifest.json
+            --require-artifact data/search_mix_qwen35_native_v3/manifest.json.sha256
+            --require-artifact data/search_mix_qwen35_native_v3/probe_g0_8.parquet
+            --require-artifact data/search_mix_qwen35_native_v3/probe_autonomous_16.parquet
+            --expect-native-prompt-version qwen35-native-search-v3-original-aligned
+            --expect-native-thinking-enabled
+            --expect-max-action-budget 4
+            --expect-selection-observation-length 384
+            --expect-rollout-observation-length 500
         )
     fi
     if [[ "${AUTODL_GPU_PIPELINE:-legacy}" == qwen_native_train ]]; then
         handoff_verify_args+=(
-            --require-artifact data/search_mix_qwen35_native_v2/manifest.json
-            --require-artifact data/search_mix_qwen35_native_v2/manifest.json.sha256
-            --require-artifact data/search_mix_qwen35_native_v2/train_512.parquet
-            --require-artifact data/search_mix_qwen35_native_v2/val_128.parquet
+            --require-artifact data/search_mix_qwen35_native_v3/train_512.parquet
+            --require-artifact data/search_mix_qwen35_native_v3/val_128.parquet
+            --require-artifact data/search_mix_qwen35_native_v3/probe_multi_64.parquet
+            --require-artifact data/search_mix_qwen35_native_v3/nq_test_128_native_v3.parquet
+            --require-artifact data/search_mix_qwen35_native_v3/multihop_eval_256_native_v3.parquet
         )
     fi
     "$TRAIN_ENV/bin/python" "$CHECKOUT_DIR/scripts/autodl/handoff.py" verify \
