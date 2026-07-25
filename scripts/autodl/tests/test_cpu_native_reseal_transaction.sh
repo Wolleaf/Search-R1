@@ -27,6 +27,22 @@ validation = text.index('validate-native-evidence')
 publication = text.index('"$train_python" "$CHECKOUT_DIR/scripts/autodl/handoff.py" create')
 if validation >= publication:
     raise SystemExit("native evidence validation must precede handoff publication")
+endpoint_start = text.index("        for variant in \\\n            qwen_native_a_val")
+endpoint_end = text.index("        for spec in \\\n            \"smoke|2|\"", endpoint_start)
+endpoint_block = text[endpoint_start:endpoint_end]
+endpoint_contract = (
+    'endpoint_model="$parent_placeholder"',
+    'if [[ "$variant" == qwen_native_a_* ]]; then',
+    'endpoint_model="$MODEL_DIR"',
+    'eval "$variant" "$endpoint_model"',
+)
+missing_endpoint = [value for value in endpoint_contract
+                    if value not in endpoint_block]
+if missing_endpoint:
+    raise SystemExit(
+        f"CPU native endpoint model binding is incomplete: {missing_endpoint}")
+if 'eval "$variant" "$parent_placeholder"' in endpoint_block:
+    raise SystemExit("native A endpoint configs cannot use the parent placeholder")
 PY
 
 MANIFEST_DIR="$ROOT/manifests"

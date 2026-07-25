@@ -274,7 +274,7 @@ example, <answer> Beijing </answer>. Question: {question}
 3. 只把该精确 token prefix 放入策略轨迹、环境执行和 PPO log-prob；不得重新编码字符串。
 4. parser 对切片后的单 action 工作，不再因 raw tail 中第二个调用把第一调用作废。
 5. thinking 内容正确写入 Qwen message 的 `reasoning_content`，action 写入 `content`；tool result 后由模板开启下一次 thinking。
-6. invalid action 的 sampled reasoning/action 先按真实 assistant message 重建，再追加一条 **user-role** 的论文原文 `My action is not correct. Let me rethink.`，然后由固定 template 开启下一次 assistant thinking。只允许这一种 role/文案；从重渲染结果提取 suffix 时必须断言此前累计 sampled token 逐 token 不变，做不到就判 adapter 失败，不能退回伪 tool role 或自造固定 suffix。
+6. invalid action 的 sampled reasoning/action 先按真实 assistant message 重建，再追加一条 **user-role** 的论文原文 `My action is not correct. Let me rethink.`，然后由固定 template 开启下一次 assistant thinking。只允许这一种 role/文案；从重渲染结果提取的 suffix 必须是独立 token tail，拼接时此前累计 token 和本轮 sampled token 必须逐 token 不变，做不到就判 adapter 失败，不能退回伪 tool role 或自造固定 suffix。完整 messages 的 fresh render 仅用于 canonical 合成轨迹回归，不能因 tokenizer 的非 canonical segmentation 或模板 `trim` 而替换、拒绝真实 sampled token。
 
 这与上游“生成后截到首个 action”一致，同时比上游 decode-truncate-reencode 更严格地保存 Qwen 实际 token。完整 raw 仍能展示模型是否有并行多调用倾向，但 raw tail 不进入训练轨迹。
 
@@ -360,7 +360,7 @@ CPU 阶段只做增量修复，无需重建环境、模型、语料或 BM25：
 2. 验证每个 generation prefix 确实开启 thinking，native tool schema 存在，自写策略 system 不存在。
 3. 用合成 token 覆盖零搜回答、合法 search、二次 search、非空 think、双调用 raw、invalid retry 和 answer。
 4. 验证总 action 计数严格不超过 4、没有额外 terminal、rollout observation 上限为 500，最坏容量不超过 4096；新 trace 只写 `max_action_budget`。
-5. 验证每轮 reconstructed tokens 与 manager tokens 完全一致，observation/wrapper 全部被 info mask 排除。
+5. 验证按“初始 canonical prompt + 每轮原 sampled IDs + 独立 template suffix”递归得到的 reconstructed tokens 与 manager tokens 完全一致，observation/wrapper 全部被 info mask 排除；canonical 合成轨迹另做完整 messages 重渲染一致性检查，但不把真实 sampled IDs 重新编码后作为运行时门禁。
 6. 验证 v3 与 source 的非 prompt 字段逐行相同，manifest 同时保留 selection obs=384 与 rollout obs=500；用真实 native template 对 train 512 + val 128 共 640 条证据渲染 500-token follow-up，逐条确认原 catalog 记录的 gold/supporting evidence 仍可见。任一失败只封存报告并停止，不自动重选题或重跑 BM25；forced probe 不在 v3 科学入口。
 7. 验证主训练、watchdog、lineage 都不再依赖 parent G3 GO，最终评测入口同时接受 curated 与无筛选 sealed 数据。
 8. 运行聚焦 pytest、`compileall`、相关 shell tests、`bash -n` 和三路 Hydra config compose。

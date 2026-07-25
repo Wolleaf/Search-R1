@@ -465,6 +465,41 @@ def test_native_conversation_uses_complete_invalid_retry_wrapper():
     }
 
 
+def test_native_consecutive_invalid_retries_do_not_rewrite_history():
+    tokenizer = _LastQueryAwareCharacterTokenizer()
+    messages = qwen35_messages("Capital of France?")
+    initial = render_qwen35_prompt(tokenizer, messages)
+    initial_ids = tokenizer(initial, add_special_tokens=False)["input_ids"]
+    conversation = Qwen35Conversation(tokenizer, messages, initial_ids)
+    first = "<tool_call>broken"
+    first_ids = tokenizer(first, add_special_tokens=False)["input_ids"]
+    conversation.append_followup(
+        first,
+        parse_action(first, QWEN35_NATIVE),
+        "",
+        max_obs_length=300,
+        response_token_ids=first_ids,
+    )
+    before_second = list(conversation.prompt_token_ids)
+    first_assistant = dict(conversation.messages[1])
+    second = "still not a valid action"
+    second_ids = tokenizer(second, add_special_tokens=False)["input_ids"]
+
+    followup = conversation.append_followup(
+        second,
+        parse_action(second, QWEN35_NATIVE),
+        "",
+        max_obs_length=300,
+        response_token_ids=second_ids,
+    )
+
+    assert conversation.messages[1] == first_assistant
+    assert conversation.prompt_token_ids == (
+        before_second + second_ids + list(followup.token_ids))
+    assert render_qwen35_prompt(tokenizer, conversation.messages) == (
+        tokenizer.decode(conversation.prompt_token_ids))
+
+
 def test_native_user_retry_does_not_rewrite_prior_search_tokens():
     tokenizer = _CharacterTokenizer()
     messages = qwen35_messages("Who wrote Hamlet?")

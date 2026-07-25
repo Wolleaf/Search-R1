@@ -1065,6 +1065,10 @@ PY
             qwen_native_b_nq_test qwen_native_c_nq_test \
             qwen_native_a_multihop qwen_native_r_multihop \
             qwen_native_b_multihop qwen_native_c_multihop; do
+            endpoint_model="$parent_placeholder"
+            if [[ "$variant" == qwen_native_a_* ]]; then
+                endpoint_model="$MODEL_DIR"
+            fi
             AUTODL_CONFIG_ONLY=1 \
                 AUTODL_ROOT="$PROJECT_ROOT" \
                 GPU_COUNT=2 \
@@ -1080,7 +1084,7 @@ PY
                 TRACE_CHECKPOINT_DIGEST="$trace_digest_placeholder" \
                 TOOL_PROTOCOL=qwen35_native \
                 bash "$CHECKOUT_DIR/scripts/autodl/train_small_grpo.sh" \
-                eval "$variant" "$parent_placeholder" \
+                eval "$variant" "$endpoint_model" \
                 >"$config_manifest_dir/config-2gpu-$variant-eval.yaml"
         done
         for spec in \

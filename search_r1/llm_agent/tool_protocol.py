@@ -385,7 +385,9 @@ class Qwen35Conversation:
             # before the latest ordinary user message. Materialize those
             # wrappers before adding the user-role retry so rerendering cannot
             # rewrite any already sampled token.
-            for message in messages:
+            for message in reversed(messages):
+                if message.get("role") == "user":
+                    break
                 if (message.get("role") == "assistant"
                         and "reasoning_content" in message):
                     reasoning = str(message["reasoning_content"]).strip()
