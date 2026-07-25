@@ -103,6 +103,27 @@ validate_protected_executable() {
     validate_protected_regular "$1" "$2" && [[ -x "$1" ]]
 }
 
+select_authorization_python() {
+    local candidate canonical
+    local -a candidates=(
+        /usr/bin/python3
+        /usr/local/bin/python3
+        /root/miniconda3/bin/python3
+    )
+    for candidate in "${candidates[@]}"; do
+        [[ -e "$candidate" || -L "$candidate" ]] || continue
+        canonical="$(canonical_existing "$candidate")" || continue
+        validate_protected_executable "$canonical" 0 || continue
+        if /usr/bin/env -i PATH="$PATH" "$canonical" -I -S -c \
+                'import csv, hashlib, json, os, pathlib, re, stat, sys; raise SystemExit(sys.version_info < (3, 9))' \
+                >/dev/null 2>&1; then
+            printf '%s\n' "$canonical"
+            return 0
+        fi
+    done
+    return 1
+}
+
 validate_mount() {
     local persistent_root="$1" mount_line root_line target fs source majmin root_majmin
     command -v findmnt >/dev/null 2>&1 || return 1
@@ -367,8 +388,10 @@ validate_legacy_success_artifacts() {
 
 validate_qwen_native_training_evidence() {
     local contract="$1" project="$2" results="$3" attempt_name="$4" expected_uid="$5"
-    command -v python3 >/dev/null 2>&1 || return 1
-    python3 - "$contract" "$project" "$results" "$attempt_name" "$expected_uid" <<'PY'
+    local python_bin
+    python_bin="$(select_authorization_python)" || return 1
+    /usr/bin/env -i PATH="$PATH" "$python_bin" -I -S - \
+        "$contract" "$project" "$results" "$attempt_name" "$expected_uid" <<'PY'
 import csv
 import hashlib
 import json
