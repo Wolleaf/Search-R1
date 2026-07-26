@@ -15,6 +15,13 @@ LEGACY_XML = "legacy_xml"
 QWEN35_NATIVE = "qwen35_native"
 SUPPORTED_TOOL_PROTOCOLS = (LEGACY_XML, QWEN35_NATIVE)
 
+QWEN35_REASONING_CONTINUATION = "continuation"
+QWEN35_REASONING_FULL = "full"
+QWEN35_REASONING_MODES = (
+    QWEN35_REASONING_CONTINUATION,
+    QWEN35_REASONING_FULL,
+)
+
 QWEN35_PROMPT_VERSION = "qwen35-native-search-v3-original-aligned"
 QWEN35_MODEL_REVISION = "15852e8c16360a2fea060d615a32b45270f8a8fc"
 QWEN35_CHAT_TEMPLATE_SHA256 = (
@@ -85,10 +92,6 @@ _NATIVE_ANSWER = re.compile(
     r"\A(?P<prefix>.*?)<answer>(?P<content>.*?)</answer>\s*\Z",
     flags=re.DOTALL,
 )
-_THINK_PREFIX = re.compile(
-    r"\A<think>(?P<content>.*?)</think>",
-    flags=re.DOTALL,
-)
 _LEGACY_ACTION = re.compile(r"<(search|answer)>(.*?)</\1>", re.DOTALL)
 
 
@@ -109,6 +112,18 @@ class ParsedAction:
 
 
 @dataclass(frozen=True)
+class Qwen35ActionBoundary:
+    """Reasoning split and first closing delimiter in one native response."""
+
+    reasoning: str
+    action_start: Optional[int]
+    boundary: Optional[str]
+    delimiter_start: Optional[int]
+    logical_end: Optional[int]
+    error: Optional[str] = None
+
+
+@dataclass(frozen=True)
 class ProtocolFollowup:
     token_ids: tuple[int, ...]
     visible_observation: str
@@ -121,6 +136,81 @@ def normalize_tool_protocol(value: Any) -> str:
             f"tool_protocol must be one of {SUPPORTED_TOOL_PROTOCOLS}, got "
             f"{protocol!r}")
     return protocol
+
+
+def normalize_qwen35_reasoning_mode(value: Any) -> str:
+    mode = str(value)
+    if mode not in QWEN35_REASONING_MODES:
+        raise ProtocolError(
+            f"qwen35 reasoning mode must be one of {QWEN35_REASONING_MODES}, "
+            f"got {mode!r}")
+    return mode
+
+
+def locate_qwen35_action_boundary(
+        text: str, reasoning_mode: str) -> Qwen35ActionBoundary:
+    """Locate the first native close marker after the reasoning channel."""
+    if not isinstance(text, str):
+        raise TypeError("model response must be a string")
+    mode = normalize_qwen35_reasoning_mode(reasoning_mode)
+
+    opening_start: Optional[int] = None
+    if mode == QWEN35_REASONING_CONTINUATION:
+        close_start = text.find("</think>")
+        reasoning_start = 0
+    else:
+        opening_start = text.find("<think>")
+        if opening_start < 0 or text[:opening_start].strip():
+            return Qwen35ActionBoundary("", None, None, None, None,
+                                        "invalid_thinking_prefix")
+        close_start = text.find("</think>", opening_start + len("<think>"))
+        reasoning_start = opening_start + len("<think>")
+    if close_start < 0:
+        return Qwen35ActionBoundary("", None, None, None, None,
+                                    "invalid_thinking_prefix")
+
+    action_start = close_start + len("</think>")
+    completed = []
+    for marker, boundary in (("</tool_call>", "tool_call"),
+                             ("</answer>", "answer")):
+        position = text.find(marker, action_start)
+        if position >= 0:
+            completed.append((position, boundary, len(marker)))
+    delimiter_start = None
+    boundary = None
+    logical_end = None
+    if completed:
+        delimiter_start, boundary, marker_length = min(
+            completed, key=lambda item: item[0])
+        logical_end = delimiter_start + marker_length
+
+    # Raw tail after the first complete action is audit-only and cannot make
+    # the already selected reasoning/action prefix invalid.
+    validation_end = logical_end if logical_end is not None else len(text)
+    validated_prefix = text[:validation_end]
+    if mode == QWEN35_REASONING_CONTINUATION:
+        thinking_valid = (validated_prefix.count("</think>") == 1
+                          and "<think" not in validated_prefix)
+    else:
+        thinking_valid = (
+            validated_prefix.count("<think>") == 1
+            and validated_prefix.count("<think") == 1
+            and validated_prefix.count("</think>") == 1
+            and opening_start is not None)
+    if not thinking_valid:
+        return Qwen35ActionBoundary("", None, None, None, None,
+                                    "invalid_thinking_prefix")
+
+    reasoning = text[reasoning_start:close_start].strip()
+    if logical_end is None:
+        return Qwen35ActionBoundary(reasoning, action_start, None, None, None)
+    return Qwen35ActionBoundary(
+        reasoning=reasoning,
+        action_start=action_start,
+        boundary=boundary,
+        delimiter_start=delimiter_start,
+        logical_end=logical_end,
+    )
 
 
 def qwen35_tools() -> list[dict[str, Any]]:
@@ -188,33 +278,50 @@ def render_qwen35_prompt(tokenizer: Any,
     )
 
 
-def parse_action(text: str, tool_protocol: str) -> ParsedAction:
+def parse_action(text: str,
+                 tool_protocol: str,
+                 *,
+                 qwen35_reasoning_mode: Optional[str] = None) -> ParsedAction:
     protocol = normalize_tool_protocol(tool_protocol)
     if not isinstance(text, str):
         raise TypeError("model response must be a string")
     if protocol == LEGACY_XML:
+        if qwen35_reasoning_mode is not None:
+            raise ProtocolError(
+                "qwen35 reasoning mode is invalid for the legacy protocol")
         match = _LEGACY_ACTION.search(text)
         if match is None:
             return ParsedAction(None, "", "missing_legacy_action")
         return ParsedAction(match.group(1), match.group(2).strip())
-    return _parse_qwen35_action(text)
+    if qwen35_reasoning_mode is None:
+        raise ProtocolError("qwen35 reasoning mode is required")
+    return _parse_qwen35_action(text, qwen35_reasoning_mode)
 
 
-def _parse_qwen35_action(text: str) -> ParsedAction:
-    candidate = text.strip()
-    if not candidate:
+def _parse_qwen35_action(text: str, reasoning_mode: str) -> ParsedAction:
+    if not text.strip():
         return ParsedAction(None, "", "empty_response")
+    located = locate_qwen35_action_boundary(text, reasoning_mode)
+    if located.error is not None:
+        return ParsedAction(None, "", located.error)
+    if located.action_start is None:
+        raise AssertionError("valid native reasoning has no action start")
 
-    has_answer_marker = ("<answer" in candidate
-                         or "</answer>" in candidate)
-    if has_answer_marker:
+    logical_end = located.logical_end if located.logical_end is not None else len(
+        text)
+    candidate = text[located.action_start:logical_end].strip()
+    if not candidate:
+        return ParsedAction(None, "", "missing_native_action")
+
+    if located.boundary == "answer":
         if (candidate.count("<answer>") != 1
                 or candidate.count("</answer>") != 1):
             return ParsedAction(None, "", "multiple_or_unbalanced_answers")
         match = _NATIVE_ANSWER.fullmatch(candidate)
         if match is None:
             return ParsedAction(None, "", "malformed_answer")
-        prefix, prefix_error = _normalize_qwen35_prefix(match.group("prefix"))
+        prefix, prefix_error = _normalize_qwen35_action_prefix(
+            match.group("prefix"))
         if prefix_error is not None:
             return ParsedAction(None, "", prefix_error)
         answer = match.group("content").strip()
@@ -222,13 +329,23 @@ def _parse_qwen35_action(text: str) -> ParsedAction:
             return ParsedAction(None, "", "empty_answer")
         if any(marker in answer for marker in _PROTOCOL_MARKERS):
             return ParsedAction(None, "", "nested_protocol_marker")
-        return ParsedAction("answer", answer, prefix=prefix)
+        return ParsedAction(
+            "answer",
+            answer,
+            prefix=_join_reasoning_prefix(located.reasoning, prefix),
+        )
 
-    has_marker = any(marker in candidate for marker in _PROTOCOL_MARKERS)
-    if not has_marker:
-        if _looks_like_json_tool_call(candidate):
-            return ParsedAction(None, "", "json_tool_call_not_supported")
-        return ParsedAction(None, "", "missing_native_action")
+    if located.boundary is None:
+        has_answer_marker = ("<answer" in candidate
+                             or "</answer>" in candidate)
+        if has_answer_marker:
+            return ParsedAction(None, "", "multiple_or_unbalanced_answers")
+        has_marker = any(marker in candidate for marker in _PROTOCOL_MARKERS)
+        if not has_marker:
+            if _looks_like_json_tool_call(candidate):
+                return ParsedAction(None, "", "json_tool_call_not_supported")
+            return ParsedAction(None, "", "missing_native_action")
+        return ParsedAction(None, "", "multiple_or_unbalanced_tool_calls")
 
     if (candidate.count("<tool_call>") != 1
             or candidate.count("</tool_call>") != 1
@@ -249,38 +366,27 @@ def _parse_qwen35_action(text: str) -> ParsedAction:
         return ParsedAction(None, "", "empty_search_query")
     if any(marker in query for marker in _PROTOCOL_MARKERS):
         return ParsedAction(None, "", "nested_protocol_marker")
-    prefix, prefix_error = _normalize_qwen35_prefix(match.group("prefix"))
+    prefix, prefix_error = _normalize_qwen35_action_prefix(
+        match.group("prefix"))
     if prefix_error is not None:
         return ParsedAction(None, "", prefix_error)
     return ParsedAction("search",
                         query,
-                        prefix=prefix)
+                        prefix=_join_reasoning_prefix(located.reasoning,
+                                                      prefix))
 
 
-def _normalize_qwen35_prefix(prefix: str) -> tuple[str, Optional[str]]:
-    """Extract reasoning from Qwen's full or continuation-only think form."""
+def _normalize_qwen35_action_prefix(
+        prefix: str) -> tuple[str, Optional[str]]:
+    """Validate marker-free prose between thinking and the native action."""
     candidate = prefix.strip()
-    if candidate.startswith("<think"):
-        match = _THINK_PREFIX.match(candidate)
-        if match is None:
-            return "", "invalid_thinking_prefix"
-        reasoning = match.group("content").strip()
-        remainder = candidate[match.end():].strip()
-        if any(marker in remainder for marker in _PROTOCOL_MARKERS):
-            return "", "invalid_action_prefix"
-        candidate = "\n".join(part for part in (reasoning, remainder) if part)
-    elif "</think>" in candidate:
-        if candidate.count("</think>") != 1 or "<think" in candidate:
-            return "", "invalid_thinking_prefix"
-        reasoning, remainder = candidate.split("</think>", 1)
-        reasoning = reasoning.strip()
-        remainder = remainder.strip()
-        if any(marker in remainder for marker in _PROTOCOL_MARKERS):
-            return "", "invalid_action_prefix"
-        candidate = "\n".join(part for part in (reasoning, remainder) if part)
     if any(marker in candidate for marker in _PROTOCOL_MARKERS):
         return "", "invalid_action_prefix"
     return candidate, None
+
+
+def _join_reasoning_prefix(reasoning: str, action_prefix: str) -> str:
+    return "\n".join(part for part in (reasoning, action_prefix) if part)
 
 
 def _looks_like_json_tool_call(candidate: str) -> bool:
@@ -398,13 +504,22 @@ class Qwen35Conversation:
         assistant_index = len(messages)
         if action.valid:
             marker = "<tool_call>" if action.action == "search" else "<answer>"
-            candidate = response_text.strip()
-            marker_index = candidate.find(marker)
+            candidate = response_text
+            located = locate_qwen35_action_boundary(
+                candidate, QWEN35_REASONING_CONTINUATION)
+            expected_boundary = (
+                "tool_call" if action.action == "search" else "answer")
+            if (located.error is not None
+                    or located.boundary != expected_boundary
+                    or located.action_start is None):
+                raise ProtocolError(
+                    "parsed native action boundary does not match response")
+            marker_index = candidate.find(marker, located.action_start)
             if marker_index < 0:
                 raise ProtocolError("parsed native action marker is missing")
             messages.append({
                 "role": "assistant",
-                "content": candidate[marker_index:],
+                "content": candidate[marker_index:].strip(),
                 "reasoning_content": action.prefix,
             })
         else:

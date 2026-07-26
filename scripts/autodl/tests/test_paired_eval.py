@@ -235,10 +235,10 @@ class PairedEvalTest(unittest.TestCase):
                     })
                 raw_generations = [{
                     "turn": turn,
-                    "raw_text": "x",
+                    "raw_text": "fixture</think>x",
                     "raw_token_ids": [turn + 1],
                     "raw_token_count": 1,
-                    "action_text": "x",
+                    "action_text": "fixture</think>x",
                     "action_token_ids": [turn + 1],
                     "action_token_count": 1,
                     "boundary": "length" if clipped and turn == 0 else "eos",

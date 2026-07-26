@@ -18,18 +18,20 @@ from verl.trainer.ppo.ray_trainer import (
 
 
 def _eval_record():
+    action_text = (
+        'Answer from the available evidence.</think><answer>Paris</answer>')
     return {
         'sample_id': 'hotpotqa:train:17',
         'source_index': 17,
         'question': 'Which city is the capital?',
         'gold_answers': ['Paris'],
-        'raw_trajectory': '<answer>Paris</answer>',
+        'raw_trajectory': action_text,
         'raw_generations': [{
             'turn': 0,
-            'raw_text': '<answer>Paris</answer>',
+            'raw_text': action_text,
             'raw_token_ids': [10, 11, 12, 13],
             'raw_token_count': 4,
-            'action_text': '<answer>Paris</answer>',
+            'action_text': action_text,
             'action_token_ids': [10, 11, 12, 13],
             'action_token_count': 4,
             'boundary': 'answer',

@@ -285,14 +285,15 @@ def test_native_training_batch_records_zero_advantage_without_aborting():
     assert metrics['native_batch/advantage_abs_max'] == 0.0
 
 
-@pytest.mark.parametrize(('decoded_query', 'trailing_output'), [
-    ('France capital', ''),
-    ('France  capital', ''),
+@pytest.mark.parametrize(('decoded_query', 'trailing_output',
+                          'action_overshoot'), [
+    ('France capital', '', ''),
+    ('France  capital', '', '.'),
     ('France capital',
-     '<answer>Paris, France</answer><search>France capital</search>'),
+     '<answer>Paris, France</answer><search>France capital</search>', ''),
 ])
 def test_training_trace_integration_keeps_group_fields_aligned(
-        tmp_path, decoded_query, trailing_output):
+        tmp_path, decoded_query, trailing_output, action_overshoot):
     batch_size = 5
     tensors = {
         'prompts': torch.tensor([[1, 2]] * batch_size),
@@ -318,9 +319,12 @@ def test_training_trace_integration_keeps_group_fields_aligned(
         'observation': 'Doc 1 says Paris.',
     }] for _ in range(batch_size)]
     search_text = (
-        '<tool_call><function=search><parameter=query>France capital'
+        'I need evidence.</think><tool_call><function=search>'
+        '<parameter=query>France capital'
         '</parameter></function></tool_call>')
-    answer_text = '<think>The evidence is clear.</think><answer>Paris</answer>'
+    answer_text = (
+        'The evidence is clear.</think><answer>Paris</answer>'
+        f'{action_overshoot}')
     generations = [[{
         'turn': 0,
         'text': search_text,
@@ -339,7 +343,7 @@ def test_training_trace_integration_keeps_group_fields_aligned(
         'action': 'search',
         'content': 'France capital',
         'parse_error': None,
-        'reasoning_prefix': '',
+        'reasoning_prefix': 'I need evidence.',
     }, {
         'turn': 1,
         'text': answer_text,
@@ -420,6 +424,11 @@ def test_training_trace_integration_keeps_group_fields_aligned(
         assert records[0]['turns'][-1]['action'] == 'answer'
         assert trailing_output in records[0]['raw_generations'][-1]['raw_text']
         assert trailing_output not in records[0]['raw_trajectory']
+    if action_overshoot:
+        generation = records[0]['raw_generations'][-1]
+        assert generation['action_text'].endswith('</answer>.')
+        assert generation['boundary'] == 'answer'
+        assert generation['action_token_ids'] == [40, 41, 42, 43]
     assert records[0]['max_action_budget'] == 4
     assert records[0]['action_count'] == 2
     assert records[0]['policy_token_count'] == 7

@@ -10,6 +10,11 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Set
 
+from search_r1.llm_agent.tool_protocol import (
+    QWEN35_REASONING_CONTINUATION,
+    locate_qwen35_action_boundary,
+)
+
 TRACE_SCHEMA = "search-r1.trajectory"
 TRACE_SCHEMA_VERSION = 3
 SUPPORTED_TRACE_SCHEMA_VERSIONS = (1, 2, TRACE_SCHEMA_VERSION)
@@ -299,14 +304,18 @@ def _validate_raw_generation(generation: Any, index: int) -> None:
     if generation["tail_dropped"] != (raw_ids != action_ids):
         raise ValueError(
             f"raw_generations[{index}].tail_dropped does not match IDs")
-    if (generation["boundary"] == "tool_call"
-            and not generation["action_text"].rstrip().endswith("</tool_call>")):
+    located = locate_qwen35_action_boundary(
+        generation["action_text"], QWEN35_REASONING_CONTINUATION)
+    declared_boundary = generation["boundary"]
+    if declared_boundary in ("tool_call", "answer"):
+        if located.error is not None or located.boundary != declared_boundary:
+            raise ValueError(
+                f"raw_generations[{index}] {declared_boundary} boundary is inconsistent"
+            )
+    elif located.boundary is not None:
         raise ValueError(
-            f"raw_generations[{index}] tool_call boundary is inconsistent")
-    if (generation["boundary"] == "answer"
-            and not generation["action_text"].rstrip().endswith("</answer>")):
-        raise ValueError(
-            f"raw_generations[{index}] answer boundary is inconsistent")
+            f"raw_generations[{index}] {declared_boundary} boundary is inconsistent"
+        )
 
 
 def _stable_record_id(record: Mapping[str, Any]) -> str:

@@ -114,7 +114,7 @@ def _record(sample_index: int,
                   observation=observation,
                   documents=documents))
         action_text = (
-            "<think>search</think><tool_call>"
+            "search</think><tool_call>"
             f'{{"name":"search","arguments":{{"query":{json.dumps(query)}}}}}'
             "</tool_call>")
         raw_generations.append(
@@ -123,7 +123,7 @@ def _record(sample_index: int,
             f"{action_text}<information>{observation}</information>")
     extracted = answer if em else f"Wrong {sample_index}"
     turns.append(_turn(len(turns), "answer", answer=extracted))
-    answer_text = f"<think>answer</think><answer>{extracted}</answer>"
+    answer_text = f"answer</think><answer>{extracted}</answer>"
     raw_generations.append(
         _raw_generation(len(raw_generations), answer_text, "answer"))
     raw_parts.append(answer_text)
@@ -261,7 +261,7 @@ def _add_invalid_turn(record: dict[str, object]) -> None:
     raw_generations = record["raw_generations"]
     assert isinstance(raw_generations, list)
     generation = _raw_generation(len(raw_generations),
-                                 "<think>invalid</think>unparsed", "eos")
+                                 "invalid</think>unparsed", "eos")
     raw_generations.append(generation)
     record["raw_trajectory"] += generation["action_text"]
     record["action_count"] = len(raw_generations)

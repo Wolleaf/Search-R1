@@ -90,16 +90,16 @@ def _valid_token_ids(value: Any) -> bool:
 
 
 def thinking_record(text: str, context: str = "initial_question") -> dict[str, Any]:
-    action_positions = [position for marker in ("<tool_call>", "<answer>")
-                        if (position := text.find(marker)) >= 0]
-    action_position = min(action_positions) if action_positions else len(text)
-    close_position = text.find("</think>")
-    closing_before_action = (close_position >= 0
-                             and close_position < action_position
-                             and text.count("</think>") == 1)
-    reasoning = text[:close_position] if closing_before_action else ""
-    if reasoning.lstrip().startswith("<think>"):
-        reasoning = reasoning.lstrip()[len("<think>"):]
+    from search_r1.llm_agent.tool_protocol import (
+        QWEN35_REASONING_CONTINUATION,
+        locate_qwen35_action_boundary,
+    )
+
+    located = locate_qwen35_action_boundary(
+        text, QWEN35_REASONING_CONTINUATION)
+    closing_before_action = (located.error is None
+                             and located.action_start is not None)
+    reasoning = located.reasoning if closing_before_action else ""
     return {
         "context": context,
         "template_opening_provided": True,
@@ -358,14 +358,22 @@ def set_seed(seed: int) -> None:
 def direct_records(actor: Any, batch: Any, tokenizer: Any, sample_ids: list[str],
                    slots: list[int], seed: int) -> list[dict[str, Any]]:
     from search_r1.llm_agent.generation import slice_first_complete_native_action
-    from search_r1.llm_agent.tool_protocol import QWEN35_NATIVE, parse_action
+    from search_r1.llm_agent.tool_protocol import (
+        QWEN35_NATIVE,
+        QWEN35_REASONING_CONTINUATION,
+        parse_action,
+    )
 
     set_seed(seed)
     output = actor.generate_sequences(batch)
     records = []
     for index, response in enumerate(output.batch["responses"]):
         sliced = slice_first_complete_native_action(tokenizer, response)
-        parsed = parse_action(sliced.action_text, QWEN35_NATIVE)
+        parsed = parse_action(
+            sliced.action_text,
+            QWEN35_NATIVE,
+            qwen35_reasoning_mode=QWEN35_REASONING_CONTINUATION,
+        )
         records.append({
             "sample_id": sample_ids[index],
             "group_slot": slots[index],
@@ -400,7 +408,11 @@ def manager_records(actor: Any, batch: Any, tokenizer: Any, sample_ids: list[str
                     protocol: str, retriever_url: str) -> list[dict[str, Any]]:
     from search_r1.llm_agent.generation import (GenerationConfig,
                                                 LLMGenerationManager)
-    from search_r1.llm_agent.tool_protocol import parse_action
+    from search_r1.llm_agent.tool_protocol import (
+        QWEN35_NATIVE,
+        QWEN35_REASONING_CONTINUATION,
+        parse_action,
+    )
 
     config = GenerationConfig(
         max_turns=4,
@@ -437,7 +449,13 @@ def manager_records(actor: Any, batch: Any, tokenizer: Any, sample_ids: list[str
         action_ids = first.get("action_token_ids")
         if not _valid_token_ids(raw_ids) or not _valid_token_ids(action_ids):
             raise ValueError("native manager omitted raw/action token evidence")
-        parsed = parse_action(first_text, protocol)
+        reasoning_mode = (QWEN35_REASONING_CONTINUATION
+                          if protocol == QWEN35_NATIVE else None)
+        parsed = parse_action(
+            first_text,
+            protocol,
+            qwen35_reasoning_mode=reasoning_mode,
+        )
         records.append({
             "sample_id": sample_ids[index],
             "group_slot": slots[index],
@@ -466,7 +484,11 @@ def run_environment_replay(tokenizer: Any, batch: Any, raw_messages: list[Any],
 
     from search_r1.llm_agent.generation import (GenerationConfig,
                                                 LLMGenerationManager)
-    from search_r1.llm_agent.tool_protocol import QWEN35_NATIVE, parse_action
+    from search_r1.llm_agent.tool_protocol import (
+        QWEN35_NATIVE,
+        QWEN35_REASONING_CONTINUATION,
+        parse_action,
+    )
 
     config = GenerationConfig(
         max_turns=4,
@@ -493,7 +515,11 @@ def run_environment_replay(tokenizer: Any, batch: Any, raw_messages: list[Any],
         "<tool_call>\n<function=search>\n<parameter=query>\n"
         "Barack Obama\n</parameter>\n</function>\n</tool_call>"
     )
-    parsed = parse_action(action_text, QWEN35_NATIVE)
+    parsed = parse_action(
+        action_text,
+        QWEN35_NATIVE,
+        qwen35_reasoning_mode=QWEN35_REASONING_CONTINUATION,
+    )
     if not parsed.valid or parsed.action != "search":
         raise ValueError("E0 fixed native search action is not parseable")
     observations, dones, valid, executed = manager.execute_predictions(

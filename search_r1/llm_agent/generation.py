@@ -7,9 +7,11 @@ import os
 from typing import List, Dict, Any, Tuple, Sequence
 from dataclasses import dataclass
 from .tensor_helper import TensorHelper, TensorConfig
-from .tool_protocol import (LEGACY_XML, QWEN35_NATIVE, ParsedAction,
-                            Qwen35Conversation, normalize_tool_protocol,
-                            parse_action)
+from .tool_protocol import (LEGACY_XML, QWEN35_NATIVE,
+                            QWEN35_REASONING_CONTINUATION, ParsedAction,
+                            Qwen35Conversation,
+                            locate_qwen35_action_boundary,
+                            normalize_tool_protocol, parse_action)
 from verl import DataProto
 from verl.utils.tracking import Tracking
 import shutil
@@ -81,18 +83,17 @@ def slice_first_complete_native_action(tokenizer,
         text_ids.append(token_id)
 
     raw_text = _decode_sampled_tokens(tokenizer, text_ids)
-    markers = (('</tool_call>', 'tool_call'), ('</answer>', 'answer'))
-    completed = [(raw_text.find(marker), name) for marker, name in markers]
-    completed = [(position, name) for position, name in completed
-                 if position >= 0]
-    if completed:
-        _, boundary = min(completed, key=lambda item: item[0])
-        marker = '</tool_call>' if boundary == 'tool_call' else '</answer>'
+    located = locate_qwen35_action_boundary(
+        raw_text, QWEN35_REASONING_CONTINUATION)
+    if located.boundary is not None:
+        boundary = located.boundary
         low, high = 1, len(text_ids)
         while low < high:
             middle = (low + high) // 2
             prefix = _decode_sampled_tokens(tokenizer, text_ids[:middle])
-            if marker in prefix:
+            prefix_boundary = locate_qwen35_action_boundary(
+                prefix, QWEN35_REASONING_CONTINUATION)
+            if prefix_boundary.boundary == boundary:
                 high = middle
             else:
                 low = middle + 1
@@ -801,7 +802,11 @@ If I want to give the final answer, I should put the answer between <answer> and
         for prediction in predictions:
             if isinstance(prediction, str): # for llm output
                 if self._current_tool_protocol() == QWEN35_NATIVE:
-                    parsed = parse_action(prediction, QWEN35_NATIVE)
+                    parsed = parse_action(
+                        prediction,
+                        QWEN35_NATIVE,
+                        qwen35_reasoning_mode=QWEN35_REASONING_CONTINUATION,
+                    )
                     action = parsed.action if parsed.valid else None
                     content = parsed.content
                 else:

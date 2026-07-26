@@ -742,6 +742,7 @@ from transformers import AutoTokenizer
 from search_r1.llm_agent.tool_protocol import (
     QWEN35_CHAT_TEMPLATE_SHA256,
     QWEN35_NATIVE,
+    QWEN35_REASONING_CONTINUATION,
     QWEN35_RETRY_PROMPT,
     Qwen35Conversation,
     parse_action,
@@ -790,7 +791,9 @@ search_text = native_search("I should verify the author.", "Hamlet author")
 search_ids = tokenizer(search_text, add_special_tokens=False)["input_ids"]
 search_prefix = list(conversation.prompt_token_ids) + list(search_ids)
 search = conversation.append_followup(
-    search_text, parse_action(search_text, QWEN35_NATIVE),
+    search_text, parse_action(
+        search_text, QWEN35_NATIVE,
+        qwen35_reasoning_mode=QWEN35_REASONING_CONTINUATION),
     "  Hamlet was written by William Shakespeare.  ", 500,
     response_token_ids=search_ids)
 if not search.token_ids or not search.visible_observation:
@@ -801,7 +804,9 @@ second_text = native_search("I need a second source.", "Shakespeare Hamlet")
 second_ids = tokenizer(second_text, add_special_tokens=False)["input_ids"]
 second_prefix = list(conversation.prompt_token_ids) + list(second_ids)
 second = conversation.append_followup(
-    second_text, parse_action(second_text, QWEN35_NATIVE),
+    second_text, parse_action(
+        second_text, QWEN35_NATIVE,
+        qwen35_reasoning_mode=QWEN35_REASONING_CONTINUATION),
     "  Shakespeare is credited as the author of Hamlet.  ", 500,
     response_token_ids=second_ids)
 if not second.token_ids or not second.visible_observation:
@@ -814,7 +819,9 @@ retry_search_ids = tokenizer(search_text,
 retry_search_prefix = (list(retry_conversation.prompt_token_ids)
                        + list(retry_search_ids))
 retry_conversation.append_followup(
-    search_text, parse_action(search_text, QWEN35_NATIVE),
+    search_text, parse_action(
+        search_text, QWEN35_NATIVE,
+        qwen35_reasoning_mode=QWEN35_REASONING_CONTINUATION),
     "  Hamlet was written by William Shakespeare.  ", 500,
     response_token_ids=retry_search_ids)
 assert_roundtrip(retry_conversation, retry_search_prefix,
@@ -827,7 +834,9 @@ invalid_ids = tokenizer(invalid_text, add_special_tokens=False)["input_ids"]
 invalid_prefix = (list(retry_conversation.prompt_token_ids)
                   + list(invalid_ids))
 retry = retry_conversation.append_followup(
-    invalid_text, parse_action(invalid_text, QWEN35_NATIVE), "", 500,
+    invalid_text, parse_action(
+        invalid_text, QWEN35_NATIVE,
+        qwen35_reasoning_mode=QWEN35_REASONING_CONTINUATION), "", 500,
     response_token_ids=invalid_ids)
 if (not retry.token_ids
         or retry_conversation.messages[-1] != {

@@ -6,6 +6,8 @@ from search_r1.llm_agent.tool_protocol import (
     LEGACY_XML,
     QWEN35_NATIVE,
     QWEN35_PROMPT_VERSION,
+    QWEN35_REASONING_CONTINUATION,
+    QWEN35_REASONING_FULL,
     QWEN35_RETRY_PROMPT,
     ParsedAction,
     ProtocolError,
@@ -213,9 +215,9 @@ class _TrimNoncanonicalTokenizer:
         (
             "<tool_call><function=search><parameter=query>France</parameter>"
             "</function></tool_call> trailing",
+            "search",
+            "France",
             None,
-            "",
-            "malformed_tool_call",
         ),
         ("<search>France</search>", None, "",
          "multiple_or_unbalanced_tool_calls"),
@@ -228,7 +230,12 @@ class _TrimNoncanonicalTokenizer:
     ],
 )
 def test_native_parser_is_strict(text, action, content, error):
-    parsed = parse_action(text, QWEN35_NATIVE)
+    response = text if not text else "</think>\n" + text
+    parsed = parse_action(
+        response,
+        QWEN35_NATIVE,
+        qwen35_reasoning_mode=QWEN35_REASONING_CONTINUATION,
+    )
 
     assert parsed.action == action
     assert parsed.content == content
@@ -236,14 +243,20 @@ def test_native_parser_is_strict(text, action, content, error):
 
 
 @pytest.mark.parametrize(
-    ("prefix", "expected_prefix"),
+    ("prefix", "reasoning_mode", "expected_prefix"),
     [
-        ("I will verify.\n", "I will verify."),
-        ("<think>\n\n</think>\n", ""),
-        ("Useful nonempty reasoning.\n</think>\n", "Useful nonempty reasoning."),
+        ("I will verify.\n</think>\n", QWEN35_REASONING_CONTINUATION,
+         "I will verify."),
+        ("</think>\n", QWEN35_REASONING_CONTINUATION, ""),
+        ("Useful nonempty reasoning.\n</think>\n",
+         QWEN35_REASONING_CONTINUATION, "Useful nonempty reasoning."),
         ("<think>Useful nonempty reasoning.</think>\n",
-         "Useful nonempty reasoning."),
-        ("<think>\n\n</think>\nI will verify.\n", "I will verify."),
+         QWEN35_REASONING_FULL, "Useful nonempty reasoning."),
+        ("</think>\nI will verify.\n", QWEN35_REASONING_CONTINUATION,
+         "I will verify."),
+        ("Reason first.\n</think>\nI will verify.\n",
+         QWEN35_REASONING_CONTINUATION,
+         "Reason first.\nI will verify."),
     ],
 )
 @pytest.mark.parametrize(
@@ -258,9 +271,14 @@ def test_native_parser_is_strict(text, action, content, error):
         ),
     ],
 )
-def test_native_parser_shares_safe_prefix(prefix, expected_prefix, action_text,
-                                          action, content):
-    parsed = parse_action(prefix + action_text, QWEN35_NATIVE)
+def test_native_parser_shares_safe_prefix(prefix, reasoning_mode,
+                                          expected_prefix, action_text, action,
+                                          content):
+    parsed = parse_action(
+        prefix + action_text,
+        QWEN35_NATIVE,
+        qwen35_reasoning_mode=reasoning_mode,
+    )
 
     assert parsed == ParsedAction(action, content, prefix=expected_prefix)
 
@@ -271,29 +289,9 @@ def test_native_parser_shares_safe_prefix(prefix, expected_prefix, action_text,
         ("<answer></answer>", "empty_answer"),
         ("<answer>   </answer>", "empty_answer"),
         (
-            "<answer>Paris</answer><answer>Lyon</answer>",
-            "multiple_or_unbalanced_answers",
-        ),
-        (
             "<answer>Paris <answer>France</answer></answer>",
             "multiple_or_unbalanced_answers",
         ),
-        ("<answer>Paris</answer> trailing", "malformed_answer"),
-        (
-            "<tool_call><function=search><parameter=query>France capital"
-            "</parameter></function></tool_call><answer>Paris</answer>",
-            "invalid_action_prefix",
-        ),
-        (
-            "<answer>Paris</answer><tool_call><function=search>"
-            "<parameter=query>France capital</parameter></function></tool_call>",
-            "malformed_answer",
-        ),
-        (
-            "<think></think><think></think><answer>Paris</answer>",
-            "invalid_action_prefix",
-        ),
-        ("<think><answer>Paris</answer>", "invalid_thinking_prefix"),
         (
             "Reason about <search>France</search>.\n<answer>Paris</answer>",
             "invalid_action_prefix",
@@ -302,16 +300,144 @@ def test_native_parser_shares_safe_prefix(prefix, expected_prefix, action_text,
     ],
 )
 def test_native_parser_rejects_invalid_terminal_answers(text, error):
-    parsed = parse_action(text, QWEN35_NATIVE)
+    parsed = parse_action(
+        "</think>\n" + text,
+        QWEN35_NATIVE,
+        qwen35_reasoning_mode=QWEN35_REASONING_CONTINUATION,
+    )
 
     assert parsed == ParsedAction(None, "", error)
+
+
+@pytest.mark.parametrize(
+    ("reasoning", "action_text", "expected"),
+    [
+        (
+            "A discarded <answer>guess</answer> is only reasoning.",
+            "<tool_call><function=search><parameter=query>Passaic County"
+            "</parameter></function></tool_call>",
+            ParsedAction(
+                "search",
+                "Passaic County",
+                prefix=(
+                    "A discarded <answer>guess</answer> is only reasoning."
+                ),
+            ),
+        ),
+        (
+            "Do not emit this opening marker: <answer>",
+            "<tool_call><function=search><parameter=query>New Jersey county"
+            "</parameter></function></tool_call>",
+            ParsedAction(
+                "search",
+                "New Jersey county",
+                prefix="Do not emit this opening marker: <answer>",
+            ),
+        ),
+        (
+            "The token <answer> appeared while reasoning.",
+            "<answer>Passaic County</answer>",
+            ParsedAction(
+                "answer",
+                "Passaic County",
+                prefix="The token <answer> appeared while reasoning.",
+            ),
+        ),
+        (
+            "A stray </tool_call> belongs to reasoning.",
+            "<answer>Passaic County</answer>",
+            ParsedAction(
+                "answer",
+                "Passaic County",
+                prefix="A stray </tool_call> belongs to reasoning.",
+            ),
+        ),
+    ],
+)
+def test_native_parser_ignores_protocol_markers_inside_reasoning(
+        reasoning, action_text, expected):
+    assert parse_action(
+        reasoning + "\n</think>\n" + action_text,
+        QWEN35_NATIVE,
+        qwen35_reasoning_mode=QWEN35_REASONING_CONTINUATION,
+    ) == expected
 
 
 @pytest.mark.parametrize(
     ("text", "expected"),
     [
         (
-            '<answer>{"name":"search","arguments":{"query":"France"}}'
+            "</think>\n<answer>Paris</answer> trailing audit text",
+            ParsedAction("answer", "Paris"),
+        ),
+        (
+            "</think>\n<answer>Paris</answer><answer>Lyon</answer>",
+            ParsedAction("answer", "Paris"),
+        ),
+        (
+            "</think>\n<answer>Paris</answer>"
+            "<tool_call><function=search><parameter=query>Lyon"
+            "</parameter></function></tool_call>",
+            ParsedAction("answer", "Paris"),
+        ),
+        (
+            "</think>\n<tool_call><function=search><parameter=query>France"
+            "</parameter></function></tool_call><answer>Paris</answer>",
+            ParsedAction("search", "France"),
+        ),
+    ],
+)
+def test_native_parser_selects_first_complete_action_and_ignores_raw_tail(
+        text, expected):
+    assert parse_action(
+        text,
+        QWEN35_NATIVE,
+        qwen35_reasoning_mode=QWEN35_REASONING_CONTINUATION,
+    ) == expected
+
+
+def test_native_parser_keeps_malformed_first_close_as_selected_boundary():
+    response = (
+        "Reasoning.\n</think>\n</answer>"
+        "<tool_call><function=search><parameter=query>France capital"
+        "</parameter></function></tool_call>"
+    )
+
+    assert parse_action(
+        response,
+        QWEN35_NATIVE,
+        qwen35_reasoning_mode=QWEN35_REASONING_CONTINUATION,
+    ) == ParsedAction(None, "", "multiple_or_unbalanced_answers")
+
+
+def test_native_parser_rejects_second_think_in_production_continuation():
+    response = (
+        "First thought.\n</think>\n<think>Second thought.</think>\n"
+        "<answer>Paris</answer>"
+    )
+
+    assert parse_action(
+        response,
+        QWEN35_NATIVE,
+        qwen35_reasoning_mode=QWEN35_REASONING_CONTINUATION,
+    ) == ParsedAction(None, "", "invalid_thinking_prefix")
+
+
+def test_native_parser_accepts_explicit_full_thinking_mode():
+    response = "<think>Useful reasoning.</think>\n<answer>Paris</answer>"
+
+    assert parse_action(
+        response,
+        QWEN35_NATIVE,
+        qwen35_reasoning_mode=QWEN35_REASONING_FULL,
+    ) == ParsedAction("answer", "Paris", prefix="Useful reasoning.")
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        (
+            '</think>\n<answer>{"name":"search","arguments":{"query":"France"}}'
             "</answer>",
             ParsedAction(
                 "answer",
@@ -319,7 +445,7 @@ def test_native_parser_rejects_invalid_terminal_answers(text, error):
             ),
         ),
         (
-            "<tool_call><function=search><parameter=query>"
+            "</think>\n<tool_call><function=search><parameter=query>"
             '{"query":"France","operator":"and"}'
             "</parameter></function></tool_call>",
             ParsedAction("search", '{"query":"France","operator":"and"}'),
@@ -337,7 +463,11 @@ def test_native_parser_rejects_invalid_terminal_answers(text, error):
 )
 def test_native_parser_does_not_interpret_valid_payloads_as_json_tool_calls(
         text, expected):
-    assert parse_action(text, QWEN35_NATIVE) == expected
+    assert parse_action(
+        text,
+        QWEN35_NATIVE,
+        qwen35_reasoning_mode=QWEN35_REASONING_CONTINUATION,
+    ) == expected
 
 
 def test_legacy_parser_keeps_historical_first_match_behavior():
@@ -411,7 +541,11 @@ def test_native_conversation_preserves_prefix_and_masks_complete_wrapper():
 
     followup = conversation.append_followup(
         response,
-        parse_action(response, QWEN35_NATIVE),
+        parse_action(
+            response,
+            QWEN35_NATIVE,
+            qwen35_reasoning_mode=QWEN35_REASONING_CONTINUATION,
+        ),
         "Paris " * 100,
         max_obs_length=160,
         response_token_ids=response_ids,
@@ -439,12 +573,16 @@ def test_native_conversation_uses_complete_invalid_retry_wrapper():
     initial = render_qwen35_prompt(tokenizer, messages)
     initial_ids = tokenizer(initial, add_special_tokens=False)["input_ids"]
     conversation = Qwen35Conversation(tokenizer, messages, initial_ids)
-    response = "<tool_call>broken"
+    response = "</think>\n<tool_call>broken"
     response_ids = tokenizer(response, add_special_tokens=False)["input_ids"]
 
     followup = conversation.append_followup(
         response,
-        parse_action(response, QWEN35_NATIVE),
+        parse_action(
+            response,
+            QWEN35_NATIVE,
+            qwen35_reasoning_mode=QWEN35_REASONING_CONTINUATION,
+        ),
         "",
         max_obs_length=300,
         response_token_ids=response_ids,
@@ -471,23 +609,31 @@ def test_native_consecutive_invalid_retries_do_not_rewrite_history():
     initial = render_qwen35_prompt(tokenizer, messages)
     initial_ids = tokenizer(initial, add_special_tokens=False)["input_ids"]
     conversation = Qwen35Conversation(tokenizer, messages, initial_ids)
-    first = "<tool_call>broken"
+    first = "</think>\n<tool_call>broken"
     first_ids = tokenizer(first, add_special_tokens=False)["input_ids"]
     conversation.append_followup(
         first,
-        parse_action(first, QWEN35_NATIVE),
+        parse_action(
+            first,
+            QWEN35_NATIVE,
+            qwen35_reasoning_mode=QWEN35_REASONING_CONTINUATION,
+        ),
         "",
         max_obs_length=300,
         response_token_ids=first_ids,
     )
     before_second = list(conversation.prompt_token_ids)
     first_assistant = dict(conversation.messages[1])
-    second = "still not a valid action"
+    second = "</think>\nstill not a valid action"
     second_ids = tokenizer(second, add_special_tokens=False)["input_ids"]
 
     followup = conversation.append_followup(
         second,
-        parse_action(second, QWEN35_NATIVE),
+        parse_action(
+            second,
+            QWEN35_NATIVE,
+            qwen35_reasoning_mode=QWEN35_REASONING_CONTINUATION,
+        ),
         "",
         max_obs_length=300,
         response_token_ids=second_ids,
@@ -512,18 +658,26 @@ def test_native_user_retry_does_not_rewrite_prior_search_tokens():
     search_ids = tokenizer(search, add_special_tokens=False)["input_ids"]
     conversation.append_followup(
         search,
-        parse_action(search, QWEN35_NATIVE),
+        parse_action(
+            search,
+            QWEN35_NATIVE,
+            qwen35_reasoning_mode=QWEN35_REASONING_CONTINUATION,
+        ),
         "William Shakespeare wrote Hamlet.",
         max_obs_length=200,
         response_token_ids=search_ids,
     )
     before_retry = list(conversation.prompt_token_ids)
-    invalid = "<tool_call>broken"
+    invalid = "</think>\n<tool_call>broken"
     invalid_ids = tokenizer(invalid, add_special_tokens=False)["input_ids"]
 
     retry = conversation.append_followup(
         invalid,
-        parse_action(invalid, QWEN35_NATIVE),
+        parse_action(
+            invalid,
+            QWEN35_NATIVE,
+            qwen35_reasoning_mode=QWEN35_REASONING_CONTINUATION,
+        ),
         "",
         max_obs_length=200,
         response_token_ids=invalid_ids,
@@ -544,7 +698,8 @@ def test_native_conversation_preserves_trimmed_noncanonical_sample(
     initial_ids = tokenizer(initial, add_special_tokens=False)["input_ids"]
     conversation = Qwen35Conversation(tokenizer, messages, initial_ids)
     response = (
-        "  <tool_call><function=search><parameter=query>capital France"
+        "</think>\n  <tool_call><function=search>"
+        "<parameter=query>capital France"
         "</parameter></function></tool_call>  ")
     before, marker, after = response.partition("France")
     assert marker
@@ -557,7 +712,11 @@ def test_native_conversation_preserves_trimmed_noncanonical_sample(
 
     followup = conversation.append_followup(
         response,
-        parse_action(response, QWEN35_NATIVE),
+        parse_action(
+            response,
+            QWEN35_NATIVE,
+            qwen35_reasoning_mode=QWEN35_REASONING_CONTINUATION,
+        ),
         "Paris is the capital of France.",
         max_obs_length=400,
         response_token_ids=response_ids,
@@ -583,11 +742,16 @@ def test_native_conversation_rejects_inconsistent_sampled_token_ids():
     initial_ids = tokenizer(initial, add_special_tokens=False)["input_ids"]
     conversation = Qwen35Conversation(tokenizer, messages, initial_ids)
     response = (
-        "<tool_call><function=search><parameter=query>capital France"
+        "</think>\n<tool_call><function=search>"
+        "<parameter=query>capital France"
         "</parameter></function></tool_call>")
     response_ids = tokenizer(response,
                              add_special_tokens=False)["input_ids"]
-    action = parse_action(response, QWEN35_NATIVE)
+    action = parse_action(
+        response,
+        QWEN35_NATIVE,
+        qwen35_reasoning_mode=QWEN35_REASONING_CONTINUATION,
+    )
 
     with pytest.raises(ProtocolError, match="decode exactly"):
         conversation.append_followup(

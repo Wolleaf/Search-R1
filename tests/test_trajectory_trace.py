@@ -7,6 +7,7 @@ import pytest
 from search_r1.trajectory_trace import (TRACE_SCHEMA, TRACE_SCHEMA_VERSION,
                                         TraceJsonlWriter, inspect_trace_jsonl,
                                         main, parse_search_r1_transcript,
+                                        prepare_trace_record,
                                         stable_sample_id,
                                         verify_trace_manifest)
 
@@ -16,7 +17,7 @@ def _eval_record(sample_index=7, raw_trajectory=None):
         raw_trajectory = ("<think>I can answer directly.</think>"
                           "<answer>Paris</answer>")
     turns = parse_search_r1_transcript(raw_trajectory)
-    action_text = raw_trajectory
+    action_text = "I can answer directly.</think><answer>Paris</answer>"
     action_ids = [101, 102]
     return {
         "sample_id": stable_sample_id("nq", "test", sample_index),
@@ -82,6 +83,151 @@ def _v1_eval_record(sample_index=7):
         record.pop(name)
     record["max_searches"] = 4
     return record
+
+
+def _replace_raw_generation(record, action_text, boundary, *, raw_clipped=False):
+    token_ids = [101, 102]
+    record["raw_generations"] = [{
+        "turn": 0,
+        "raw_text": action_text,
+        "raw_token_ids": token_ids,
+        "raw_token_count": len(token_ids),
+        "action_text": action_text,
+        "action_token_ids": token_ids,
+        "action_token_count": len(token_ids),
+        "boundary": boundary,
+        "tail_dropped": False,
+        "raw_clipped": raw_clipped,
+    }]
+    record["policy_token_count"] = len(token_ids)
+
+
+def _invalid_eval_record(action_text, boundary, *, raw_clipped=False):
+    record = _eval_record()
+    record.update({
+        "raw_trajectory": f"<think>{action_text}",
+        "turns": [{
+            "turn": 0,
+            "think": "",
+            "action": "invalid",
+            "search_query": None,
+            "answer": None,
+            "observation": None,
+            "invalid_text": [action_text],
+            "valid_action": False,
+        }],
+        "extracted_answer": None,
+        "em": 0,
+        "posthoc_utility": 0.0,
+        "turns_used": 1,
+        "invalid_action_count": 1,
+    })
+    _replace_raw_generation(record,
+                            action_text,
+                            boundary,
+                            raw_clipped=raw_clipped)
+    return record
+
+
+@pytest.mark.parametrize(
+    ("action_text", "boundary", "wrong_boundary"),
+    [
+        (
+            "Mention </tool_call> while reasoning.</think>\n"
+            "<answer>Paris</answer>",
+            "answer",
+            "tool_call",
+        ),
+        (
+            "Mention </answer> while reasoning.</think>\n"
+            "<tool_call>broken</tool_call>",
+            "tool_call",
+            "answer",
+        ),
+    ],
+)
+def test_v3_boundary_matches_first_post_think_close(action_text, boundary,
+                                                     wrong_boundary):
+    record = _eval_record()
+    _replace_raw_generation(record, action_text, boundary)
+
+    prepared = prepare_trace_record(record, "eval", "unit", "boundary")
+    assert prepared["raw_generations"][0]["boundary"] == boundary
+
+    bad_record = _eval_record()
+    _replace_raw_generation(bad_record, action_text, wrong_boundary)
+    with pytest.raises(ValueError, match="boundary"):
+        prepare_trace_record(bad_record, "eval", "unit", "boundary")
+
+
+@pytest.mark.parametrize(
+    ("action_text", "boundary"),
+    [
+        (
+            "A literal </answer> belongs to reasoning.</think>\nNo action.",
+            "answer",
+        ),
+        (
+            "A literal </tool_call> belongs to reasoning.</think>\nNo action.",
+            "tool_call",
+        ),
+    ],
+)
+def test_v3_reasoning_only_marker_does_not_prove_action_boundary(
+        action_text, boundary):
+    record = _eval_record()
+    _replace_raw_generation(record, action_text, boundary)
+
+    with pytest.raises(ValueError, match="boundary"):
+        prepare_trace_record(record, "eval", "unit", "reasoning-marker")
+
+
+@pytest.mark.parametrize(
+    ("action_text", "boundary"),
+    [
+        ("Ready.</think><answer>Paris</answer>.", "answer"),
+        ("Search.</think><tool_call>broken</tool_call>X", "tool_call"),
+    ],
+)
+def test_v3_accepts_decoded_token_overshoot_after_action_close(
+        action_text, boundary):
+    record = _eval_record()
+    _replace_raw_generation(record, action_text, boundary)
+
+    prepared = prepare_trace_record(record, "eval", "unit", "overshoot")
+    generation = prepared["raw_generations"][0]
+    assert generation["action_text"] == action_text
+    assert generation["action_token_ids"] == [101, 102]
+
+
+@pytest.mark.parametrize(
+    ("action_text", "boundary"),
+    [
+        ("Ready.</think></answer>", "answer"),
+        ("Ready.</think></tool_call>", "tool_call"),
+    ],
+)
+def test_v3_keeps_close_only_malformed_generation_traceable(
+        action_text, boundary):
+    record = _invalid_eval_record(action_text, boundary)
+
+    prepared = prepare_trace_record(record, "eval", "unit", "close-only")
+    assert prepared["raw_generations"][0]["action_text"] == action_text
+    assert prepared["turns"][0]["action"] == "invalid"
+    assert prepared["invalid_action_count"] == 1
+
+
+@pytest.mark.parametrize("boundary", ["eos", "length"])
+def test_v3_keeps_eos_and_length_with_invalid_thinking_traceable(boundary):
+    action_text = "Unclosed reasoning contains </answer> but no think close."
+    record = _invalid_eval_record(action_text,
+                                  boundary,
+                                  raw_clipped=boundary == "length")
+
+    prepared = prepare_trace_record(record, "eval", "unit", "unfinished")
+    generation = prepared["raw_generations"][0]
+    assert generation["boundary"] == boundary
+    assert generation["raw_clipped"] is (boundary == "length")
 
 
 def test_stable_sample_id_matches_dataset_manifest_identity():

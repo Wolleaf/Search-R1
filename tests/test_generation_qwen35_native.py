@@ -7,8 +7,9 @@ import torch
 
 from search_r1.llm_agent.generation import (
     LLMGenerationManager, slice_first_complete_native_action)
-from search_r1.llm_agent.tool_protocol import (QWEN35_RETRY_PROMPT,
-                                               qwen35_messages, qwen35_tools)
+from search_r1.llm_agent.tool_protocol import (
+    QWEN35_NATIVE, QWEN35_REASONING_CONTINUATION, QWEN35_RETRY_PROMPT,
+    parse_action, qwen35_messages, qwen35_tools)
 from verl import DataProto
 
 
@@ -151,6 +152,64 @@ class _TrimNoncanonicalCharTokenizer(_CharTokenizer):
         return rendered
 
 
+class _AtomicDelimiterTokenizer(_CharTokenizer):
+
+    _atomic_tokens = {
+        "</answer>.": 2,
+        "</tool_call>X": 3,
+    }
+    _atomic_text = {value: key for key, value in _atomic_tokens.items()}
+
+    def _encode(self, text):
+        output = []
+        index = 0
+        while index < len(text):
+            if text.startswith(self._assistant_end, index):
+                output.append(self.eos_token_id)
+                index += len(self._assistant_end)
+                continue
+            atomic = next((
+                (value, token_id)
+                for value, token_id in self._atomic_tokens.items()
+                if text.startswith(value, index)
+            ), None)
+            if atomic is not None:
+                value, token_id = atomic
+                output.append(token_id)
+                index += len(value)
+                continue
+            char = text[index]
+            if char not in self._char_to_id:
+                token_id = len(self._char_to_id) + 10
+                self._char_to_id[char] = token_id
+                self._id_to_char[token_id] = char
+            output.append(self._char_to_id[char])
+            index += 1
+        return output
+
+    def decode(self, token_ids, skip_special_tokens=False, **_kwargs):
+        if hasattr(token_ids, "tolist"):
+            token_ids = token_ids.tolist()
+        output = []
+        for token_id in token_ids:
+            token_id = int(token_id)
+            if token_id == self.pad_token_id:
+                continue
+            if token_id == self.eos_token_id:
+                if not skip_special_tokens:
+                    output.append(self._assistant_end)
+                continue
+            if token_id in self._atomic_text:
+                output.append(self._atomic_text[token_id])
+            else:
+                output.append(self._id_to_char[token_id])
+        return "".join(output)
+
+
+def _native_continuation(action, reasoning="I should answer carefully."):
+    return f"{reasoning}</think>\n{action}"
+
+
 def _config(**overrides):
     values = {
         "max_turns": 1,
@@ -274,7 +333,10 @@ def test_native_postprocess_slices_original_tokens_at_first_action_close():
         actor_rollout_wg=None,
         config=_config(),
     )
-    raw = "  <tool_call>malformed but sampled</tool_call>  "
+    raw = _native_continuation(
+        "  <tool_call>malformed but sampled</tool_call>  ",
+        "I need evidence.",
+    )
     generated = _response_tensor(tokenizer, [raw])
 
     response_ids, response_text = manager._postprocess_responses(generated)
@@ -292,8 +354,11 @@ def test_native_postprocess_slices_original_tokens_at_first_action_close():
 
 def test_native_slice_executes_only_first_complete_action_and_keeps_raw_tail():
     tokenizer = _CharTokenizer()
-    first = ("<tool_call><function=search><parameter=query>capital of France"
-             "</parameter></function></tool_call>")
+    first = _native_continuation(
+        "<tool_call><function=search><parameter=query>capital of France"
+        "</parameter></function></tool_call>",
+        "I need to look this up.",
+    )
     raw = first + "<answer>Paris</answer>ignored"
     sampled = (tokenizer(raw, add_special_tokens=False)["input_ids"] +
                [tokenizer.eos_token_id])
@@ -307,12 +372,150 @@ def test_native_slice_executes_only_first_complete_action_and_keeps_raw_tail():
     assert result.tail_dropped is True
 
 
+@pytest.mark.parametrize(
+    ("reasoning", "action_text", "expected_action", "expected_content"),
+    [
+        (
+            "I drafted <answer>Lyon</answer>, but that needs verification.",
+            "<tool_call><function=search><parameter=query>capital of France"
+            "</parameter></function></tool_call>",
+            "search",
+            "capital of France",
+        ),
+        (
+            "I started an <answer> tag before deciding to retrieve evidence.",
+            "<tool_call><function=search><parameter=query>capital of France"
+            "</parameter></function></tool_call>",
+            "search",
+            "capital of France",
+        ),
+        (
+            "The literal <answer> marker belongs to this reasoning note.",
+            "<answer>Passaic County</answer>",
+            "answer",
+            "Passaic County",
+        ),
+        (
+            "An earlier format example ended with </tool_call> here.",
+            "<tool_call><function=search><parameter=query>capital of France"
+            "</parameter></function></tool_call>",
+            "search",
+            "capital of France",
+        ),
+    ],
+)
+def test_native_slice_ignores_reasoning_markers_before_post_think_action(
+        reasoning, action_text, expected_action, expected_content):
+    tokenizer = _CharTokenizer()
+    logical_prefix = _native_continuation(action_text, reasoning)
+    raw = logical_prefix + " audit-only raw tail"
+    sampled = (tokenizer(raw, add_special_tokens=False)["input_ids"] +
+               [tokenizer.eos_token_id])
+
+    result = slice_first_complete_native_action(tokenizer, sampled)
+    parsed = parse_action(
+        result.action_text,
+        QWEN35_NATIVE,
+        qwen35_reasoning_mode=QWEN35_REASONING_CONTINUATION,
+    )
+
+    expected_ids = tokenizer(
+        logical_prefix, add_special_tokens=False)["input_ids"]
+    assert result.action_text == logical_prefix
+    assert list(result.action_token_ids) == expected_ids
+    assert list(result.raw_token_ids) == sampled
+    assert result.boundary == ("tool_call"
+                               if expected_action == "search" else "answer")
+    assert result.tail_dropped is True
+    assert parsed.valid is True
+    assert parsed.action == expected_action
+    assert parsed.content == expected_content
+    assert parsed.prefix == reasoning
+
+
+@pytest.mark.parametrize(
+    ("action_prefix", "atomic_suffix", "expected_action", "expected_content"),
+    [
+        ("<answer>Paris", "</answer>.", "answer", "Paris"),
+        (
+            "<tool_call><function=search><parameter=query>capital of France"
+            "</parameter></function>",
+            "</tool_call>X",
+            "search",
+            "capital of France",
+        ),
+    ],
+)
+def test_native_slice_keeps_same_token_delimiter_overshoot_in_policy_prefix(
+        action_prefix, atomic_suffix, expected_action, expected_content):
+    tokenizer = _AtomicDelimiterTokenizer()
+    reasoning = "I have enough information."
+    policy_text = _native_continuation(
+        action_prefix + atomic_suffix, reasoning)
+    raw = policy_text + "raw tail"
+    sampled = (tokenizer(raw, add_special_tokens=False)["input_ids"] +
+               [tokenizer.eos_token_id])
+
+    result = slice_first_complete_native_action(tokenizer, sampled)
+    parsed = parse_action(
+        result.action_text,
+        QWEN35_NATIVE,
+        qwen35_reasoning_mode=QWEN35_REASONING_CONTINUATION,
+    )
+
+    expected_ids = tokenizer(policy_text,
+                             add_special_tokens=False)["input_ids"]
+    assert result.action_text == policy_text
+    assert list(result.action_token_ids) == expected_ids
+    assert tokenizer.decode(result.action_token_ids) == policy_text
+    assert list(result.raw_token_ids) == sampled
+    assert result.tail_dropped is True
+    assert parsed.valid is True
+    assert parsed.action == expected_action
+    assert parsed.content == expected_content
+    assert parsed.prefix == reasoning
+
+
+@pytest.mark.parametrize(("sampled_eos", "expected_boundary"), [
+    (True, "eos"),
+    (False, "length"),
+])
+def test_native_reasoning_only_marker_does_not_create_action_boundary(
+        sampled_eos, expected_boundary):
+    tokenizer = _CharTokenizer()
+    text = ("I considered <answer>Paris</answer> only as a draft.</think>\n"
+            "I still need to decide.")
+    sampled = tokenizer(text, add_special_tokens=False)["input_ids"]
+    if sampled_eos:
+        sampled.append(tokenizer.eos_token_id)
+
+    result = slice_first_complete_native_action(tokenizer, sampled)
+    parsed = parse_action(
+        result.action_text,
+        QWEN35_NATIVE,
+        qwen35_reasoning_mode=QWEN35_REASONING_CONTINUATION,
+    )
+
+    assert result.boundary == expected_boundary
+    assert result.action_text == text
+    assert list(result.action_token_ids) == sampled
+    assert list(result.raw_token_ids) == sampled
+    assert result.tail_dropped is False
+    assert parsed.valid is False
+    assert parsed.error == "missing_native_action"
+
+
 def test_native_loop_keeps_tokens_masks_actions_and_reorder_alignment():
     tokenizer = _CharTokenizer()
-    search = ("<tool_call>\n<function=search>\n<parameter=query>\n"
-              "capital of France\n</parameter>\n</function>\n</tool_call>")
-    direct_answer = "<answer>Lyon</answer>"
-    searched_answer = "Evidence is sufficient.\n<answer>Paris</answer>"
+    search = _native_continuation(
+        "<tool_call>\n<function=search>\n<parameter=query>\n"
+        "capital of France\n</parameter>\n</function>\n</tool_call>",
+        "I should verify the capital.",
+    )
+    direct_answer = _native_continuation(
+        "<answer>Lyon</answer>", "I recall an answer.")
+    searched_answer = _native_continuation(
+        "<answer>Paris</answer>", "Evidence is sufficient.")
     worker = _ScriptedWorker(tokenizer, [[search, direct_answer],
                                          [searched_answer]])
     manager = _native_manager(tokenizer, worker, max_turns=2)
@@ -391,8 +594,11 @@ def test_native_loop_keeps_tokens_masks_actions_and_reorder_alignment():
 def test_native_loop_preserves_trimmed_noncanonical_sample_and_mask(
         sampled_eos):
     tokenizer = _TrimNoncanonicalCharTokenizer()
-    search = ("  <tool_call><function=search><parameter=query>"
-              "capital of France</parameter></function></tool_call>  ")
+    search = _native_continuation(
+        "  <tool_call><function=search><parameter=query>"
+        "capital of France</parameter></function></tool_call>  ",
+        "I should verify the capital.",
+    )
     before, marker, after = search.partition("France")
     assert marker
     raw_search_ids = (
@@ -406,7 +612,8 @@ def test_native_loop_preserves_trimmed_noncanonical_sample_and_mask(
         tokenizer(before, add_special_tokens=False)["input_ids"] +
         [tokenizer.noncanonical_token_id] +
         tokenizer(action_after, add_special_tokens=False)["input_ids"])
-    tagged_answer = "<answer>Paris</answer>"
+    tagged_answer = _native_continuation(
+        "<answer>Paris</answer>", "The evidence is conclusive.")
     answer_ids = tokenizer(
         tagged_answer, add_special_tokens=False)["input_ids"]
     raw_answer_ids = answer_ids + [tokenizer.eos_token_id]
@@ -439,10 +646,18 @@ def test_native_loop_preserves_trimmed_noncanonical_sample_and_mask(
 
 def test_native_invalid_action_uses_native_retry_and_preserves_mask():
     tokenizer = _CharTokenizer()
-    invalid = ("<tool_call><function=search><parameter=query>x</parameter>"
-               "trailing</function></tool_call>")
+    invalid = _native_continuation(
+        "<tool_call><function=search><parameter=query>x</parameter>"
+        "trailing</function></tool_call>",
+        "I need a search.",
+    )
     worker = _ScriptedWorker(tokenizer,
-                             [[invalid], ["<answer>Paris</answer>"]])
+                             [[invalid], [
+                                 _native_continuation(
+                                     "<answer>Paris</answer>",
+                                     "I can now answer.",
+                                 )
+                             ]])
     manager = _native_manager(tokenizer, worker, max_turns=2)
     raw_messages = [qwen35_messages("Capital of France?")]
     gen_batch, prompt_rows = _generation_batch(tokenizer, raw_messages)
@@ -463,7 +678,8 @@ def test_native_invalid_action_uses_native_retry_and_preserves_mask():
     assert events[0]["action"] is None
     assert events[0]["parse_error"] == "malformed_tool_call"
     assert events[1]["action"] == "answer"
-    assert events[1]["text"] == "<answer>Paris</answer>"
+    assert events[1]["text"] == _native_continuation(
+        "<answer>Paris</answer>", "I can now answer.")
     assert events[1]["content"] == "Paris"
     assert output.non_tensor_batch["final_answer"].tolist() == ["Paris"]
 
@@ -509,8 +725,11 @@ def test_native_conversations_copy_raw_messages_and_require_alignment():
 
 def test_native_loop_uses_four_total_actions_without_free_terminal_action():
     tokenizer = _CharTokenizer()
-    search = ("<tool_call><function=search><parameter=query>"
-              "capital of France</parameter></function></tool_call>")
+    search = _native_continuation(
+        "<tool_call><function=search><parameter=query>"
+        "capital of France</parameter></function></tool_call>",
+        "I need more evidence.",
+    )
     worker = _ScriptedWorker(tokenizer, [[[search][0]] for _ in range(5)])
     manager = _native_manager(
         tokenizer,

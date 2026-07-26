@@ -9,7 +9,8 @@ from types import ModuleType
 import pytest
 
 from scripts.data_process import search_mix
-from search_r1.llm_agent.tool_protocol import parse_action
+from search_r1.llm_agent.tool_protocol import (QWEN35_REASONING_CONTINUATION,
+                                               parse_action)
 
 PARQUET_FIELDS = {
     "data_source",
@@ -1323,7 +1324,11 @@ def test_native_search_response_matches_thinking_continuation():
 
     assert text.startswith("Inspect the retrieved evidence.\n</think>\n\n")
     assert not text.startswith("<think>")
-    assert parse_action(text, search_mix.QWEN35_NATIVE) == expected
+    assert parse_action(
+        text,
+        search_mix.QWEN35_NATIVE,
+        qwen35_reasoning_mode=QWEN35_REASONING_CONTINUATION,
+    ) == expected
 
 
 def test_native_prompt_validation_enforces_exact_start_limit():
