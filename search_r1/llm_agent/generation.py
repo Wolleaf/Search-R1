@@ -141,8 +141,11 @@ class LLMGenerationManager:
     def _validate_native_right_side_capacity(self) -> None:
         """Ensure PPO can retain every generated token across all turns."""
         response_length = self.config.max_response_length
-        required_length = self.config.max_turns * (
-            response_length + self.config.max_obs_length)
+        required_length = (
+            self.config.max_turns
+            * (response_length + self.config.max_obs_length)
+            + response_length
+        )
         if required_length > self.config.max_prompt_length:
             raise ValueError(
                 'qwen35_native right-side capacity requires '
@@ -519,6 +522,7 @@ class LLMGenerationManager:
                         'turn': step,
                         'text': responses_str[index],
                         'token_count': token_count,
+                        'terminal_generation': False,
                         'clipped': token_count >= getattr(
                             self.config, 'max_response_length', responses_ids.shape[1]),
                     }
@@ -611,6 +615,113 @@ class LLMGenerationManager:
                 original_right_side,
                 responses_ids,
                 next_obs_ids
+            )
+
+        # Match the upstream Search-R1 implementation: unfinished trajectories
+        # receive one final generation, but retrieval is disabled for this pass.
+        if active_mask.sum():
+            terminal_active_mask = active_mask.clone()
+            rollings.batch = self.tensor_fn.cut_to_effective_len(
+                rollings.batch,
+                keys=['input_ids', 'attention_mask', 'position_ids']
+            )
+            rollings_active = DataProto.from_dict(
+                {k: v[active_mask] for k, v in rollings.batch.items()},
+                meta_info=rollings.meta_info.copy(),
+            )
+            gen_output = self._generate_with_gpu_padding(rollings_active)
+
+            meta_info = gen_output.meta_info
+            responses_ids, responses_str = self._postprocess_responses(
+                gen_output.batch['responses'])
+            native_slices = (list(self._last_native_action_slices)
+                             if native_protocol else None)
+            responses_ids, responses_str = self.tensor_fn._example_level_pad(
+                responses_ids, responses_str, active_mask)
+            slice_index = 0
+            for index, active in enumerate(active_mask.tolist()):
+                if active:
+                    token_count = int(
+                        (responses_ids[index] != self.tokenizer.pad_token_id)
+                        .sum().item())
+                    event = {
+                        'turn': self.config.max_turns,
+                        'text': responses_str[index],
+                        'token_count': token_count,
+                        'terminal_generation': True,
+                        'clipped': token_count >= getattr(
+                            self.config, 'max_response_length',
+                            responses_ids.shape[1]),
+                    }
+                    if native_slices is not None:
+                        action_slice = native_slices[slice_index]
+                        raw_clipped = (
+                            len(action_slice.raw_token_ids) >= getattr(
+                                self.config, 'max_response_length',
+                                responses_ids.shape[1])
+                            and (not action_slice.raw_token_ids
+                                 or action_slice.raw_token_ids[-1]
+                                 != self.tokenizer.eos_token_id))
+                        event.update({
+                            'raw_text': action_slice.raw_text,
+                            'raw_token_ids': list(action_slice.raw_token_ids),
+                            'raw_token_count': len(action_slice.raw_token_ids),
+                            'action_token_ids': list(
+                                action_slice.action_token_ids),
+                            'boundary': action_slice.boundary,
+                            'tail_dropped': action_slice.tail_dropped,
+                            'raw_clipped': raw_clipped,
+                            'clipped': raw_clipped,
+                            'generation_context': generation_contexts[index],
+                        })
+                        slice_index += 1
+                    generation_events[index].append(event)
+            action_count += terminal_active_mask.to(dtype=torch.long)
+
+            _, dones, valid_action, executed_search = self.execute_predictions(
+                responses_str,
+                self.tokenizer.pad_token,
+                active_mask,
+                do_search=False,
+            )
+            if any(executed_search):
+                raise RuntimeError(
+                    'terminal Search-R1 rollout must not execute retrieval')
+            parsed_actions = getattr(self, '_last_parsed_actions', None)
+            for index, active in enumerate(active_mask.tolist()):
+                if active:
+                    generation_events[index][-1].update({
+                        'valid_action': bool(valid_action[index]),
+                        'done': bool(dones[index]),
+                        'executed_search': False,
+                    })
+                    if native_protocol:
+                        parsed = parsed_actions[index]
+                        parsed_record = self._parsed_action_record(
+                            self.config.max_turns, parsed)
+                        parsed_record['terminal_generation'] = True
+                        parsed_action_history[index].append(parsed_record)
+                        generation_events[index][-1].update({
+                            'tool_protocol': QWEN35_NATIVE,
+                            'action': (parsed.action
+                                       if parsed.valid else None),
+                            'content': parsed.content,
+                            'parse_error': parsed.error,
+                            'reasoning_prefix': parsed.prefix,
+                        })
+                        if parsed.action == 'answer' and parsed.valid:
+                            final_answers[index] = parsed.content
+
+            curr_active_mask = torch.tensor(
+                [not done for done in dones], dtype=torch.bool)
+            active_mask = active_mask * curr_active_mask
+            active_num_list.append(active_mask.sum().item())
+            valid_action_stats += torch.tensor(valid_action, dtype=torch.int)
+            executed_search_count += torch.tensor(
+                executed_search, dtype=torch.long)
+            original_right_side = self._update_right_side(
+                original_right_side,
+                responses_ids,
             )
             
         meta_info['turns_stats'] = action_count.tolist()

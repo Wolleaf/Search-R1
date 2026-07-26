@@ -611,7 +611,7 @@ checks = {
     "val_batch_size": value("data", "val_batch_size") == 8,
     "eval_group_size": value("data", "eval_group_size") == expected_group,
     "return_raw_chat": value("data", "return_raw_chat") is True,
-    "max_prompt_length": value("data", "max_prompt_length") == 4096,
+    "max_prompt_length": value("data", "max_prompt_length") == 4500,
     "max_response_length": value("data", "max_response_length") == 500,
     "max_start_length": value("data", "max_start_length") == 1024,
     "max_obs_length": value("data", "max_obs_length") == 500,

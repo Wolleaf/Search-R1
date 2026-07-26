@@ -19,25 +19,25 @@
 
 论文最大 action budget 为 4，默认返回 top-3 passages。本项目保持：
 
-- 最多 4 个允许 `<search>` 的交互轮次；第 4 轮后仍未结束时，再生成一次禁止搜索的最终回答。
+- 最多 4 个允许 `<search>` 的交互轮次；第 4 轮后仍未结束时，按上游源码再生成一次关闭检索执行的收尾动作。
 - `n_search` 只统计真正发给检索服务的请求，范围为 `[0, 4]`。
 - `max_response_length=500` 是每次生成的上限，不是整条轨迹的总长度。
-- `max_prompt_length=4096` 固定为论文/上游 recipe 的配置，不再按最坏生成长度派生为 4560。
+- Qwen adapter 的右侧轨迹容量固定为 `max_prompt_length=4500`，完整保留上游收尾生成及其 policy token。
 
 四次 response、四段 observation 和最终回答的右侧理论上限为：
 
 ```text
-4 * (500 + 384) + 500 = 4036 <= 4096
+4 * (500 + 500) + 500 = 4500
 ```
 
-因此训练输出侧可以完整保留。只有四轮都异常生成满 500 token 时，rolling context 才会裁掉最老的最多 464 token；正常 `<search>` action 远短于 500。当前固定参数为：
+其中前四轮允许检索，最后 500 token 仅供仍 active 的轨迹收尾；该轮若再次生成 search，也不执行检索、不增加成本。`max_action_budget` 仍为 4，完整耗尽预算的轨迹在日志中记为 `action_count=5` 和 `terminal_generation=true`。当前固定参数为：
 
 | 参数 | 值 |
 | --- | ---: |
 | `max_start_length` | 1024 |
 | `max_response_length` | 500 |
-| `max_obs_length` | 384 |
-| `max_prompt_length` | 4096 |
+| `max_obs_length` | 500 |
+| `max_prompt_length` | 4500 |
 | `max_turns` / retriever top-k | 4 / 3 |
 | train batch / GRPO group | 8 / 5 |
 | temperature / top-p | 1.0 / 1.0 |
@@ -46,7 +46,7 @@
 
 保持 HF rollout、SDPA、bf16、retrieved-token loss masking、gradient checkpointing，以及 parameter/gradient/optimizer CPU offload。两卡下 actor、rollout 和 reference 的实际每卡 micro-batch 已为 1，不预先降低 batch 或 group。
 
-若 `4096/500` 的两步 smoke 在第二次 backward 明确 OOM，第一回退是 response 384，prompt 仍为 4096。batch 4 只用于确认是批次级驻留而非单条长序列导致的 OOM，不作为首选回退。历史 `05/06` 入口继续显式锁定 256，仅用于解释已归档实验。
+两步 smoke 固定验证 `trajectory/response/observation=4500/500/500`。若第二次 backward 明确 OOM，保留失败 attempt 并停止；任何 response、batch 或 group 降配都必须另立实验身份，不能在当前配置下静默回退。历史 `05/06` 入口继续显式锁定 256，仅用于解释已归档实验。
 
 ## 3. 检索验证混合数据
 
@@ -161,7 +161,7 @@ R-mix 入口实现时必须按 `data_source` 每 step 记录 EM、平均 `n_sear
 1. 验证源文件、旧资产和 checkout identity。
 2. 用 retriever venv 生成 BM25 evidence，并先检查 `selection_funnel.json` 的 retrieval 产量；再用 train venv 和 Qwen tokenizer 做 384-token 可见性筛选及 Parquet materialize，最后用 retriever venv 重放所有入选查询。
 3. 验证固定配额、完整筛选漏斗、train/val/既有测试题零重叠、Parquet 无 metadata/context 泄漏、manifest 可重算。
-4. 组合 1/2 GPU resolved configs，精确断言 response 500、prompt 4096、turns 4、top-k 3。
+4. 组合 1/2 GPU resolved configs，精确断言 response 500、trajectory 4500、turns 4、top-k 3 和预算外一次非检索收尾生成。
 5. 运行测试后发布新的自校验 handoff。
 
 ### 阶段三：两卡 GPU
@@ -170,7 +170,7 @@ R-mix 入口实现时必须按 `data_source` 每 step 记录 EM、平均 `n_sear
 
 1. 启动 CPU BM25 服务并 health check。
 2. 运行 Base × held-out Hotpot-64 × group-5 行为探针；NO-GO 则归档并停止。
-3. 只有 GO 后才进入下一实现切片：接通混合训练入口，运行 `4096/500` 的 2-step smoke，再训练 R-mix60 并复测 probe。
+3. 只有 GO 后才进入下一实现切片：接通混合训练入口，运行 `4500/500` 的 2-step smoke，再训练 R-mix60 并复测 probe。
 4. 只有 R-mix 同时通过能力及 cost-contrast 门槛，才实现并训练对称的 B-mix20/C-gated-mix20。
 
 当前 GPU 命令唯一为：

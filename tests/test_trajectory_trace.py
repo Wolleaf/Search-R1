@@ -1,5 +1,6 @@
 import hashlib
 import json
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -127,6 +128,70 @@ def _invalid_eval_record(action_text, boundary, *, raw_clipped=False):
                             boundary,
                             raw_clipped=raw_clipped)
     return record
+
+
+def _terminal_eval_record():
+    record = _eval_record()
+    template = record["raw_generations"][0]
+    record["raw_generations"] = []
+    record["generation_events"] = []
+    for turn in range(5):
+        terminal = turn == 4
+        generation = deepcopy(template)
+        generation.update({
+            "turn": turn,
+            "generation_context": "tool_response",
+            "terminal_generation": terminal,
+        })
+        record["raw_generations"].append(generation)
+        record["generation_events"].append({
+            "turn": turn,
+            "terminal_generation": terminal,
+            "executed_search": False,
+        })
+    record["action_count"] = 5
+    record["policy_token_count"] = sum(
+        generation["action_token_count"]
+        for generation in record["raw_generations"])
+    return record
+
+
+def test_v3_accepts_one_marked_terminal_generation_after_action_budget():
+    record = _terminal_eval_record()
+
+    prepared = prepare_trace_record(record, "eval", "unit", "terminal")
+
+    assert prepared["max_action_budget"] == 4
+    assert prepared["action_count"] == 5
+    assert prepared["raw_generations"][-1]["terminal_generation"] is True
+
+
+def test_v3_rejects_unmarked_or_misplaced_terminal_generation():
+    unmarked = _terminal_eval_record()
+    unmarked["raw_generations"][-1]["terminal_generation"] = False
+    unmarked["generation_events"][-1]["terminal_generation"] = False
+    with pytest.raises(ValueError, match="final terminal generation"):
+        prepare_trace_record(unmarked, "eval", "unit", "terminal")
+
+    misplaced = _terminal_eval_record()
+    misplaced["raw_generations"][-1]["terminal_generation"] = False
+    misplaced["generation_events"][-1]["terminal_generation"] = False
+    misplaced["raw_generations"][-2]["terminal_generation"] = True
+    misplaced["generation_events"][-2]["terminal_generation"] = True
+    with pytest.raises(ValueError, match="final terminal generation"):
+        prepare_trace_record(misplaced, "eval", "unit", "terminal")
+
+
+def test_v3_rejects_retrieval_or_a_second_generation_beyond_terminal():
+    retrieval = _terminal_eval_record()
+    retrieval["generation_events"][-1]["executed_search"] = True
+    with pytest.raises(ValueError, match="executed retrieval"):
+        prepare_trace_record(retrieval, "eval", "unit", "terminal")
+
+    over_budget = _terminal_eval_record()
+    over_budget["action_count"] = 6
+    with pytest.raises(ValueError, match="plus terminal generation"):
+        prepare_trace_record(over_budget, "eval", "unit", "terminal")
 
 
 @pytest.mark.parametrize(

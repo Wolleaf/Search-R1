@@ -538,8 +538,10 @@ def _validate_v3_record(record: dict[str, Any], location: str) -> None:
     action_count = _require_nonnegative_int(record, "action_count", location)
     if max_actions != 4:
         raise ValueError(f"native v3 max_action_budget must be 4 in {location}")
-    if action_count > max_actions:
-        raise ValueError(f"native v3 action_count exceeds its budget in {location}")
+    if action_count > max_actions + 1:
+        raise ValueError(
+            f"native v3 action_count exceeds its budget plus terminal generation in {location}"
+        )
     if record["executed_search_count"] > action_count:
         raise ValueError(f"executed searches exceed action_count in {location}")
     if invalid_count > action_count:
@@ -559,6 +561,17 @@ def _validate_v3_record(record: dict[str, Any], location: str) -> None:
         raise ValueError(
             f"raw_generations must contain exactly action_count entries in {location}"
         )
+    if action_count > max_actions:
+        events = record.get("generation_events")
+        if (not isinstance(events, list) or len(events) != action_count
+                or not all(isinstance(event, dict) for event in events)
+                or events[-1].get("terminal_generation") is not True
+                or events[-1].get("executed_search") is not False
+                or any(event.get("terminal_generation") is True
+                       for event in events[:-1])):
+            raise ValueError(
+                f"native v3 terminal generation is not auditable in {location}"
+            )
 
 
 def read_stage(

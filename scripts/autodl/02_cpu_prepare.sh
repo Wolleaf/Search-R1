@@ -1168,7 +1168,7 @@ for variant, (filename, group_size, checkpoint) in specs.items():
             or config.data.val_batch_size != 8
             or config.data.max_response_length != 500
             or config.data.max_obs_length != 500
-            or config.data.max_prompt_length != 4096
+            or config.data.max_prompt_length != 4500
             or Path(config.actor_rollout_ref.model.path) != checkpoint
             or float(rollout.temperature) != 1.0
             or float(rollout.top_p) != 1.0
@@ -1212,7 +1212,7 @@ for variant, (steps, model_path, cost_lambda, reward_mode) in train_specs.items(
             or config.data.eval_group_size != 1
             or config.data.return_raw_chat is not True
             or config.data.max_response_length != 500
-            or config.data.max_prompt_length != 4096
+            or config.data.max_prompt_length != 4500
             or config.data.max_start_length != 1024
             or config.data.max_obs_length != 500
             or rollout.n_agent != 5
@@ -1234,8 +1234,9 @@ for variant, (steps, model_path, cost_lambda, reward_mode) in train_specs.items(
             or config.actor_rollout_ref.actor.state_masking is not True
             or config.trainer.n_gpus_per_node != 2
             or config.max_turns != 4
-            or config.max_turns * (config.data.max_response_length
-                                   + config.data.max_obs_length) > 4096
+            or (config.max_turns * (config.data.max_response_length
+                                    + config.data.max_obs_length)
+                + config.data.max_response_length) > 4500
             or config.retriever.topk != 3
             or config.trainer.total_training_steps != steps
             or config.trainer.save_freq != steps

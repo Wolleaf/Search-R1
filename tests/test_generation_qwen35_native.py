@@ -723,19 +723,22 @@ def test_native_conversations_copy_raw_messages_and_require_alignment():
         raise AssertionError("oversized native prompts must fail")
 
 
-def test_native_loop_uses_four_total_actions_without_free_terminal_action():
+def test_native_loop_restores_upstream_terminal_generation_after_four_searches():
     tokenizer = _CharTokenizer()
     search = _native_continuation(
         "<tool_call><function=search><parameter=query>"
         "capital of France</parameter></function></tool_call>",
         "I need more evidence.",
     )
-    worker = _ScriptedWorker(tokenizer, [[[search][0]] for _ in range(5)])
+    answer = _native_continuation(
+        "<answer>Paris</answer>", "I now have enough evidence.")
+    worker = _ScriptedWorker(
+        tokenizer, [[[search][0]] for _ in range(4)] + [[answer]])
     manager = _native_manager(
         tokenizer,
         worker,
         max_turns=4,
-        max_prompt_length=4096,
+        max_prompt_length=4500,
     )
     raw_messages = [qwen35_messages("Capital of France?")]
     gen_batch, _ = _generation_batch(tokenizer, raw_messages)
@@ -746,15 +749,35 @@ def test_native_loop_uses_four_total_actions_without_free_terminal_action():
         raw_messages=raw_messages,
     )
 
-    assert output.batch["action_count"].tolist() == [4]
+    assert output.batch["action_count"].tolist() == [5]
     assert output.batch["executed_search_count"].tolist() == [4]
-    assert len(output.non_tensor_batch["generation_events"][0]) == 4
-    assert len(worker.turns) == 1
+    events = output.non_tensor_batch["generation_events"][0]
+    assert len(events) == 5
+    assert len(output.non_tensor_batch["retrieval_events"][0]) == 4
+    assert events[-1]["turn"] == 4
+    assert events[-1]["action"] == "answer"
+    assert events[-1]["content"] == "Paris"
+    assert events[-1]["terminal_generation"] is True
+    assert events[-1]["executed_search"] is False
+    assert output.non_tensor_batch["final_answer"].tolist() == ["Paris"]
+    answer_ids = tokenizer(answer, add_special_tokens=False)["input_ids"]
+    response_row = output.batch["responses"][0]
+    response_length = int(
+        (response_row != tokenizer.pad_token_id).sum().item())
+    assert response_row[
+        response_length - len(answer_ids):response_length].tolist() == answer_ids
+    response_info_mask = output.batch["info_mask"][
+        0, -output.batch["responses"].shape[1]:]
+    assert response_info_mask[
+        response_length - len(answer_ids):response_length].tolist() == [
+            1
+        ] * len(answer_ids)
+    assert not worker.turns
 
 
 def test_native_capacity_counts_only_the_policy_right_side():
     tokenizer = _CharTokenizer()
-    exact_capacity = 4 * (500 + 500)
+    exact_capacity = 4 * (500 + 500) + 500
 
     LLMGenerationManager(
         tokenizer=tokenizer,
@@ -769,7 +792,7 @@ def test_native_capacity_counts_only_the_policy_right_side():
     )
 
     with pytest.raises(ValueError, match=(
-            "right-side capacity requires 4000 tokens.*3999")):
+            "right-side capacity requires 4500 tokens.*4499")):
         LLMGenerationManager(
             tokenizer=tokenizer,
             actor_rollout_wg=None,
@@ -866,7 +889,7 @@ def test_legacy_rolling_context_still_uses_prompt_length_cap():
 def test_native_rolling_context_keeps_full_validated_capacity():
     tokenizer = _CharTokenizer()
     max_start_length = 1024
-    max_prompt_length = 4 * (500 + 500)
+    max_prompt_length = 4 * (500 + 500) + 500
     manager = LLMGenerationManager(
         tokenizer=tokenizer,
         actor_rollout_wg=None,
@@ -892,6 +915,14 @@ def test_native_rolling_context_keeps_full_validated_capacity():
         rollings = manager._update_rolling_state(
             rollings, response, observation)
         expected = torch.cat((expected, response, observation), dim=1)
+
+    final_response = torch.full((1, 500), 30)
+    rollings = manager._update_rolling_state(
+        rollings,
+        final_response,
+        torch.empty((1, 0), dtype=torch.long),
+    )
+    expected = torch.cat((expected, final_response), dim=1)
 
     assert expected.shape[1] == max_start_length + max_prompt_length
     assert torch.equal(rollings.batch["input_ids"], expected)

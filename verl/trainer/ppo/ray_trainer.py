@@ -129,7 +129,7 @@ def _validate_qwen35_native_training_contract(config):
         'actor_rollout_ref.ref.log_prob_micro_batch_size': 2,
         'data.train_batch_size': 8,
         'data.return_raw_chat': True,
-        'data.max_prompt_length': 4096,
+        'data.max_prompt_length': 4500,
         'data.max_response_length': 500,
         'data.max_start_length': 1024,
         'data.max_obs_length': 500,
@@ -495,7 +495,7 @@ def _raw_generation_trace_records(generation_events):
                 f'{sorted(missing)}')
         if event.get('turn') != index:
             raise ValueError('v3 generation event turns must be contiguous')
-        records.append({
+        record = {
             'turn': index,
             'raw_text': event['raw_text'],
             'raw_token_ids': list(event['raw_token_ids']),
@@ -506,7 +506,12 @@ def _raw_generation_trace_records(generation_events):
             'boundary': event['boundary'],
             'tail_dropped': bool(event['tail_dropped']),
             'raw_clipped': bool(event['raw_clipped']),
-        })
+            'terminal_generation': bool(
+                event.get('terminal_generation', False)),
+        }
+        if 'generation_context' in event:
+            record['generation_context'] = str(event['generation_context'])
+        records.append(record)
     return records
 
 

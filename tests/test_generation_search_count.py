@@ -71,7 +71,7 @@ def test_explicitly_disabled_search_is_not_counted_or_executed():
     manager = _manager()
     manager.batch_search = lambda _: (_ for _ in ()).throw(AssertionError('retriever was called'))
 
-    observations, _, _, executed_search = manager.execute_predictions(
+    observations, dones, valid_actions, executed_search = manager.execute_predictions(
         ['<search>not executed</search>'],
         pad_token='<pad>',
         active_mask=torch.tensor([True]),
@@ -79,7 +79,10 @@ def test_explicitly_disabled_search_is_not_counted_or_executed():
     )
 
     assert observations == ['\n\n<information></information>\n\n']
+    assert dones == [0]
+    assert valid_actions == [1]
     assert executed_search == [0]
+    assert manager._last_execution_retrieval_events == [None]
 
 
 def test_search_count_is_a_reorderable_batch_tensor():

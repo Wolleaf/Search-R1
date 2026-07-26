@@ -160,7 +160,7 @@ GO 只表示值得进入下一阶段，不能直接在 NQ 上只重训一个 C�
 
 ## 固定配置与回退
 
-当前 native-v3 gate 与训练固定为两张 GPU、batch 8、训练 group 5、总 action budget 4、retriever top-k 3、`start/observation/response/prompt=1024/500/500/4096`，并固定 `temperature/top-p/top-k/min-p/presence/repetition=1.0/1.0/0/0.0/0.0/1.0`。选样阶段保留 384-token provenance，但 rollout 使用 500；endpoint 固定 group 1、greedy、seed 42。历史 `07` 保持 XML group-5 配置，`03/05/06` 保持 response 256、prompt 3584；新实验不得复用历史入口。
+当前 native-v3 gate 与训练固定为两张 GPU、batch 8、训练 group 5、四个可检索 action 加一次上游同款非检索收尾生成、retriever top-k 3、`start/observation/response/trajectory=1024/500/500/4500`，并固定 `temperature/top-p/top-k/min-p/presence/repetition=1.0/1.0/0/0.0/0.0/1.0`。其中 `4500 = 4 * (500 + 500) + 500`，最后 500 token 只用于尚未结束轨迹的 terminal generation，不执行也不计搜索成本。选样阶段保留 384-token provenance，但 rollout 使用 500；endpoint 固定 group 1、greedy、seed 42。历史 `07` 保持 XML group-5 配置，`03/05/06` 保持 response 256、prompt 3584；新实验不得复用历史入口。
 
 native-v3 exact attempt 不接受 batch 4、response 384 或关闭 thinking 的历史 fallback。若两卡 2-step smoke 失败，保留失败 attempt 并停止；任何降配都必须另立配置版本并重新执行结构门，不能在同一实验身份下静默重跑。失败不会自动重试、覆盖旧 attempt 或采用早于固定终点的 checkpoint。
 

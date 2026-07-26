@@ -140,6 +140,7 @@ grep -Fxq -- "data.train_files=$ROOT/data/search_mix_qwen35_native_v3/train_512.
 grep -Fxq -- 'actor_rollout_ref.rollout.top_k=0' "$CAPTURE"
 grep -Fxq -- 'actor_rollout_ref.rollout.presence_penalty=0.0' "$CAPTURE"
 grep -Fxq -- '++tool_protocol=qwen35_native' "$CAPTURE"
+grep -Fxq -- 'data.max_prompt_length=4500' "$CAPTURE"
 grep -Fxq -- 'actor_rollout_ref.rollout.do_sample=true' "$CAPTURE"
 
 for spec in \
@@ -178,6 +179,7 @@ grep -Fxq -- 'data.train_batch_size=8' "$CAPTURE"
 grep -Fxq -- 'data.val_batch_size=8' "$CAPTURE"
 grep -Fxq -- 'data.max_response_length=500' "$CAPTURE"
 grep -Fxq -- 'data.max_obs_length=500' "$CAPTURE"
+grep -Fxq -- 'data.max_prompt_length=4500' "$CAPTURE"
 grep -Fxq -- 'actor_rollout_ref.rollout.n_agent=5' "$CAPTURE"
 grep -Fxq -- 'actor_rollout_ref.actor.ppo_mini_batch_size=40' "$CAPTURE"
 grep -Fxq -- 'actor_rollout_ref.actor.ppo_micro_batch_size=2' "$CAPTURE"

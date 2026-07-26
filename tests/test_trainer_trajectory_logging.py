@@ -106,7 +106,7 @@ def _native_training_config(variant='reproduce'):
         'data': {
             'train_batch_size': 8,
             'return_raw_chat': True,
-            'max_prompt_length': 4096,
+            'max_prompt_length': 4500,
             'max_response_length': 500,
             'max_start_length': 1024,
             'max_obs_length': 500,

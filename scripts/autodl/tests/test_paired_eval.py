@@ -787,6 +787,43 @@ class PairedEvalTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "only control"):
                 PAIRED_EVAL.analyze(three_arm)
 
+    def test_v3_accepts_only_one_marked_nonretrieval_terminal_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths, _, _ = self.make_v3_formal_inputs(root)
+            record = json.loads(paths["control"].read_text().splitlines()[0])
+            terminal = dict(record["raw_generations"][-1])
+            terminal.update({
+                "turn": 4,
+                "raw_token_ids": [5],
+                "action_token_ids": [5],
+                "generation_context": "tool_response",
+                "terminal_generation": True,
+            })
+            record["raw_generations"].append(terminal)
+            record["generation_events"] = [{
+                "turn": turn,
+                "terminal_generation": turn == 4,
+                "executed_search": False,
+            } for turn in range(5)]
+            record["action_count"] = 5
+            record["policy_token_count"] += 1
+
+            PAIRED_EVAL._validate_v3_record(record, "terminal fixture")
+
+            unmarked = json.loads(json.dumps(record))
+            unmarked["raw_generations"][-1]["terminal_generation"] = False
+            unmarked["generation_events"][-1]["terminal_generation"] = False
+            with self.assertRaisesRegex(ValueError, "terminal generation"):
+                PAIRED_EVAL._validate_v3_record(
+                    unmarked, "unmarked terminal fixture")
+
+            over_budget = json.loads(json.dumps(record))
+            over_budget["action_count"] = 6
+            with self.assertRaisesRegex(ValueError, "plus terminal generation"):
+                PAIRED_EVAL._validate_v3_record(
+                    over_budget, "over-budget terminal fixture")
+
     def test_v3_contract_reports_greedy_metrics_and_paired_bootstrap(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

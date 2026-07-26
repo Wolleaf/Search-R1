@@ -235,15 +235,33 @@ def validate_traces(records: list[dict[str, Any]], stage: str,
         if active_v3:
             events = record.get("generation_events")
             retrievals = record.get("retrieval_events")
+            action_count = record.get("action_count")
             if record.get("schema_version") != 3:
                 raise ValueError(f"active v3 trace schema mismatch for {key}")
             if not isinstance(events, list) or not isinstance(retrievals, list):
                 raise ValueError(f"active v3 events are missing for {key}")
             if (record.get("max_action_budget") != 4
-                    or record.get("action_count") != len(events)
+                    or isinstance(action_count, bool)
+                    or not isinstance(action_count, int)
+                    or action_count != len(events)
+                    or action_count > 5
                     or "max_searches" in record
                     or "terminal_search_request" in record):
                 raise ValueError(f"active v3 action-budget contract mismatch for {key}")
+            if not all(isinstance(event, Mapping) for event in events):
+                raise ValueError(f"active v3 generation events are invalid for {key}")
+            terminal_indices = [
+                index for index, event in enumerate(events)
+                if event.get("terminal_generation") is True
+            ]
+            if action_count == 5:
+                if (terminal_indices != [4]
+                        or events[-1].get("executed_search") is not False):
+                    raise ValueError(
+                        f"active v3 terminal generation contract mismatch for {key}")
+            elif terminal_indices:
+                raise ValueError(
+                    f"active v3 terminal generation appears before budget exhaustion for {key}")
             if record.get("executed_search_count") != len(retrievals):
                 raise ValueError(f"active v3 retrieval count mismatch for {key}")
             for name in ("policy_token_count", "observation_token_count",
@@ -416,8 +434,10 @@ def trace_structure(record: Mapping[str, Any]) -> dict[str, Any]:
     events = record.get("generation_events")
     if not isinstance(events, list):
         events = []
-    requested = sum(event.get("action") == "search" for event in events
-                    if isinstance(event, Mapping))
+    requested = sum(
+        event.get("action") == "search"
+        and event.get("terminal_generation") is not True
+        for event in events if isinstance(event, Mapping))
     if not events:
         requested = sum(turn.get("action") == "search"
                         for turn in record.get("turns", []))
@@ -455,7 +475,22 @@ def trace_structure(record: Mapping[str, Any]) -> dict[str, Any]:
 def trace_diagnostics(record: Mapping[str, Any]) -> dict[str, Any]:
     turns = record["turns"]
     first = turns[0] if turns else {}
-    search_turns = [turn for turn in turns if turn.get("action") == "search"]
+    events = record.get("generation_events")
+    terminal_turn_ids = ({
+        event.get("turn") for event in events
+        if (isinstance(event, Mapping)
+            and event.get("terminal_generation") is True)
+    } if isinstance(events, list) else set())
+    terminal_search_turns = [
+        turn for turn in turns
+        if (turn.get("action") == "search"
+            and turn.get("generation_turn") in terminal_turn_ids)
+    ]
+    search_turns = [
+        turn for turn in turns
+        if (turn.get("action") == "search"
+            and turn.get("generation_turn") not in terminal_turn_ids)
+    ]
     queries = [turn.get("search_query") for turn in search_turns]
     non_degenerate = [
         query for query in queries if isinstance(query, str) and not query_is_degenerate(query)
@@ -478,6 +513,7 @@ def trace_diagnostics(record: Mapping[str, Any]) -> dict[str, Any]:
                                         and query_is_degenerate(first.get("search_query"))),
         "first_turn_clipped": first_turn_clipped(record),
         "search_turn_count": len(search_turns),
+        "terminal_search_request_count": len(terminal_search_turns),
         "aligned_tool_response_count": len(aligned),
         "degenerate_search_count": sum(query_is_degenerate(query) for query in queries),
         "repeated_query_count": len(normalized_queries) - len(set(normalized_queries)),
@@ -748,6 +784,8 @@ def analyze_trace_stage(
             "first_turn_clipped_count": sum(
                 item["first_turn_clipped"] for item in diagnostics),
             "search_turn_count": sum(item["search_turn_count"] for item in diagnostics),
+            "terminal_search_request_count": sum(
+                item["terminal_search_request_count"] for item in diagnostics),
             "requested_search_count": sum(
                 item["requested_search_count"] for item in diagnostics),
             "executed_search_count": sum(

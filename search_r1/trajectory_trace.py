@@ -316,6 +316,16 @@ def _validate_raw_generation(generation: Any, index: int) -> None:
         raise ValueError(
             f"raw_generations[{index}] {declared_boundary} boundary is inconsistent"
         )
+    if "generation_context" in generation:
+        if generation["generation_context"] not in {
+                "initial_question", "tool_response", "user_retry",
+                "terminal_answer"}:
+            raise ValueError(
+                f"raw_generations[{index}].generation_context is invalid")
+    if ("terminal_generation" in generation
+            and not isinstance(generation["terminal_generation"], bool)):
+        raise ValueError(
+            f"raw_generations[{index}].terminal_generation must be boolean")
 
 
 def _stable_record_id(record: Mapping[str, Any]) -> str:
@@ -436,8 +446,14 @@ def validate_trace_record(record: Mapping[str, Any],
                      "max_action_budget",
                      minimum=1)
         _require_int(record["action_count"], "action_count")
-        if record["action_count"] > record["max_action_budget"]:
-            raise ValueError("action_count exceeds max_action_budget")
+        max_generation_count = record["max_action_budget"] + 1
+        if record["action_count"] > max_generation_count:
+            raise ValueError(
+                "action_count exceeds max_action_budget plus terminal generation"
+            )
+        if record["executed_search_count"] > record["max_action_budget"]:
+            raise ValueError(
+                "executed_search_count exceeds max_action_budget")
         if record["executed_search_count"] > record["action_count"]:
             raise ValueError("executed_search_count exceeds action_count")
         if not isinstance(record["raw_generations"], list):
@@ -449,6 +465,38 @@ def validate_trace_record(record: Mapping[str, Any],
         if ("generation_events" in record
                 and len(record["generation_events"]) != record["action_count"]):
             raise ValueError("action_count must equal len(generation_events)")
+        terminal_generations = [
+            index for index, generation in enumerate(record["raw_generations"])
+            if generation.get("terminal_generation", False)
+        ]
+        generation_events = record.get("generation_events")
+        if (generation_events is not None
+                and not all(isinstance(event, Mapping)
+                            for event in generation_events)):
+            raise ValueError("generation_events must contain objects")
+        terminal_events = ([] if generation_events is None else [
+            index for index, event in enumerate(generation_events)
+            if event.get("terminal_generation", False)
+        ])
+        if record["action_count"] > record["max_action_budget"]:
+            expected_terminal = [record["action_count"] - 1]
+            if (terminal_generations != expected_terminal
+                    or terminal_events != expected_terminal):
+                raise ValueError(
+                    "the extra generation must be the final terminal generation"
+                )
+            if generation_events is None:
+                raise ValueError(
+                    "terminal generation requires auditable generation_events")
+            terminal_event = generation_events[-1]
+            if (terminal_event.get("terminal_generation") is not True
+                    or terminal_event.get("executed_search") is not False):
+                raise ValueError(
+                    "terminal generation event is not marked or executed retrieval"
+                )
+        elif terminal_generations or terminal_events:
+            raise ValueError(
+                "terminal generation is only valid after max_action_budget")
         for name in ("policy_token_count", "observation_token_count",
                      "observation_policy_token_count"):
             _require_int(record[name], name)

@@ -530,11 +530,12 @@ checks = {
     "eval_group": value("data", "eval_group_size") == 1,
     "response": value("data", "max_response_length") == 500,
     "observation": value("data", "max_obs_length") == 500,
-    "prompt": value("data", "max_prompt_length") == 4096,
+    "prompt": value("data", "max_prompt_length") == 4500,
     "start": value("data", "max_start_length") == 1024,
     "turns": value("max_turns") == 4,
-    "capacity": value("max_turns") * (
-        value("data", "max_response_length") + value("data", "max_obs_length")) <= 4096,
+    "capacity": (value("max_turns") * (
+        value("data", "max_response_length") + value("data", "max_obs_length"))
+        + value("data", "max_response_length")) <= 4500,
     "retriever": value("retriever", "topk") == 3,
     "gpus": value("trainer", "n_gpus_per_node") == 2,
     "steps": value("trainer", "total_training_steps") == steps,

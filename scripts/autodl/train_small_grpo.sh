@@ -55,7 +55,11 @@ if [[ "$TOOL_PROTOCOL" == legacy_xml && "$EVAL_GROUP_SIZE" != 1 &&
 fi
 case "$MAX_RESPONSE_LENGTH" in
     500|384)
-        readonly MAX_PROMPT_LENGTH=4096
+        if [[ "$TOOL_PROTOCOL" == qwen35_native ]]; then
+            readonly MAX_PROMPT_LENGTH=4500
+        else
+            readonly MAX_PROMPT_LENGTH=4096
+        fi
         ;;
     256|192)
         # Preserve the archived experiment entrypoints without changing their configs.
@@ -100,8 +104,8 @@ if [[ "$TOOL_PROTOCOL" == qwen35_native ]]; then
     [[ "$GPU_COUNT" == 2 && "$TRAIN_BATCH_SIZE" == 8 &&
         "$MAX_RESPONSE_LENGTH" == 500 && "$GRPO_GROUP_SIZE" == 5 &&
         "$MAX_OBS_LENGTH" == 500 &&
-        $((MAX_TURNS * (MAX_RESPONSE_LENGTH + MAX_OBS_LENGTH))) -le $MAX_PROMPT_LENGTH ]] || {
-        printf 'Qwen native v3 requires two GPUs, batch 8, group 5, response/observation 500, and a four-action budget within 4096 tokens.\n' >&2
+        $((MAX_TURNS * (MAX_RESPONSE_LENGTH + MAX_OBS_LENGTH) + MAX_RESPONSE_LENGTH)) -le $MAX_PROMPT_LENGTH ]] || {
+        printf 'Qwen native v3 requires two GPUs, batch 8, group 5, response/observation 500, four searchable turns, and one terminal generation within 4500 tokens.\n' >&2
         exit 64
     }
 fi
