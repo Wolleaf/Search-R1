@@ -34,6 +34,27 @@ import verl.utils.torch_functional as verl_F
 __all__ = ['DataParallelPPOActor']
 
 
+def _policy_logit_projection_indices(input_ids, responses, loss_mask):
+    """Map policy-token labels to the logits that predict them."""
+    if (input_ids.ndim != 2 or responses.ndim != 2
+            or loss_mask.shape != responses.shape):
+        raise ValueError('policy-logit projection expects rank-2 aligned tensors')
+    if input_ids.size(0) != responses.size(0):
+        raise ValueError('policy-logit projection batch sizes must match')
+
+    response_length = responses.size(1)
+    predecessor_offset = input_ids.size(1) - response_length - 1
+    if predecessor_offset < 0:
+        raise ValueError(
+            'policy-logit projection requires a prompt token before the response')
+
+    response_indices = torch.nonzero(
+        loss_mask.bool().any(dim=0), as_tuple=False).flatten()
+    if response_indices.numel() == 0:
+        raise ValueError('policy-logit projection requires at least one policy token')
+    return response_indices, response_indices + predecessor_offset
+
+
 class DataParallelPPOActor(BasePPOActor):
 
     def __init__(
@@ -52,6 +73,14 @@ class DataParallelPPOActor(BasePPOActor):
         self.optimizer_state_offload_fn = optimizer_state_offload_fn
         self.use_remove_padding = self.config.get('use_remove_padding', False)
         print(f'Actor use_remove_padding={self.use_remove_padding}')
+        wrapped_module = getattr(actor_module, '_fsdp_wrapped_module',
+                                 actor_module)
+        model_config = getattr(wrapped_module, 'config', None)
+        self.use_qwen35_policy_logits = (
+            not self.use_remove_padding
+            and self.config.get('state_masking', False)
+            and getattr(model_config, 'model_type', None) == 'qwen3_5')
+        print(f'Actor use_qwen35_policy_logits={self.use_qwen35_policy_logits}')
         self.ulysses_sequence_parallel_size = self.config.ulysses_sequence_parallel_size
         self.use_ulysses_sp = self.ulysses_sequence_parallel_size > 1
 
@@ -69,6 +98,10 @@ class DataParallelPPOActor(BasePPOActor):
             batch_size, seqlen = input_ids.shape
             attention_mask = micro_batch['attention_mask']
             position_ids = micro_batch['position_ids']
+            policy_projection = None
+            if self.use_qwen35_policy_logits and 'loss_mask' in micro_batch:
+                policy_projection = _policy_logit_projection_indices(
+                    input_ids, micro_batch['responses'], micro_batch['loss_mask'])
 
             if self.use_remove_padding:
                 from flash_attn.bert_padding import pad_input, unpad_input, rearrange, index_first_axis
@@ -132,15 +165,35 @@ class DataParallelPPOActor(BasePPOActor):
                 log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1:-1]  # (bsz, response_length)
 
             else:  # not using rmpad and no ulysses sp
-                output = self.actor_module(input_ids=input_ids,
-                                           attention_mask=attention_mask,
-                                           position_ids=position_ids,
-                                           use_cache=False)  # prevent model thinks we are generating
+                forward_kwargs = {
+                    'input_ids': input_ids,
+                    'attention_mask': attention_mask,
+                    'position_ids': position_ids,
+                    'use_cache': False,
+                }
+                if policy_projection is not None:
+                    _, logit_indices = policy_projection
+                    forward_kwargs['logits_to_keep'] = logit_indices
+                output = self.actor_module(**forward_kwargs)
                 logits = output.logits
                 logits.div_(temperature)
-                logits = logits[:, -response_length - 1:-1]  # (bsz, response_length)
-                log_probs = logprobs_from_logits(logits, micro_batch['responses'])
-                entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
+                if policy_projection is None:
+                    logits = logits[:, -response_length - 1:-1]  # (bsz, response_length)
+                    log_probs = logprobs_from_logits(logits, micro_batch['responses'])
+                    entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
+                else:
+                    response_indices, _ = policy_projection
+                    if logits.size(1) != response_indices.numel():
+                        raise ValueError(
+                            'Qwen3.5 logits_to_keep returned an unexpected token count')
+                    labels = micro_batch['responses'].index_select(1, response_indices)
+                    selected_log_probs = logprobs_from_logits(logits, labels)
+                    selected_entropy = verl_F.entropy_from_logits(logits)
+                    output_shape = (batch_size, response_length)
+                    log_probs = logits.new_zeros(output_shape).index_copy(
+                        1, response_indices, selected_log_probs)
+                    entropy = logits.new_zeros(output_shape).index_copy(
+                        1, response_indices, selected_entropy)
 
             return entropy, log_probs
 
@@ -259,6 +312,16 @@ class DataParallelPPOActor(BasePPOActor):
                 # all return: (bsz, response_length)
                 entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature)
 
+                if self.use_qwen35_policy_logits:
+                    policy_mask = response_mask.bool()
+                    log_prob = torch.where(policy_mask, log_prob,
+                                           torch.zeros_like(log_prob))
+                    old_log_prob = torch.where(
+                        policy_mask, old_log_prob,
+                        torch.zeros_like(old_log_prob))
+                    advantages = torch.where(
+                        policy_mask, advantages, torch.zeros_like(advantages))
+
                 pg_loss, pg_clipfrac, ppo_kl = core_algos.compute_policy_loss(old_log_prob=old_log_prob,
                                                                               log_prob=log_prob,
                                                                               advantages=advantages,
@@ -272,6 +335,10 @@ class DataParallelPPOActor(BasePPOActor):
 
                 if self.config.use_kl_loss:
                     ref_log_prob = data['ref_log_prob']
+                    if self.use_qwen35_policy_logits:
+                        ref_log_prob = torch.where(
+                            policy_mask, ref_log_prob,
+                            torch.zeros_like(ref_log_prob))
                     # compute kl loss
                     kld = core_algos.kl_penalty(logprob=log_prob,
                                                 ref_logprob=ref_log_prob,
