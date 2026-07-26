@@ -431,6 +431,7 @@ PY
 
 qwen_native_train_preflight() {
     local commit="$1" handoff_digest="$2" base_digest="$3" base_model data_digest
+    export PYTHONPATH="$CHECKOUT_DIR${PYTHONPATH:+:$PYTHONPATH}"
     require_qwen_native_train
     verify_qwen_native_train_data
     base_model="$(readlink -f -- "$MODEL_DIR")"

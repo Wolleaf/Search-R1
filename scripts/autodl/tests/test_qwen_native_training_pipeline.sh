@@ -2,8 +2,10 @@
 set -Eeuo pipefail
 
 AUTODL_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+CHECKOUT="$(cd -- "$AUTODL_DIR/../.." && pwd -P)"
 ENTRYPOINT="$AUTODL_DIR/09_gpu_qwen_native_train.sh"
 GPU_RUN="$AUTODL_DIR/03_gpu_run.sh"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 
@@ -57,7 +59,33 @@ MAX_RESPONSE_LENGTH=500
 QWEN_NATIVE_TRAIN_STAGE=smoke
 QWEN_NATIVE_PROTOCOL_GATE_EVIDENCE="$PROTOCOL_GATE_MARKER"
 QWEN_NATIVE_SMOKE_EVIDENCE=''
+mkdir -p "$AUTODL_ROOT/envs/train/bin" "$AUTODL_ROOT/models/Qwen3.5-2B"
+ln -s "$CHECKOUT" "$AUTODL_ROOT/checkout"
+cat >"$AUTODL_ROOT/envs/train/bin/python" <<'SH'
+#!/usr/bin/env bash
+exec "${PYTHON_BIN:-python3}" "$@"
+SH
+chmod +x "$AUTODL_ROOT/envs/train/bin/python"
 source "$ENTRYPOINT"
+
+# GPU helpers must import the sealed checkout without relying on an editable install.
+(
+    unset PYTHONPATH
+    require_qwen_native_train() { return 0; }
+    verify_qwen_native_train_data() {
+        [[ "$PYTHONPATH" == "$CHECKOUT_DIR" ]]
+        (
+            cd "$PROJECT_ROOT"
+            "$TRAIN_ENV/bin/python" -S \
+                "$CHECKOUT_DIR/scripts/data_process/search_mix.py" --help \
+                >/dev/null
+        )
+    }
+    file_sha256() { printf 'd%.0s' {1..64}; }
+    verify_protocol_gate_evidence() { return 0; }
+    qwen_native_train_preflight "$(printf 'c%.0s' {1..40})" \
+        "$(printf 'a%.0s' {1..64})" "$(printf 'b%.0s' {1..64})"
+)
 
 # The shared run record must describe the neutral native-v3 sampling contract.
 record_dir="$TEST_ROOT/project/runs/record"
