@@ -471,6 +471,60 @@ def test_v4_terminal_search_is_rejected_but_fails_behavior_target(
     assert overall["criteria"]["terminal_requested_search_rate"]["passed"] is False
 
 
+def test_v4_invalid_terminal_answer_is_audited_as_behavior_no_go(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    record = _terminal_record("answer")
+    record["checkpoint_digest"] = "a" * 64
+    record["generation_events"][-1].update({
+        "action": None,
+        "parse_error": "invalid_terminal_answer_format",
+        "terminal_rejection_reason": "invalid_terminal_answer_format",
+        "valid_action": False,
+    })
+    monkeypatch.setitem(ANALYSIS.STAGE_SHAPES, "g0_g1", (1, 1))
+
+    ANALYSIS.validate_traces(
+        [record], "g0_g1", "a" * 64, ["hotpotqa:train:0"],
+        {"hotpotqa:train:0": "What is the capital city?"},
+        active_v4=True)
+    overall, _, _ = ANALYSIS.analyze_trace_stage(
+        "g0_g1", [record], active_v4=True)
+
+    assert overall["terminal_answer_count"] == 0
+    assert overall["terminal_invalid_count"] == 1
+    assert overall["terminal_answer_rate"] == 0.0
+    assert overall["criteria"]["terminal_answer_rate"]["passed"] is False
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("action", "answer"),
+        ("terminal_rejection_reason", None),
+        ("valid_action", True),
+    ],
+)
+def test_v4_invalid_terminal_answer_still_fails_closed_when_inconsistent(
+        monkeypatch: pytest.MonkeyPatch, field: str, value: object) -> None:
+    record = _terminal_record("answer")
+    record["checkpoint_digest"] = "a" * 64
+    terminal = record["generation_events"][-1]
+    terminal.update({
+        "action": None,
+        "parse_error": "invalid_terminal_answer_format",
+        "terminal_rejection_reason": "invalid_terminal_answer_format",
+        "valid_action": False,
+    })
+    terminal[field] = value
+    monkeypatch.setitem(ANALYSIS.STAGE_SHAPES, "g0_g1", (1, 1))
+
+    with pytest.raises(ValueError, match="terminal allowlist result mismatch"):
+        ANALYSIS.validate_traces(
+            [record], "g0_g1", "a" * 64, ["hotpotqa:train:0"],
+            {"hotpotqa:train:0": "What is the capital city?"},
+            active_v4=True)
+
+
 def test_v4_terminal_generation_requires_answer_only_instruction(
         monkeypatch: pytest.MonkeyPatch) -> None:
     record = _terminal_record("answer")

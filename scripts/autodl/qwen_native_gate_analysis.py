@@ -283,12 +283,20 @@ def validate_traces(records: list[dict[str, Any]], stage: str,
                         f"active v4 terminal answer-only contract mismatch for {key}")
                 requested_action = terminal.get("requested_action")
                 if requested_action == "answer":
-                    terminal_result_valid = (
-                        terminal.get("action") == "answer"
-                        and terminal.get("parse_error") is None
-                        and terminal.get("terminal_rejection_reason") is None
-                        and terminal.get("valid_action") is True
-                    )
+                    parse_error = terminal.get("parse_error")
+                    if parse_error is None:
+                        terminal_result_valid = (
+                            terminal.get("action") == "answer"
+                            and terminal.get("terminal_rejection_reason") is None
+                            and terminal.get("valid_action") is True
+                        )
+                    else:
+                        terminal_result_valid = (
+                            terminal.get("action") is None
+                            and isinstance(parse_error, str) and bool(parse_error)
+                            and terminal.get("terminal_rejection_reason") == parse_error
+                            and terminal.get("valid_action") is False
+                        )
                 elif requested_action == "search":
                     terminal_result_valid = (
                         terminal.get("action") is None
@@ -581,7 +589,8 @@ def trace_diagnostics(record: Mapping[str, Any]) -> dict[str, Any]:
             and event.get("parse_error") is None
             for event in terminal_events),
         "terminal_invalid_count": sum(
-            event.get("requested_action") not in {"answer", "search"}
+            event.get("parse_error") is not None
+            and event.get("requested_action") != "search"
             for event in terminal_events),
         "terminal_accepted_search_count": sum(
             event.get("action") == "search"
