@@ -192,10 +192,12 @@ class DataParallelPPOActor(BasePPOActor):
                     selected_log_probs = logprobs_from_logits(logits, labels)
                     selected_entropy = verl_F.entropy_from_logits(logits)
                     output_shape = (batch_size, response_length)
-                    log_probs = logits.new_zeros(output_shape).index_copy(
-                        1, response_indices, selected_log_probs)
-                    entropy = logits.new_zeros(output_shape).index_copy(
-                        1, response_indices, selected_entropy)
+                    log_probs = selected_log_probs.new_zeros(
+                        output_shape).index_copy(1, response_indices,
+                                                 selected_log_probs)
+                    entropy = selected_entropy.new_zeros(
+                        output_shape).index_copy(1, response_indices,
+                                                 selected_entropy)
 
             return entropy, log_probs
 

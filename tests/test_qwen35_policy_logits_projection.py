@@ -67,6 +67,16 @@ def _naive_log_probs(logits, labels):
                         labels.unsqueeze(-1)).squeeze(-1)
 
 
+def _fp32_log_probs(logits, labels):
+    return _naive_log_probs(logits.float(), labels)
+
+
+def _fp32_entropy(logits):
+    float_logits = logits.float()
+    probabilities = torch.softmax(float_logits, dim=-1)
+    return -(probabilities * torch.log_softmax(float_logits, dim=-1)).sum(-1)
+
+
 def test_policy_projection_maps_labels_to_predecessor_logits():
     input_ids = torch.zeros((2, 9), dtype=torch.long)
     responses = torch.zeros((2, 5), dtype=torch.long)
@@ -169,3 +179,56 @@ def test_qwen35_projection_preserves_masked_values_and_gradients():
                                generic_module.hidden_states.grad)
     torch.testing.assert_close(qwen_module.lm_head.weight.grad,
                                generic_module.lm_head.weight.grad)
+
+
+def test_qwen35_projection_preserves_fp32_statistics_from_bfloat16_logits():
+    torch.manual_seed(11)
+    sequence_length = 8
+    response_length = 4
+    hidden_states = torch.randn(sequence_length, 3, dtype=torch.bfloat16)
+    lm_head_weight = torch.randn(9, 3, dtype=torch.bfloat16)
+    module = _FakeCausalLM(hidden_states, lm_head_weight, 'qwen3_5_text')
+    actor = _make_actor(_FakeFSDP(module))
+
+    responses = torch.tensor([
+        [2, 4, 1, 7],
+        [5, 3, 8, 1],
+    ])
+    loss_mask = torch.tensor([
+        [0, 1, 0, 1],
+        [0, 0, 1, 1],
+    ])
+    micro_batch = {
+        'input_ids': torch.arange(sequence_length).repeat(2, 1),
+        'attention_mask': torch.ones((2, sequence_length), dtype=torch.long),
+        'position_ids': torch.arange(sequence_length).repeat(2, 1),
+        'responses': responses,
+        'loss_mask': loss_mask,
+    }
+
+    with patch.object(dp_actor_module.torch,
+                      'autocast',
+                      return_value=nullcontext()), patch.object(
+                          dp_actor_module,
+                          'logprobs_from_logits',
+                          side_effect=_fp32_log_probs), patch.object(
+                              dp_actor_module.verl_F,
+                              'entropy_from_logits',
+                              side_effect=_fp32_entropy):
+        entropy, log_probs = actor._forward_micro_batch(micro_batch,
+                                                        temperature=1.0)
+
+    policy_mask = loss_mask.bool()
+    projected_columns = policy_mask.any(dim=0)
+    assert entropy.dtype == torch.float32
+    assert log_probs.dtype == torch.float32
+    assert torch.count_nonzero(entropy[:, ~projected_columns]) == 0
+    assert torch.count_nonzero(log_probs[:, ~projected_columns]) == 0
+    assert torch.isfinite(entropy[policy_mask]).all()
+    assert torch.isfinite(log_probs[policy_mask]).all()
+
+    (entropy[policy_mask].mean() + log_probs[policy_mask].mean()).backward()
+    for gradient in (module.hidden_states.grad, module.lm_head.weight.grad):
+        assert gradient is not None
+        assert torch.isfinite(gradient).all()
+        assert torch.count_nonzero(gradient) > 0
