@@ -7,11 +7,14 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 
 wait_for_terminal() {
-    local attempt="$1"
-    for _ in {1..100}; do
+    local attempt="$1" launcher_pid
+    for _ in {1..600}; do
+        launcher_pid="$(tr -d '\r\n' <"$attempt/launcher-pid" 2>/dev/null || true)"
         if [[ -f "$attempt/exit-code" && -f "$attempt/terminal" &&
               ! -e "$attempt/.starting" && ! -e "$attempt/.running" ]] &&
-            { [[ -f "$attempt/.success" ]] || [[ -f "$attempt/.failed" ]]; }; then
+            { [[ -f "$attempt/.success" ]] || [[ -f "$attempt/.failed" ]]; } &&
+            [[ "$launcher_pid" =~ ^[1-9][0-9]*$ ]] &&
+            ! kill -0 "$launcher_pid" 2>/dev/null; then
             return 0
         fi
         sleep 0.05
