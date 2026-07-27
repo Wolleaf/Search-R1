@@ -15,8 +15,13 @@ from typing import Any, Mapping, Sequence
 
 
 SCHEMA = "search-r1.qwen-native-protocol-probe"
-SCHEMA_VERSION = 3
-PROMPT_VERSION = "qwen35-native-search-v3-original-aligned"
+SCHEMA_VERSION = 4
+ACTIVE_DATA_SCHEMA_VERSION = 5
+PROMPT_VERSION = "qwen35-native-search-v4-terminal-answer-only"
+TERMINAL_PROMPT_VERSION = "qwen35-terminal-answer-v1"
+TERMINAL_PROMPT_SHA256 = (
+    "afc18b79afaafccece6927aec5ccd7898ef2ae17766bce7ffda244eef388d7f2"
+)
 EXPECTED_QUESTIONS = 8
 GROUP_SIZE = 2
 MODES = ("direct", "native_manager")
@@ -28,6 +33,38 @@ SAMPLING = {
     "presence_penalty": 0.0,
     "repetition_penalty": 1.0,
 }
+
+
+def validate_active_prompt_contract(payload: Mapping[str, Any]) -> None:
+    prompt_contract = payload.get("prompt_contract")
+    if (payload.get("schema_version") != ACTIVE_DATA_SCHEMA_VERSION
+            or not isinstance(prompt_contract, Mapping)
+            or prompt_contract.get("tool_protocol") != "qwen35_native"
+            or prompt_contract.get("prompt_version") != PROMPT_VERSION
+            or prompt_contract.get("terminal_answer_only") is not True
+            or prompt_contract.get("terminal_prompt_version") !=
+            TERMINAL_PROMPT_VERSION
+            or prompt_contract.get("terminal_prompt_sha256") !=
+            TERMINAL_PROMPT_SHA256):
+        raise ValueError("active v4 data prompt contract mismatch")
+
+
+def validate_resolved_contract(resolved: Mapping[str, Any],
+                               checkpoint_digest: str) -> None:
+    expected = {
+        "schema": SCHEMA,
+        "schema_version": SCHEMA_VERSION,
+        "checkpoint_digest": checkpoint_digest,
+        "prompt_version": PROMPT_VERSION,
+        "terminal_answer_only": True,
+        "terminal_prompt_version": TERMINAL_PROMPT_VERSION,
+        "terminal_prompt_sha256": TERMINAL_PROMPT_SHA256,
+        "max_action_budget": 4,
+        "max_obs_length": 500,
+        "sampling": SAMPLING,
+    }
+    if any(resolved.get(name) != value for name, value in expected.items()):
+        raise ValueError("active v4 resolved protocol contract mismatch")
 
 
 def canonical_bytes(value: Any) -> bytes:
@@ -183,6 +220,7 @@ def publish(output_dir: Path, resolved: Mapping[str, Any],
             checkpoint_digest: str) -> None:
     if output_dir.exists() or output_dir.is_symlink():
         raise ValueError(f"refusing to overwrite protocol probe output: {output_dir}")
+    validate_resolved_contract(resolved, checkpoint_digest)
     if len(records) != EXPECTED_QUESTIONS * GROUP_SIZE * len(MODES):
         raise ValueError("protocol probe must contain exactly 32 records")
     validate_environment_replay(environment_replay)
@@ -228,10 +266,7 @@ def load_fixture(path: Path, checkpoint_digest: str) -> tuple[
     records = payload["records"]
     if not isinstance(resolved, dict) or not isinstance(records, list):
         raise ValueError("fixture resolved_config/records types are invalid")
-    if resolved.get("sampling") != SAMPLING:
-        raise ValueError("fixture sampling does not match the registered G0 config")
-    if resolved.get("checkpoint_digest") != checkpoint_digest:
-        raise ValueError("fixture checkpoint digest mismatch")
+    validate_resolved_contract(resolved, checkpoint_digest)
     replay = payload["environment_replay"]
     if not isinstance(replay, dict):
         raise ValueError("fixture E0 environment replay is invalid")
@@ -262,6 +297,9 @@ def load_probe_rows(data_path: Path, manifest_path: Path,
     import pandas as pd
 
     manifest = json.loads(manifest_path.read_bytes())
+    if not isinstance(manifest, Mapping):
+        raise ValueError("native data manifest must be an object")
+    validate_active_prompt_contract(manifest)
     artifact = manifest.get("artifacts", {}).get(artifact_name, {})
     sample_ids = artifact.get("sample_ids")
     if artifact.get("file") != data_path.name or artifact.get("rows") != expected_rows \
@@ -609,6 +647,9 @@ def run_real(args: argparse.Namespace) -> tuple[
         "schema_version": SCHEMA_VERSION,
         "checkpoint_digest": args.checkpoint_digest,
         "prompt_version": PROMPT_VERSION,
+        "terminal_answer_only": True,
+        "terminal_prompt_version": TERMINAL_PROMPT_VERSION,
+        "terminal_prompt_sha256": TERMINAL_PROMPT_SHA256,
         "model_tree_sha256": sha256_tree(args.model_dir),
         "seed": args.seed,
         "questions": EXPECTED_QUESTIONS,

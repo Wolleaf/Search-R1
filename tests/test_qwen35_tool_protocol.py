@@ -1,3 +1,4 @@
+import hashlib
 import json
 
 import pytest
@@ -9,6 +10,9 @@ from search_r1.llm_agent.tool_protocol import (
     QWEN35_REASONING_CONTINUATION,
     QWEN35_REASONING_FULL,
     QWEN35_RETRY_PROMPT,
+    QWEN35_TERMINAL_PROMPT,
+    QWEN35_TERMINAL_PROMPT_SHA256,
+    QWEN35_TERMINAL_PROMPT_VERSION,
     ParsedAction,
     ProtocolError,
     Qwen35Conversation,
@@ -396,6 +400,60 @@ def test_native_parser_selects_first_complete_action_and_ignores_raw_tail(
     ) == expected
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "</think>prose<answer>Paris</answer>",
+        "</think><answer>Paris</answer> garbage",
+        ("</think><answer>Paris</answer>"
+         "<tool_call><function=search><parameter=query>Lyon"
+         "</parameter></function></tool_call>"),
+    ],
+)
+def test_terminal_answer_only_rejects_prose_or_raw_tail(text):
+    parsed = parse_action(
+        text,
+        QWEN35_NATIVE,
+        qwen35_reasoning_mode=QWEN35_REASONING_CONTINUATION,
+        qwen35_answer_only=True,
+    )
+
+    assert parsed.action == "answer"
+    assert parsed.content == "Paris"
+    assert parsed.error == "invalid_terminal_answer_format"
+    assert parsed.valid is False
+
+
+def test_terminal_answer_only_accepts_reasoning_and_action_whitespace():
+    parsed = parse_action(
+        "Useful reasoning.</think>\n \t<answer>Paris</answer>\r\n\t",
+        QWEN35_NATIVE,
+        qwen35_reasoning_mode=QWEN35_REASONING_CONTINUATION,
+        qwen35_answer_only=True,
+    )
+
+    assert parsed == ParsedAction(
+        "answer", "Paris", prefix="Useful reasoning.")
+
+
+def test_terminal_answer_only_rejects_search_with_auditable_request():
+    parsed = parse_action(
+        "Need evidence.</think>\n<tool_call><function=search>"
+        "<parameter=query>France capital</parameter></function></tool_call>",
+        QWEN35_NATIVE,
+        qwen35_reasoning_mode=QWEN35_REASONING_CONTINUATION,
+        qwen35_answer_only=True,
+    )
+
+    assert parsed == ParsedAction(
+        "search",
+        "France capital",
+        error="search_disallowed_after_budget",
+        prefix="Need evidence.",
+    )
+    assert parsed.valid is False
+
+
 def test_native_parser_keeps_malformed_first_close_as_selected_boundary():
     response = (
         "Reasoning.\n</think>\n</answer>"
@@ -509,7 +567,8 @@ def test_native_message_contract_preserves_question_text():
         "between <information> and </information>",
         "in a tool response",
     ).replace("as your want", "as you want")
-    assert QWEN35_PROMPT_VERSION == "qwen35-native-search-v3-original-aligned"
+    assert QWEN35_PROMPT_VERSION == (
+        "qwen35-native-search-v4-terminal-answer-only")
     assert messages == [{"role": "user", "content": expected_user}]
     assert validate_qwen35_messages(messages) == messages
     with pytest.raises(ProtocolError, match="exactly one user"):
@@ -526,6 +585,22 @@ def test_native_contract_contains_no_added_search_policy():
     for forbidden in ("at least once", "at most four", "exactly one search",
                       "call search once", "specific factual"):
         assert forbidden not in contract.casefold()
+
+
+def test_terminal_answer_only_prompt_contract_is_versioned_and_hashed():
+    expected = (
+        "The search budget is exhausted. You must not call the search tool "
+        "again. Using only the question and information already available, "
+        "give your best answer even if uncertain. After reasoning, output "
+        "exactly one concise final answer inside <answer> and </answer>, with "
+        "no text after </answer>.")
+
+    assert QWEN35_TERMINAL_PROMPT_VERSION == "qwen35-terminal-answer-v1"
+    assert QWEN35_TERMINAL_PROMPT == expected
+    assert QWEN35_TERMINAL_PROMPT_SHA256 == (
+        "afc18b79afaafccece6927aec5ccd7898ef2ae17766bce7ffda244eef388d7f2")
+    assert hashlib.sha256(expected.encode("utf-8")).hexdigest() == (
+        QWEN35_TERMINAL_PROMPT_SHA256)
 
 
 def test_native_conversation_preserves_prefix_and_masks_complete_wrapper():

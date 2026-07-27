@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 NATIVE_PROJECT_ROOT="${AUTODL_ROOT:-/root/autodl-tmp/search-r1}"
 NATIVE_STAGE="${QWEN_NATIVE_GATE_STAGE:-}"
 NATIVE_PREDECESSOR_EVIDENCE="${QWEN_NATIVE_PREDECESSOR_EVIDENCE:-}"
-NATIVE_DATA_DIR="$NATIVE_PROJECT_ROOT/data/search_mix_qwen35_native_v3"
+NATIVE_DATA_DIR="$NATIVE_PROJECT_ROOT/data/search_mix_qwen35_native_v4"
 export DATA_DIR="$NATIVE_DATA_DIR"
 
 export AUTODL_RUN_BUDGET_PROFILE=gated_followup
@@ -224,7 +224,7 @@ verify_native_attempt_binding() {
     recorded_results="$(tr -d '\r\n' <"$outer/result-root")" || return 1
     recorded_marker="$(tr -d '\r\n' <"$outer/evidence-marker")" || return 1
     recorded_digest="$(tr -d '\r\n' <"$outer/evidence-digest")" || return 1
-    [[ ("$contract" == qwen-native-gate-v1 || "$contract" == qwen-native-gate-v3) &&
+    [[ "$contract" == qwen-native-gate-v4 &&
         "$recorded_results" == "$results" &&
         "$recorded_marker" == "$marker" &&
         "$recorded_digest" == "$evidence_digest" ]] || {
@@ -848,7 +848,7 @@ publish_native_gate_evidence() {
     }
     atomic_write "$marker" "$evidence_digest"$'\n'
     sync_path "$marker_dir"
-    atomic_write "$outer_attempt/result-contract" 'qwen-native-gate-v3'$'\n'
+    atomic_write "$outer_attempt/result-contract" 'qwen-native-gate-v4'$'\n'
     atomic_write "$outer_attempt/result-root" "$results_dir"$'\n'
     atomic_write "$outer_attempt/evidence-marker" "$marker"$'\n'
     atomic_write "$outer_attempt/evidence-digest" "$evidence_digest"$'\n'

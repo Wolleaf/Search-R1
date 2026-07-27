@@ -2,7 +2,7 @@
 
 > 日期：2026-07-27
 >
-> 状态：方案预注册，尚未修改训练代码
+> 状态：实现完成并通过本地验收；待 CPU 增量重物化与 handoff
 >
 > 基线：`experiment/hotpot-search-gate@1e31808`
 >
@@ -68,11 +68,12 @@ terminal 轮采用 answer-only allowlist：
 
 ### 2.4 代码与证据范围
 
-预计仅修改：
+实际修改边界：
 
 - `search_r1/llm_agent/tool_protocol.py`：固定 terminal prompt、模板 suffix 与 prompt hash；
 - `search_r1/llm_agent/generation.py`：第 4 轮 follow-up 注入、mask 和 answer-only 执行；
-- `search_r1/trajectory_trace.py`、`verl/trainer/ppo/ray_trainer.py`：记录 terminal instruction、请求动作、拒绝原因和对齐事实；
+- `search_r1/trajectory_trace.py`：记录 terminal instruction、请求动作、拒绝原因和对齐事实；
+- `verl/utils/tracking.py`、`verl/trainer/main_ppo.py`：管理具体 WandB Run 的成功/异常终态；
 - `scripts/autodl/qwen_native_*`、watchdog 与测试：提升协议/证据 contract，复核新字段。
 
 初始问题 prompt、前四轮工具协议、检索结果格式和 strict EM 均不改。新版本明确命名为 `qwen35-native-search-v4-terminal-answer-only`，报告中注明这是本项目对原版 terminal rollout 的新增改进。
@@ -97,14 +98,16 @@ gold = ["Pete Seeger", "Lee Hays"]
 
 ### 3.2 最小处理
 
-不直接编辑 pinned source、catalog 或 Parquet。新增版本化 exclusion manifest，例如 `scripts/data_process/search_mix_answer_quality_exclusions.json`，每条必须包含：
+不直接编辑 pinned source、旧 catalog 或旧 Parquet。新增版本化人工审计清单 `scripts/data_process/search_mix_answer_quality_exclusions.v1.json`，每条必须包含：
 
 - pinned source revision 与 `source_id`；
 - expected question 和 expected `golden_answers`；
-- `disposition=exclude`；
+- `disposition=retain_alias` 或显式的 `exclude_*`；
 - 可复核原因与依据。
 
-构建时先严格核对 expected 内容；源数据有任何漂移立即失败。排除后从同 source/category 的既有合格候选中按原 seed 和稳定排序确定性补位，并把 manifest digest、逐原因数量和替换 lineage 写入数据 manifest。现有 NQ single 合格候选 2,896 条，只需选择 256 条，因此无需重新下载数据或重建 BM25，只需 CPU 重物化。
+构建时先严格核对 expected 内容；源数据有任何漂移立即失败。52 条 multi-gold 已逐条人工审计：2 条为真实 alias 并保留，33 条要求同时回答多个实体，16 条语义含混、1 条 gold 不完整并剔除；另剔除已确认的 bit/nibble 错标。合计封存 53 条审计、排除 51 条。任何新入选 multi-gold 若没有显式 `retain_alias` 审计都会失败关闭，避免补位再次引入未经审计的 OR gold。
+
+排除后从同 source/category 的既有合格候选中按原 seed 和稳定排序确定性补位，并保持原 output split；数据 manifest 封存人工清单 digest、审计/排除逐原因数量和完整替换 lineage。现有 NQ single 合格候选充足，因此无需重新下载数据或重建 BM25，只需 CPU 重物化为独立的 `data/search_mix_qwen35_native_v4/`，旧 v3 保持不可变。
 
 处理顺序：
 
@@ -121,7 +124,7 @@ gold = ["Pete Seeger", "Lee Hays"]
 
 `verl/utils/tracking.py` 改为保存 `wandb.init()` 返回的具体 Run，而不是 wandb 模块：
 
-- 每次 `Run.log(data, step=step, commit=True)`，保证形成 history record；
+- 每次使用 `Run.log(data, step=step)`，由 step 推进和显式 finish 提交 history；固定 WandB 0.21.1 下强制 `commit=True` 会使同 step 的后续验证指标被丢弃，因此不采用；
 - 增加幂等 `finish(exit_code)`；正常完成调用 `Run.finish(0)`；
 - Ray owner 中 `init_workers()+fit()` 成功后必须 finish(0) 才能返回；
 - 任意训练异常时 best-effort finish(1)，随后重新抛出原异常；finish 的次生异常不得覆盖原训练错误；
@@ -131,15 +134,15 @@ gold = ["Pete Seeger", "Lee Hays"]
 
 ### 4.2 真实二进制门禁
 
-`qwen_native_smoke_analysis.py` 使用当前固定 WandB 版本的 `DataStore` 扫描唯一的普通非软链 `run-*.wandb`，解析失败、截断、伪字节或多 run 均 fail closed。2-step smoke 的 GO 必须同时满足：
+`wandb_history.py` 与 `qwen_native_smoke_analysis.py` 使用当前固定 WandB 版本的 `DataStore` 扫描唯一的普通非软链 `run-*.wandb`；解析失败、截断、伪字节、多 run、扫描中输入漂移或 exit 后仍有 record 均 fail closed。2-step smoke 的 GO 必须同时满足：
 
-- history 覆盖 `_step={1,2}`；
-- 每个 step 都包含有限的 PG loss、KL loss、entropy、grad norm 和 PPO KL；
+- history 精确覆盖 `_step=[1,2]`，每步恰有一条完整 actor metric record；
+- 每个 step 同时包含有限的 PG loss、KL loss、entropy、grad norm 和 PPO KL；
 - history 数值与 `train.log` 在固定容差内一致；
 - 至少一个 summary record；
 - 恰好一个 exit record，且 `exit_code=0`。
 
-`wandb_offline_history.observed` 改为 history record 数，不再是文件数。WandB 文件树 SHA 继续封存，但不能替代内容解析。watchdog 和 main evidence publisher 必须复用同一 scanner，不能只信 decision JSON 或 `*.wandb` 文件存在。
+scanner 为每个 run 写不可覆盖的 canonical receipt，绑定模式、预期 steps、训练日志 digest、唯一 run 和完整 WandB 文件树；写入前后复核输入稳定性并 fsync 文件和父目录。`wandb_offline_history.observed` 改为 history record 数，不再是文件数。WandB 文件树 SHA 继续封存，但不能替代内容解析。watchdog 和 main evidence publisher 必须重新验证 receipt，不能只信 decision JSON 或 `*.wandb` 文件存在。
 
 旧 smoke marker 不删除、不改写，也不从 `train.log` 伪造 history。新 contract 自然拒绝旧 marker。
 
@@ -155,7 +158,7 @@ gold = ["Pete Seeger", "Lee Hays"]
 - observation 可截断但 terminal prompt 不可截断；
 - legacy XML 路径完全不变；
 - gold OR 命中、组合答案失败、倒序失败；exclusion 防漂移、确定性补位和 manifest digest；
-- fake WandB Run 的 `commit=True` 与 finish(0/1)；Ray 正常/异常生命周期；
+- fake WandB Run 的默认 commit 行为与 finish(0/1)；owner 正常/异常生命周期；
 - 用临时目录真实生成 offline 2-step `.wandb`，验证完整正例，以及缺 history、缺 step、NaN、finish(1)、损坏文件和软链负例；
 - smoke analyzer、training pipeline、watchdog、CPU reseal transaction、完整 pytest 与 shell 语法。
 

@@ -19,7 +19,7 @@ DATA_ROOT="$PROJECT_ROOT/data"
 SMALL_DATA_DIR="$DATA_ROOT/nq_small"
 SEARCH_GATE_DATA_DIR="$DATA_ROOT/search_opportunity_gate"
 SEARCH_MIX_DATA_DIR="$DATA_ROOT/search_mix"
-QWEN_NATIVE_DATA_DIR="$DATA_ROOT/search_mix_qwen35_native_v3"
+QWEN_NATIVE_DATA_DIR="$DATA_ROOT/search_mix_qwen35_native_v4"
 BM25_ROOT="$DATA_ROOT/wiki-18-bm25-index"
 CORPUS_SOURCE_ROOT="$DATA_ROOT/wiki-18-corpus-source"
 CORPUS_ROOT="$DATA_ROOT/wiki-18-corpus"
@@ -720,8 +720,7 @@ PY
             --output-dir "$QWEN_NATIVE_DATA_DIR" \
             --model-dir "$MODEL_DIR" \
             --eval-catalog "$SEARCH_GATE_DATA_DIR/catalog.jsonl" \
-            --eval-parquet "$SMALL_DATA_DIR/test_128.parquet" \
-            --no-reselection
+            --eval-parquet "$SMALL_DATA_DIR/test_128.parquet"
         seal_qwen_native=1
     elif [[ -f "$QWEN_NATIVE_DATA_DIR/manifest.json" &&
             ! -L "$QWEN_NATIVE_DATA_DIR/manifest.json" ]]; then
@@ -744,6 +743,9 @@ from search_r1.llm_agent.tool_protocol import (
     QWEN35_NATIVE,
     QWEN35_REASONING_CONTINUATION,
     QWEN35_RETRY_PROMPT,
+    QWEN35_TERMINAL_PROMPT,
+    QWEN35_TERMINAL_PROMPT_SHA256,
+    QWEN35_TERMINAL_PROMPT_VERSION,
     Qwen35Conversation,
     parse_action,
     qwen35_messages,
@@ -844,18 +846,58 @@ if (not retry.token_ids
     raise SystemExit("Qwen native retry wrapper did not preserve sampled tokens")
 assert_roundtrip(retry_conversation, invalid_prefix,
                  "search/invalid user retry")
+
+if (QWEN35_TERMINAL_PROMPT_VERSION != "qwen35-terminal-answer-v1"
+        or hashlib.sha256(QWEN35_TERMINAL_PROMPT.encode("utf-8")).hexdigest()
+        != QWEN35_TERMINAL_PROMPT_SHA256):
+    raise SystemExit("Qwen native terminal prompt identity is inconsistent")
+
+terminal_search_conversation = Qwen35Conversation(tokenizer, messages, prompt_ids)
+terminal_search_prefix = (list(terminal_search_conversation.prompt_token_ids)
+                          + list(search_ids))
+terminal_search = terminal_search_conversation.append_followup(
+    search_text, parse_action(
+        search_text, QWEN35_NATIVE,
+        qwen35_reasoning_mode=QWEN35_REASONING_CONTINUATION),
+    "  Hamlet was written by William Shakespeare.  ", 500,
+    response_token_ids=search_ids, terminal_answer_only=True)
+if (not terminal_search.terminal_instruction_applied
+        or [message["role"] for message in terminal_search_conversation.messages[-3:]]
+        != ["assistant", "tool", "user"]
+        or terminal_search_conversation.messages[-1] != {
+            "role": "user", "content": QWEN35_TERMINAL_PROMPT}
+        or any(message.get("content") == QWEN35_RETRY_PROMPT
+               for message in terminal_search_conversation.messages)):
+    raise SystemExit("Qwen native terminal search wrapper is invalid")
+assert_roundtrip(terminal_search_conversation, terminal_search_prefix,
+                 "search/tool/terminal user")
+rejected_search = parse_action(
+    search_text, QWEN35_NATIVE,
+    qwen35_reasoning_mode=QWEN35_REASONING_CONTINUATION,
+    qwen35_answer_only=True)
+if (rejected_search.valid or rejected_search.action != "search"
+        or rejected_search.error != "search_disallowed_after_budget"):
+    raise SystemExit("Qwen native terminal search was not rejected")
+
+terminal_invalid_conversation = Qwen35Conversation(tokenizer, messages, prompt_ids)
+terminal_invalid_prefix = (list(terminal_invalid_conversation.prompt_token_ids)
+                           + list(invalid_ids))
+terminal_invalid = terminal_invalid_conversation.append_followup(
+    invalid_text, parse_action(
+        invalid_text, QWEN35_NATIVE,
+        qwen35_reasoning_mode=QWEN35_REASONING_CONTINUATION), "", 500,
+    response_token_ids=invalid_ids, terminal_answer_only=True)
+if (not terminal_invalid.terminal_instruction_applied
+        or [message["role"] for message in terminal_invalid_conversation.messages[-2:]]
+        != ["assistant", "user"]
+        or terminal_invalid_conversation.messages[-1] != {
+            "role": "user", "content": QWEN35_TERMINAL_PROMPT}
+        or any(message.get("content") == QWEN35_RETRY_PROMPT
+               for message in terminal_invalid_conversation.messages)):
+    raise SystemExit("Qwen native terminal invalid wrapper is invalid")
+assert_roundtrip(terminal_invalid_conversation, terminal_invalid_prefix,
+                 "invalid/terminal user")
 PY
-        # New output was fully verified before its atomic publication.
-        if [[ "$build_qwen_native" != 1 ]]; then
-            "$train_python" "$CHECKOUT_DIR/scripts/data_process/search_mix.py" \
-                verify-no-reselection \
-                --manifest "$QWEN_NATIVE_DATA_DIR/manifest.json" \
-                --source-manifest "$SEARCH_MIX_DATA_DIR/manifest.json" \
-                --model-dir "$MODEL_DIR" \
-                --eval-catalog "$SEARCH_GATE_DATA_DIR/catalog.jsonl" \
-                --eval-parquet "$SMALL_DATA_DIR/test_128.parquet" \
-                --expected-tool-protocol qwen35_native
-        fi
         "$train_python" "$CHECKOUT_DIR/scripts/data_process/search_mix.py" \
             validate-native-evidence \
             --manifest "$QWEN_NATIVE_DATA_DIR/manifest.json" \
@@ -1144,14 +1186,14 @@ specs = {
     "qwen_native_r_val": ("val_128.parquet", 1, parent_placeholder),
     "qwen_native_b_val": ("val_128.parquet", 1, parent_placeholder),
     "qwen_native_c_val": ("val_128.parquet", 1, parent_placeholder),
-    "qwen_native_a_nq_test": ("nq_test_128_native_v3.parquet", 1, model_dir),
-    "qwen_native_r_nq_test": ("nq_test_128_native_v3.parquet", 1, parent_placeholder),
-    "qwen_native_b_nq_test": ("nq_test_128_native_v3.parquet", 1, parent_placeholder),
-    "qwen_native_c_nq_test": ("nq_test_128_native_v3.parquet", 1, parent_placeholder),
-    "qwen_native_a_multihop": ("multihop_eval_256_native_v3.parquet", 1, model_dir),
-    "qwen_native_r_multihop": ("multihop_eval_256_native_v3.parquet", 1, parent_placeholder),
-    "qwen_native_b_multihop": ("multihop_eval_256_native_v3.parquet", 1, parent_placeholder),
-    "qwen_native_c_multihop": ("multihop_eval_256_native_v3.parquet", 1, parent_placeholder),
+    "qwen_native_a_nq_test": ("nq_test_128_native_v4.parquet", 1, model_dir),
+    "qwen_native_r_nq_test": ("nq_test_128_native_v4.parquet", 1, parent_placeholder),
+    "qwen_native_b_nq_test": ("nq_test_128_native_v4.parquet", 1, parent_placeholder),
+    "qwen_native_c_nq_test": ("nq_test_128_native_v4.parquet", 1, parent_placeholder),
+    "qwen_native_a_multihop": ("multihop_eval_256_native_v4.parquet", 1, model_dir),
+    "qwen_native_r_multihop": ("multihop_eval_256_native_v4.parquet", 1, parent_placeholder),
+    "qwen_native_b_multihop": ("multihop_eval_256_native_v4.parquet", 1, parent_placeholder),
+    "qwen_native_c_multihop": ("multihop_eval_256_native_v4.parquet", 1, parent_placeholder),
 }
 for variant, (filename, group_size, checkpoint) in specs.items():
     path = manifest_dir / f"config-2gpu-{variant}-eval.yaml"
@@ -1203,7 +1245,7 @@ for variant, (steps, model_path, cost_lambda, reward_mode) in train_specs.items(
     trace_checkpoint = config.trainer.get("trace_checkpoint_digest", None)
     trace_parent = config.trainer.get("trace_parent_checkpoint_digest", None)
     if (config.tool_protocol != "qwen35_native"
-            or config.qwen35_prompt_version != "qwen35-native-search-v3-original-aligned"
+            or config.qwen35_prompt_version != "qwen35-native-search-v4-terminal-answer-only"
             or config.trainer.native_training_variant != variant
             or Path(config.data.train_files) != data_dir / "train_512.parquet"
             or Path(config.data.val_files) != data_dir / "val_128.parquet"
@@ -1491,26 +1533,28 @@ PY
             --extra-file "$config_manifest_dir/config-2gpu-qwen-native-cost_aware_gated-train.yaml"
         )
         native_handoff_contract_args+=(
-            --native-prompt-version qwen35-native-search-v3-original-aligned
+            --native-prompt-version qwen35-native-search-v4-terminal-answer-only
             --native-thinking-enabled
             --max-action-budget 4
             --selection-observation-length 384
             --rollout-observation-length 500
         )
         native_handoff_verify_args+=(
-            --expect-native-prompt-version qwen35-native-search-v3-original-aligned
+            --expect-native-prompt-version qwen35-native-search-v4-terminal-answer-only
             --expect-native-thinking-enabled
             --expect-max-action-budget 4
             --expect-selection-observation-length 384
             --expect-rollout-observation-length 500
-            --require-artifact data/search_mix_qwen35_native_v3/manifest.json
-            --require-artifact data/search_mix_qwen35_native_v3/train_512.parquet
-            --require-artifact data/search_mix_qwen35_native_v3/val_128.parquet
-            --require-artifact data/search_mix_qwen35_native_v3/probe_g0_8.parquet
-            --require-artifact data/search_mix_qwen35_native_v3/probe_autonomous_16.parquet
-            --require-artifact data/search_mix_qwen35_native_v3/probe_multi_64.parquet
-            --require-artifact data/search_mix_qwen35_native_v3/nq_test_128_native_v3.parquet
-            --require-artifact data/search_mix_qwen35_native_v3/multihop_eval_256_native_v3.parquet
+            --require-artifact data/search_mix_qwen35_native_v4/manifest.json
+            --require-artifact data/search_mix_qwen35_native_v4/catalog.jsonl
+            --require-artifact data/search_mix_qwen35_native_v4/search_mix_answer_quality_exclusions.v1.json
+            --require-artifact data/search_mix_qwen35_native_v4/train_512.parquet
+            --require-artifact data/search_mix_qwen35_native_v4/val_128.parquet
+            --require-artifact data/search_mix_qwen35_native_v4/probe_g0_8.parquet
+            --require-artifact data/search_mix_qwen35_native_v4/probe_autonomous_16.parquet
+            --require-artifact data/search_mix_qwen35_native_v4/probe_multi_64.parquet
+            --require-artifact data/search_mix_qwen35_native_v4/nq_test_128_native_v4.parquet
+            --require-artifact data/search_mix_qwen35_native_v4/multihop_eval_256_native_v4.parquet
         )
     fi
 

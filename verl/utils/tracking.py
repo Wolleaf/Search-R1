@@ -35,6 +35,8 @@ class Tracking(object):
                 assert backend in self.supported_backend, f'{backend} is not supported'
 
         self.logger = {}
+        self._wandb_run = None
+        self._wandb_finished = False
 
         if 'tracking' in default_backend or 'wandb' in default_backend:
             import wandb
@@ -42,8 +44,10 @@ class Tracking(object):
             WANDB_API_KEY = os.environ.get("WANDB_API_KEY", None)
             if WANDB_API_KEY:
                 wandb.login(key=WANDB_API_KEY)
-            wandb.init(project=project_name, name=experiment_name, config=config)
-            self.logger['wandb'] = wandb
+            self._wandb_run = wandb.init(project=project_name,
+                                         name=experiment_name,
+                                         config=config)
+            self.logger['wandb'] = self._wandb_run
 
         if 'mlflow' in default_backend:
             import mlflow
@@ -59,7 +63,19 @@ class Tracking(object):
     def log(self, data, step, backend=None):
         for default_backend, logger_instance in self.logger.items():
             if backend is None or default_backend in backend:
-                logger_instance.log(data=data, step=step)
+                if default_backend == 'wandb':
+                    # Explicit finish flushes the last step while the default
+                    # commit behavior still lets same-step validation merge.
+                    logger_instance.log(data=data, step=step)
+                else:
+                    logger_instance.log(data=data, step=step)
+
+    def finish(self, exit_code: int = 0) -> None:
+        if self._wandb_run is None or self._wandb_finished:
+            return
+
+        self._wandb_run.finish(exit_code=exit_code)
+        self._wandb_finished = True
 
 
 class _MlflowLoggingAdapter:

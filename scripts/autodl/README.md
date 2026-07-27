@@ -2,7 +2,7 @@
 
 本目录是 Search-R1-small 云端复现的唯一入口。固定镜像为 **PyTorch 2.8.0 / Python 3.12 / Ubuntu 22.04 / CUDA 12.8**，持久目录为 `/root/autodl-tmp/search-r1`。正常流程始终是 **Git -> CPU -> GPU**；脚本不扫描机器规格、不自动改配置、不自动重试。GPU phase 本身不关机；需要时显式绑定本次 attempt 启动独立 watchdog。
 
-`03/05/06/07` 保留此前 NQ、搜索机会门和 XML grouped probe 的可执行证据，不作为 Qwen3.5 原生协议入口。当前流程先增量重封 native-v3 CPU handoff，再由 `08_gpu_qwen_native_gate.sh` 运行结构 G0/G1 门；`09_gpu_qwen_native_train.sh` 将两步 smoke 与正式 R60 分成独立 attempt，并在 R 后运行能力 G3。G3 只决定是否继续 B/C 分支，不阻止 R 学习搜索策略。
+`03/05/06/07` 保留此前 NQ、搜索机会门和 XML grouped probe 的可执行证据，不作为 Qwen3.5 原生协议入口。当前流程先增量重封 native-v4 CPU handoff，再由 `08_gpu_qwen_native_gate.sh` 运行结构 G0/G1 门；`09_gpu_qwen_native_train.sh` 将两步 smoke 与正式 R60 分成独立 attempt，并在 R 后运行能力 G3。G3 只决定是否继续 B/C 分支，不阻止 R 学习搜索策略。
 
 ## 最短正常路径
 
@@ -66,7 +66,7 @@ AUTODL_QWEN_NATIVE_INCREMENTAL=1 \
 bash /root/autodl-tmp/search-r1/checkout/scripts/autodl/02_cpu_prepare.sh
 ```
 
-该模式不联网、不重装环境、不下载资产，也不重放整套 BM25 查询。它要求上一次成功 handoff 已封存语义校验通过的 `retrieval_replay.json` 及 sidecar，只从该 source、evidence、selection funnel 和固定 tokenizer 物化独立的 `data/search_mix_qwen35_native_v3/`；旧 v2 与原 `data/search_mix/` 均不覆盖。v3 恢复论文原版单 user prompt 的语义，只把 `<search>/<information>` 映射为 Qwen3.5 原生 tool call/tool response；开启 native thinking，不加入强制首搜、搜索次数提示或 terminal action。
+该模式不联网、不重装环境、不下载资产，也不重放整套 BM25 查询。它要求上一次成功 handoff 已封存语义校验通过的 `retrieval_replay.json` 及 sidecar，只从该 source、既有 retrieval evidence、selection funnel 和固定 tokenizer 物化独立的 `data/search_mix_qwen35_native_v4/`；旧 v2/v3 与原 `data/search_mix/` 均不覆盖。v4 保留论文原版单 user prompt，只把 `<search>/<information>` 映射为 Qwen3.5 原生 tool call/tool response，并开启 native thinking。版本化清单逐条封存 52 个 multi-gold 样本：仅保留 2 个已核实 alias，剔除其余 50 个以及 bit/nibble 错标，并在同 source/category/split 确定性补齐 51 个单 gold；任何未经审计的 multi-gold 都不能入选或作为补位。四个常规 action 耗尽后，仍 active 的轨迹收到固定 terminal answer-only user 提示；terminal search 只记录、不执行。
 
 CPU 使用固定 tokenizer 验证全部 640 条 train/val evidence 在 500-token observation 下仍可见，并验证 G0-8、autonomous G1-16、R 后 G3-64、NQ test-128 和 multihop-256。随后组合 smoke/R/B/C 以及 A/R/B/C 三个 endpoint 的两卡 resolved config。handoff schema 3 显式绑定 prompt version、thinking、总 action budget 4、选样 observation 384 和 rollout observation 500；候选数据、配置与 handoff 全部通过后才原子发布，失败可安全重跑同一命令。
 
@@ -119,7 +119,7 @@ bash /root/autodl-tmp/search-r1/checkout/scripts/autodl/07_gpu_group_probe.sh
 
 ## 历史 GPU 工作流（本轮不要运行）
 
-`03_gpu_run.sh` 是旧 NQ A/R/B/C 完整流程；`05_gpu_cost_aware_gated.sh` 和 `06_gpu_search_opportunity_gate.sh` 是其后续实验。它们保留复现实证，但不读取本轮 `search_mix` 训练集，也不能代替当前 native-v3 结构门与 Parent/R 评测。
+`03_gpu_run.sh` 是旧 NQ A/R/B/C 完整流程；`05_gpu_cost_aware_gated.sh` 和 `06_gpu_search_opportunity_gate.sh` 是其后续实验。它们保留复现实证，但不读取本轮 `search_mix` 训练集，也不能代替当前 native-v4 结构门与 Parent/R 评测。
 
 ### 旧 NQ A/R/B/C 流程
 
@@ -160,13 +160,13 @@ GO 只表示值得进入下一阶段，不能直接在 NQ 上只重训一个 C�
 
 ## 固定配置与回退
 
-当前 native-v3 gate 与训练固定为两张 GPU、batch 8、训练 group 5、四个可检索 action 加一次上游同款非检索收尾生成、retriever top-k 3、`start/observation/response/trajectory=1024/500/500/4500`，并固定 `temperature/top-p/top-k/min-p/presence/repetition=1.0/1.0/0/0.0/0.0/1.0`。其中 `4500 = 4 * (500 + 500) + 500`，最后 500 token 只用于尚未结束轨迹的 terminal generation，不执行也不计搜索成本。选样阶段保留 384-token provenance，但 rollout 使用 500；endpoint 固定 group 1、greedy、seed 42。历史 `07` 保持 XML group-5 配置，`03/05/06` 保持 response 256、prompt 3584；新实验不得复用历史入口。
+当前 native-v4 gate 与训练固定为两张 GPU、batch 8、训练 group 5、四个可检索 action 加一次 answer-only 收尾生成、retriever top-k 3、`start/observation/response/trajectory=1024/500/500/4500`，并固定 `temperature/top-p/top-k/min-p/presence/repetition=1.0/1.0/0/0.0/0.0/1.0`。其中 `4500 = 4 * (500 + 500) + 500`，最后 500 token 只用于尚未结束轨迹的 terminal generation，不执行也不计搜索成本。选样阶段保留 384-token provenance，但 rollout 使用 500；endpoint 固定 group 1、greedy、seed 42。历史 `07` 保持 XML group-5 配置，`03/05/06` 保持 response 256、prompt 3584；新实验不得复用历史入口。
 
-native-v3 exact attempt 不接受 batch 4、response 384 或关闭 thinking 的历史 fallback。若两卡 2-step smoke 失败，保留失败 attempt 并停止；任何降配都必须另立配置版本并重新执行结构门，不能在同一实验身份下静默重跑。失败不会自动重试、覆盖旧 attempt 或采用早于固定终点的 checkpoint。
+native-v4 exact attempt 不接受 batch 4、response 384 或关闭 thinking 的历史 fallback。两卡 2-step smoke 还必须从唯一 `run-*.wandb` 二进制重放 step 1/2 的五项 actor 指标、summary 与 `exit_code=0`，并与 `train.log` 对齐。若 smoke 失败，保留失败 attempt 并停止；任何降配都必须另立配置版本并重新执行结构门，不能在同一实验身份下静默重跑。失败不会自动重试、覆盖旧 attempt 或采用早于固定终点的 checkpoint。
 
 ## 预算与存储
 
-native-v3 结构门与两步 smoke 的硬上限分别为 2 元和 15 元。main 中 R60/G3/B20/C20 分别为 100/10/40/25 元；A/R 六个 endpoint 始终注册，每个 5 元，B/C 六个 endpoint 仅在分支放行后注册。完整 GO 路径的分项硬上限合计 252 元。脚本按 `AUTODL_PRICE_PER_HOUR` 换算 timeout；这是防失控上限，不是预计账单，GNU timeout 的 120 秒强杀宽限和 CPU/存储费用另计。
+native-v4 结构门与两步 smoke 的硬上限分别为 2 元和 15 元。main 中 R60/G3/B20/C20 分别为 100/10/40/25 元；A/R 六个 endpoint 始终注册，每个 5 元，B/C 六个 endpoint 仅在分支放行后注册。完整 GO 路径的分项硬上限合计 252 元。脚本按 `AUTODL_PRICE_PER_HOUR` 换算 timeout；这是防失控上限，不是预计账单，GNU timeout 的 120 秒强杀宽限和 CPU/存储费用另计。
 
 100 GB 盘不预设“必然够用”。两步 smoke 会记录实际 `checkpoint_bytes` 和 `filesystem_available_bytes`；启动 main 前必须据此确认还能同时保留 R/B/C endpoint、日志、trace 和 WandB history。smoke checkpoint 在 main evidence 完整封存前不得删除，脚本也不会自动清理历史 checkpoint、扩容或覆盖证据。空间不足时保持停机并由人工决定精确清理对象或扩容，不能让脚本猜测路径。
 

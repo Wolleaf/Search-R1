@@ -12,9 +12,9 @@ import sys
 
 text = Path(sys.argv[1]).read_text(encoding="utf-8")
 required = (
-    'search_mix_qwen35_native_v3',
+    'search_mix_qwen35_native_v4',
     'validate-native-evidence',
-    '--native-prompt-version qwen35-native-search-v3-original-aligned',
+    '--native-prompt-version qwen35-native-search-v4-terminal-answer-only',
     '--native-thinking-enabled',
     '--max-action-budget 4',
     '--selection-observation-length 384',
@@ -22,7 +22,7 @@ required = (
 )
 missing = [value for value in required if value not in text]
 if missing:
-    raise SystemExit(f"CPU native v3 contract is incomplete: {missing}")
+    raise SystemExit(f"CPU native v4 contract is incomplete: {missing}")
 validation = text.index('validate-native-evidence')
 publication = text.index('"$train_python" "$CHECKOUT_DIR/scripts/autodl/handoff.py" create')
 if validation >= publication:

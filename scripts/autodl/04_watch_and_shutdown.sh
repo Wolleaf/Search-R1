@@ -386,15 +386,52 @@ validate_legacy_success_artifacts() {
     sync_required "${CAP[attempt]}"
 }
 
+verify_native_wandb_receipts() {
+    local contract="$1" project="$2" results="$3"
+    local train_python scanner stage role run_dir remainder expected_steps step decision
+    local -a args
+    [[ "$contract" == qwen-native-training-smoke-v4 ||
+        "$contract" == qwen-native-training-main-v4 ]] || return 1
+    train_python="$(readlink -f -- "$project/envs/train/bin/python")" || return 1
+    scanner="$project/checkout/scripts/autodl/wandb_history.py"
+    validate_protected_executable "$train_python" 0 || return 1
+    validate_protected_regular "$scanner" 0 || return 1
+    while IFS=$'\t' read -r stage role run_dir remainder; do
+        [[ -n "$stage" && -n "$role" && -n "$run_dir" ]] || return 1
+        case "$stage" in
+            S) expected_steps=2 ;;
+            R) expected_steps=60 ;;
+            B|C) expected_steps=20 ;;
+            *) expected_steps=0 ;;
+        esac
+        args=(
+            --wandb-dir "$run_dir/wandb"
+            --verify-receipt "$run_dir/wandb-receipt.json"
+        )
+        if ((expected_steps > 0)); then
+            args+=(--log "$run_dir/train.log")
+            for ((step = 1; step <= expected_steps; step += 1)); do
+                args+=(--expected-step "$step")
+            done
+        fi
+        decision="$(/usr/bin/env -i \
+            PATH="$(dirname -- "$train_python"):/usr/bin:/bin" \
+            "$train_python" "$scanner" "${args[@]}")" || return $?
+        [[ "$decision" == GO ]] || return 1
+    done < <(tail -n +2 -- "$results/lineage.tsv")
+}
+
 validate_qwen_native_training_evidence() {
     local contract="$1" project="$2" results="$3" attempt_name="$4" expected_uid="$5"
     local python_bin
     python_bin="$(select_authorization_python)" || return 1
     /usr/bin/env -i PATH="$PATH" "$python_bin" -I -S - \
-        "$contract" "$project" "$results" "$attempt_name" "$expected_uid" <<'PY'
+        "$contract" "$project" "$results" "$attempt_name" "$expected_uid" \
+        <<'PY' || return $?
 import csv
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -428,15 +465,47 @@ smoke_check_names = frozenset({
     "native_batch_policy_coverage",
     "native_batch_nonzero_advantage_tokens",
     "native_batch_advantage_abs_max",
+    "terminal_instruction_applied_count",
+    "terminal_prompt_policy_token_count",
+    "terminal_accepted_search_count",
+    "terminal_executed_search_count",
+    "terminal_answer_rate",
+    "terminal_requested_search_rate",
     "wandb_offline_history",
+    "wandb_history_steps",
+    "wandb_actor_metrics_match_log",
+    "wandb_summary_present",
+    "wandb_exit_zero",
 })
 smoke_metric_names = frozenset({
     "groups",
     "mixed_groups",
     "nonzero_trace_advantages",
     "strict_em_positive_count",
+    "terminal_generation_count",
+    "terminal_instruction_applied_count",
+    "terminal_answer_count",
+    "terminal_requested_search_count",
+    "terminal_invalid_count",
+    "terminal_accepted_search_count",
+    "terminal_executed_search_count",
+    "terminal_prompt_policy_token_count",
+    "terminal_answer_rate",
+    "terminal_requested_search_rate",
     "trajectories",
-    "wandb_files",
+    "wandb",
+})
+wandb_actor_metric_names = frozenset({
+    "actor/pg_loss",
+    "actor/kl_loss",
+    "actor/entropy_loss",
+    "actor/grad_norm",
+    "actor/ppo_kl",
+})
+wandb_metric_names = frozenset({
+    "actor_metrics", "exit_codes", "files", "history_records",
+    "history_steps", "last_record_type", "record_counts", "run_file",
+    "run_file_sha256", "summary", "summary_records", "wandb_version",
 })
 
 
@@ -642,7 +711,7 @@ def validate_smoke_decision_shape(decision):
     }
     if set(decision) != expected_keys or \
             decision.get("schema") != "search-r1.qwen-native-smoke-decision" or \
-            decision.get("schema_version") != 1 or \
+            decision.get("schema_version") != 2 or \
             decision.get("decision") not in {"GO", "NO-GO"}:
         fail("smoke-decision identity is invalid")
     checks = decision.get("checks")
@@ -663,9 +732,16 @@ def validate_smoke_decision_shape(decision):
     metrics = decision.get("metrics")
     if not isinstance(metrics, dict) or set(metrics) != smoke_metric_names:
         fail("smoke-decision metrics schema is invalid")
+    rate_metrics = {"terminal_answer_rate", "terminal_requested_search_rate"}
+    integer_metrics = smoke_metric_names - {"wandb"} - rate_metrics
     if any(isinstance(metrics[name], bool) or not isinstance(metrics[name], int) or
-           metrics[name] < 0 for name in smoke_metric_names):
+           metrics[name] < 0 for name in integer_metrics):
         fail("smoke-decision metrics must be non-negative integers")
+    if any(isinstance(metrics[name], bool) or
+           not isinstance(metrics[name], (int, float)) or
+           not math.isfinite(float(metrics[name])) or
+           not 0.0 <= float(metrics[name]) <= 1.0 for name in rate_metrics):
+        fail("smoke-decision terminal rates must be finite probabilities")
     expected_metrics = {
         "groups": 16,
         "trajectories": 80,
@@ -676,11 +752,97 @@ def validate_smoke_decision_shape(decision):
         "strict_em_positive": "strict_em_positive_count",
         "mixed_reward_group": "mixed_groups",
         "nonzero_trace_advantage": "nonzero_trace_advantages",
-        "wandb_offline_history": "wandb_files",
+        "terminal_instruction_applied_count":
+            "terminal_instruction_applied_count",
+        "terminal_prompt_policy_token_count":
+            "terminal_prompt_policy_token_count",
+        "terminal_accepted_search_count": "terminal_accepted_search_count",
+        "terminal_executed_search_count": "terminal_executed_search_count",
+        "terminal_answer_rate": "terminal_answer_rate",
+        "terminal_requested_search_rate": "terminal_requested_search_rate",
     }
     if any(checks[check]["observed"] != metrics[metric]
            for check, metric in observed_pairs.items()):
         fail("smoke check observations disagree with metrics")
+    terminal_generations = metrics["terminal_generation_count"]
+    if any(metrics[name] > terminal_generations for name in (
+            "terminal_instruction_applied_count", "terminal_answer_count",
+            "terminal_requested_search_count", "terminal_invalid_count",
+            "terminal_accepted_search_count", "terminal_executed_search_count")):
+        fail("smoke terminal counts exceed terminal generations")
+    if (metrics["terminal_answer_count"] +
+            metrics["terminal_requested_search_count"] +
+            metrics["terminal_invalid_count"] != terminal_generations):
+        fail("smoke terminal outcomes do not partition terminal generations")
+    replayed_answer_rate = (
+        metrics["terminal_answer_count"] / terminal_generations
+        if terminal_generations else 1.0
+    )
+    replayed_search_rate = (
+        metrics["terminal_requested_search_count"] / terminal_generations
+        if terminal_generations else 0.0
+    )
+    if (not math.isclose(metrics["terminal_answer_rate"], replayed_answer_rate,
+                         rel_tol=0.0, abs_tol=1e-12) or
+            not math.isclose(metrics["terminal_requested_search_rate"],
+                             replayed_search_rate,
+                             rel_tol=0.0, abs_tol=1e-12)):
+        fail("smoke terminal rates do not replay from counts")
+    expected_terminal_checks = {
+        "terminal_instruction_applied_count":
+            metrics["terminal_instruction_applied_count"] == terminal_generations,
+        "terminal_prompt_policy_token_count":
+            metrics["terminal_prompt_policy_token_count"] == 0,
+        "terminal_accepted_search_count":
+            metrics["terminal_accepted_search_count"] == 0,
+        "terminal_executed_search_count":
+            metrics["terminal_executed_search_count"] == 0,
+        "terminal_answer_rate": metrics["terminal_answer_rate"] >= 0.90,
+        "terminal_requested_search_rate":
+            metrics["terminal_requested_search_rate"] <= 0.05,
+    }
+    if any(checks[name]["passed"] != passed
+           for name, passed in expected_terminal_checks.items()):
+        fail("smoke terminal checks disagree with registered thresholds")
+    wandb = metrics["wandb"]
+    if not isinstance(wandb, dict) or set(wandb) != wandb_metric_names:
+        fail("smoke WandB metric schema is invalid")
+    for name in ("files", "history_records", "summary_records"):
+        if isinstance(wandb[name], bool) or not isinstance(wandb[name], int) or \
+                wandb[name] < 0:
+            fail(f"smoke WandB count is invalid: {name}")
+    if (wandb["exit_codes"] != [0] or wandb["last_record_type"] != "exit"
+            or wandb["history_steps"] != [1, 2]
+            or wandb["wandb_version"] != "0.21.1"
+            or not isinstance(wandb["summary"], dict)
+            or not isinstance(wandb["record_counts"], dict)
+            or not isinstance(wandb["run_file"], str)
+            or re.fullmatch(r"[0-9a-f]{64}", wandb["run_file_sha256"] or "") is None):
+        fail("smoke WandB completion identity is invalid")
+    actor_metrics = wandb["actor_metrics"]
+    if not isinstance(actor_metrics, dict) or set(actor_metrics) != {"1", "2"}:
+        fail("smoke WandB actor metric steps are invalid")
+    for step_metrics in actor_metrics.values():
+        if not isinstance(step_metrics, dict) or set(step_metrics) != wandb_actor_metric_names:
+            fail("smoke WandB actor metric names are invalid")
+        for values in step_metrics.values():
+            if (not isinstance(values, list) or not values or any(
+                    isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(float(value)) for value in values)):
+                fail("smoke WandB actor metric values are invalid")
+    expected_wandb_observations = {
+        "wandb_offline_history": wandb["history_records"],
+        "wandb_history_steps": [1, 2],
+        "wandb_actor_metrics_match_log": actor_metrics,
+        "wandb_summary_present": wandb["summary_records"],
+        "wandb_exit_zero": {
+            "codes": [0],
+            "last_record_type": "exit",
+        },
+    }
+    if any(checks[name]["observed"] != value
+           for name, value in expected_wandb_observations.items()):
+        fail("smoke WandB checks disagree with structured metrics")
     return checks, metrics
 
 
@@ -729,7 +891,9 @@ def validate_bound_predecessor(
 
 def require_run_evidence(run_dir_raw, kind):
     run_dir = require_directory(run_dir_raw, "run")
-    common = ("train.log", "resolved-config.yaml", "run.env")
+    common = (
+        "train.log", "resolved-config.yaml", "run.env", "wandb-receipt.json",
+    )
     if kind == "train":
         required = common + (
             "lineage.tsv",
@@ -767,7 +931,7 @@ handoff_digest = require_evidence(project / "manifests/cpu.ok").read_text(
     encoding="utf-8"
 ).strip()
 data_manifest = require_evidence(
-    project / "data/search_mix_qwen35_native_v3/manifest.json"
+    project / "data/search_mix_qwen35_native_v4/manifest.json"
 )
 data_manifest_digest = sha256(data_manifest)
 if re.fullmatch(r"[0-9a-f]{40}", checkout_commit) is None:
@@ -818,7 +982,7 @@ def validate_common_lineage(row, stage, role, run_kind, predecessor_digest):
         fail(f"trace digest mismatch for {stage}")
 
 
-if contract == "qwen-native-training-smoke-v3":
+if contract == "qwen-native-training-smoke-v4":
     env = load_env(
         results / "contract.env",
         (
@@ -841,7 +1005,7 @@ if contract == "qwen-native-training-smoke-v3":
         "qwen-native-gate",
         "runs/qwen-native-gate/attempts",
         env["protocol_gate_evidence_sha256"],
-        "qwen-native-gate-v3",
+        "qwen-native-gate-v4",
     )
     if any(relative(pretrain_root / name) not in pretrain_entries
            for name in ("stage.txt", "go_no_go.json")):
@@ -850,10 +1014,10 @@ if contract == "qwen-native-training-smoke-v3":
         fail("smoke predecessor is not the structural G0/G1 gate")
     gate_decision = json.loads((pretrain_root / "go_no_go.json").read_bytes())
     if (gate_decision.get("schema") != "search-r1.qwen-native-gate" or
-            gate_decision.get("schema_version") != 3 or
+            gate_decision.get("schema_version") != 4 or
             gate_decision.get("stage") != "g0_g1" or
             gate_decision.get("decision") != "GO"):
-        fail("smoke predecessor is not a structural G0/G1 v3 GO")
+        fail("smoke predecessor is not a structural G0/G1 v4 GO")
     rows = load_tsv(results / "lineage.tsv", smoke_lineage_fields)
     index = load_tsv(results / "run-index.tsv", index_fields)
     if len(rows) != 1 or len(index) != 1:
@@ -908,7 +1072,7 @@ if contract == "qwen-native-training-smoke-v3":
     if not isinstance(inputs, dict) or set(inputs) != {
             "catalog_sha256", "log_sha256", "trace_sha256", "wandb_tree_sha256"}:
         fail("malformed smoke decision inputs")
-    catalog = require_evidence(project / "data/search_mix_qwen35_native_v3/catalog.jsonl")
+    catalog = require_evidence(project / "data/search_mix_qwen35_native_v4/catalog.jsonl")
     expected_inputs = {
         "catalog_sha256": sha256(catalog),
         "log_sha256": sha256(run_dir / "train.log"),
@@ -917,7 +1081,7 @@ if contract == "qwen-native-training-smoke-v3":
     wandb_files, wandb_digest = wandb_tree(run_dir / "wandb")
     if any(inputs.get(key) != value for key, value in expected_inputs.items()) or \
             inputs.get("wandb_tree_sha256") != wandb_digest or \
-            metrics["wandb_files"] != wandb_files:
+            metrics["wandb"]["files"] != wandb_files:
         fail("smoke decision input digest mismatch")
     storage = load_env(
         results / "storage.env",
@@ -929,7 +1093,7 @@ if contract == "qwen-native-training-smoke-v3":
     if re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", storage["recorded_at"]) is None:
         fail("invalid smoke storage timestamp")
 
-elif contract == "qwen-native-training-main-v3":
+elif contract == "qwen-native-training-main-v4":
     env = load_env(
         results / "contract.env",
         (
@@ -968,23 +1132,23 @@ elif contract == "qwen-native-training-main-v3":
         "qwen-native-gate",
         "runs/qwen-native-gate/attempts",
         env["protocol_gate_evidence_sha256"],
-        "qwen-native-gate-v3",
+        "qwen-native-gate-v4",
     )
     if any(relative(pretrain_root / name) not in pretrain_entries
            for name in ("stage.txt", "go_no_go.json")):
         fail("main predecessor omits its structural gate decision evidence")
     protocol_decision = json.loads((pretrain_root / "go_no_go.json").read_bytes())
     if ((pretrain_root / "stage.txt").read_text(encoding="utf-8").strip() != "g0_g1" or
-            protocol_decision.get("schema_version") != 3 or
+            protocol_decision.get("schema_version") != 4 or
             protocol_decision.get("stage") != "g0_g1" or
             protocol_decision.get("decision") != "GO"):
-        fail("main predecessor is not a structural G0/G1 v3 GO")
+        fail("main predecessor is not a structural G0/G1 v4 GO")
     smoke_root, smoke_entries = validate_bound_predecessor(
         env["smoke_evidence"],
         "qwen-native-training-smoke",
         "runs/qwen-native-training/attempts",
         env["smoke_evidence_sha256"],
-        "qwen-native-training-smoke-v3",
+        "qwen-native-training-smoke-v4",
     )
     if any(relative(smoke_root / name) not in smoke_entries
            for name in ("contract.env", "smoke-decision.json")):
@@ -996,7 +1160,7 @@ elif contract == "qwen-native-training-main-v3":
             "protocol_gate_evidence", "protocol_gate_evidence_sha256",
         ),
     )
-    if (smoke_env["schema"] != "qwen-native-training-smoke-v3" or
+    if (smoke_env["schema"] != "qwen-native-training-smoke-v4" or
             smoke_env["stage"] != "smoke" or smoke_env["stage_order"] != "S2" or
             smoke_env["decision"] != "GO" or smoke_env["manual_review_required"] != "true"):
         fail("main smoke predecessor contract mismatch")
@@ -1028,7 +1192,7 @@ elif contract == "qwen-native-training-main-v3":
         "cost_contrast_group_count": contrast_count,
         "cost_contrast_group_minimum": 8,
         "decision": "GO" if authorized else "NO-GO",
-        "schema": "qwen-native-post-r-gate-v3",
+        "schema": "qwen-native-post-r-gate-v4",
     }
     if decision != expected_decision:
         fail("branch-decision.json is inconsistent with contract.env")
@@ -1094,7 +1258,7 @@ elif contract == "qwen-native-training-main-v3":
     g3_trace = g3_run / "traces/eval_predictions.jsonl"
     g3_trace_digest = sha256(g3_trace)
     catalog = require_evidence(
-        project / "data/search_mix_qwen35_native_v3/catalog.jsonl"
+        project / "data/search_mix_qwen35_native_v4/catalog.jsonl"
     )
     catalog_digest = sha256(catalog)
     summary_input = analysis_summary.get("input")
@@ -1199,22 +1363,27 @@ elif contract == "qwen-native-training-main-v3":
         fail("formal data manifest must be an object")
     prompt_contract = data_contract.get("prompt_contract")
     tokenizer_contract = data_contract.get("tokenizer")
-    if (data_contract.get("schema_version") != 4 or
+    if (data_contract.get("schema_version") != 5 or
             not isinstance(prompt_contract, dict) or
             prompt_contract.get("tool_protocol") != "qwen35_native" or
             prompt_contract.get("prompt_version") !=
-            "qwen35-native-search-v3-original-aligned" or
+            "qwen35-native-search-v4-terminal-answer-only" or
+            prompt_contract.get("terminal_prompt_version") !=
+            "qwen35-terminal-answer-v1" or
+            prompt_contract.get("terminal_prompt_sha256") !=
+            "afc18b79afaafccece6927aec5ccd7898ef2ae17766bce7ffda244eef388d7f2" or
+            prompt_contract.get("terminal_answer_only") is not True or
             not isinstance(tokenizer_contract, dict) or
             tokenizer_contract.get("selection_observation_length") != 384 or
             tokenizer_contract.get("rollout_observation_length") != 500):
-        fail("formal native-v3 data contract is invalid")
+        fail("formal native-v4 data contract is invalid")
     artifacts = data_contract.get("artifacts", {})
     if not isinstance(artifacts, dict):
         fail("formal data manifest artifacts must be an object")
     eval_specs = (
         ("val", "val", "val_128.parquet", 128, "VAL"),
-        ("nq_test", "nq_test_eval", "nq_test_128_native_v3.parquet", 128, "NQ-TEST"),
-        ("multihop", "multihop_eval", "multihop_eval_256_native_v3.parquet", 256, "MULTIHOP"),
+        ("nq_test", "nq_test_eval", "nq_test_128_native_v4.parquet", 128, "NQ-TEST"),
+        ("multihop", "multihop_eval", "multihop_eval_256_native_v4.parquet", 256, "MULTIHOP"),
     )
     endpoint_contract = {
         "group_size": 1,
@@ -1250,7 +1419,7 @@ elif contract == "qwen-native-training-main-v3":
         ):
             require_evidence(paired / name)
         summary = load_json(paired / "summary.json", f"{directory} summary")
-        if (summary.get("schema_version") != 2 or
+        if (summary.get("schema_version") != 3 or
                 summary.get("report_type") != report_type or
                 summary.get("expected_rows") != row_count or
                 summary.get("cost_lambda") != 0.10 or
@@ -1301,7 +1470,7 @@ elif contract == "qwen-native-training-main-v3":
                 fail(f"{directory} paired input mismatch for {role}")
         artifact = artifacts.get(artifact_key, {})
         sample_ids = artifact.get("sample_ids") if isinstance(artifact, dict) else None
-        artifact_path = project / "data/search_mix_qwen35_native_v3" / filename
+        artifact_path = project / "data/search_mix_qwen35_native_v4" / filename
         if (not isinstance(sample_ids, list) or len(sample_ids) != row_count or
                 artifact.get("file") != filename or artifact.get("rows") != row_count or
                 artifact.get("sha256") != sha256(artifact_path)):
@@ -1311,11 +1480,12 @@ elif contract == "qwen-native-training-main-v3":
         ).encode("utf-8")).hexdigest()
         expected_formal = {
             "mode": mode,
+            "native_contract_version": "v4",
             "data_manifest": {
                 "path": str(data_manifest),
                 "sha256": data_manifest_digest,
-                "schema_version": 4,
-                "prompt_version": "qwen35-native-search-v3-original-aligned",
+                "schema_version": 5,
+                "prompt_version": "qwen35-native-search-v4-terminal-answer-only",
             },
             "endpoints": {
                 role: {
@@ -1355,7 +1525,7 @@ elif contract == "qwen-native-training-main-v3":
             },
             {"parent": {"checkpoint_digest": r_row["parent_checkpoint_digest"]},
              "reproduced": r_row},
-            "parent_reproduced_capability", "qwen35_native_v3_a_r_capability",
+            "parent_reproduced_capability", "qwen35_native_v4_a_r_capability",
             "parent", "reproduced",
         )
         if authorized:
@@ -1372,12 +1542,15 @@ elif contract == "qwen-native-training-main-v3":
                     "cost_aware_gated": f"qwen_native_c_{directory_key}",
                 },
                 {"control": by_stage["B"], "cost_aware_gated": by_stage["C"]},
-                "control_cost_efficiency", "qwen35_native_v3_b_c_efficiency",
+                "control_cost_efficiency", "qwen35_native_v4_b_c_efficiency",
                 "control", "cost_aware_gated",
             )
 else:
     fail(f"unsupported native training contract: {contract}")
 PY
+    if [[ "${CAP[mode]}" == production ]]; then
+        verify_native_wandb_receipts "$contract" "$project" "$results" || return $?
+    fi
 }
 
 validate_followup_success_artifacts() {
@@ -1426,7 +1599,7 @@ validate_followup_success_artifacts() {
                 per_question.jsonl lineage.tsv run-index.tsv
             )
             ;;
-        qwen-native-gate-v3)
+        qwen-native-gate-v4)
             results_relative_parent='runs/qwen-native-gate/attempts'
             marker_relative_parent='manifests/qwen-native-gate'
             required=(
@@ -1434,7 +1607,7 @@ validate_followup_success_artifacts() {
                 per_question.jsonl lineage.tsv run-index.tsv stage.txt sampling.json
             )
             ;;
-        qwen-native-training-smoke-v3)
+        qwen-native-training-smoke-v4)
             results_relative_parent='runs/qwen-native-training/attempts'
             marker_relative_parent='manifests/qwen-native-training-smoke'
             required=(
@@ -1442,7 +1615,7 @@ validate_followup_success_artifacts() {
                 smoke-decision.json
             )
             ;;
-        qwen-native-training-main-v3)
+        qwen-native-training-main-v4)
             results_relative_parent='runs/qwen-native-training/attempts'
             marker_relative_parent='manifests/qwen-native-training-main'
             required=(
@@ -1489,7 +1662,7 @@ validate_followup_success_artifacts() {
         [[ ${seen["$results_relative_parent/$(basename -- "$attempt")/$file"]+present} ]] || return 1
     done
     case "$contract" in
-        qwen-native-training-smoke-v3|qwen-native-training-main-v3)
+        qwen-native-training-smoke-v4|qwen-native-training-main-v4)
             validate_qwen_native_training_evidence "$contract" "$project" "$results" \
                 "$(basename -- "$attempt")" "$expected_uid" || return 1
             ;;

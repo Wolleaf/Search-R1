@@ -22,12 +22,22 @@ QWEN35_REASONING_MODES = (
     QWEN35_REASONING_FULL,
 )
 
-QWEN35_PROMPT_VERSION = "qwen35-native-search-v3-original-aligned"
+QWEN35_PROMPT_VERSION = "qwen35-native-search-v4-terminal-answer-only"
 QWEN35_MODEL_REVISION = "15852e8c16360a2fea060d615a32b45270f8a8fc"
 QWEN35_CHAT_TEMPLATE_SHA256 = (
     "273d8e0e683b885071fb17e08d71e5f2a5ddfb5309756181681de4f5a1822d80"
 )
 QWEN35_RETRY_PROMPT = "My action is not correct. Let me rethink."
+QWEN35_TERMINAL_PROMPT_VERSION = "qwen35-terminal-answer-v1"
+QWEN35_TERMINAL_PROMPT = (
+    "The search budget is exhausted. You must not call the search tool again. "
+    "Using only the question and information already available, give your best "
+    "answer even if uncertain. After reasoning, output exactly one concise "
+    "final answer inside <answer> and </answer>, with no text after </answer>."
+)
+QWEN35_TERMINAL_PROMPT_SHA256 = (
+    "afc18b79afaafccece6927aec5ccd7898ef2ae17766bce7ffda244eef388d7f2"
+)
 
 _QWEN35_USER_PROMPT_PREFIX = (
     "Answer the given question. You must conduct reasoning inside <think> and "
@@ -92,6 +102,10 @@ _NATIVE_ANSWER = re.compile(
     r"\A(?P<prefix>.*?)<answer>(?P<content>.*?)</answer>\s*\Z",
     flags=re.DOTALL,
 )
+_TERMINAL_ANSWER_ONLY = re.compile(
+    r"\A\s*<answer>(?P<content>.*?)</answer>\s*\Z",
+    flags=re.DOTALL,
+)
 _LEGACY_ACTION = re.compile(r"<(search|answer)>(.*?)</\1>", re.DOTALL)
 
 
@@ -127,6 +141,7 @@ class Qwen35ActionBoundary:
 class ProtocolFollowup:
     token_ids: tuple[int, ...]
     visible_observation: str
+    terminal_instruction_applied: bool = False
 
 
 def normalize_tool_protocol(value: Any) -> str:
@@ -281,21 +296,50 @@ def render_qwen35_prompt(tokenizer: Any,
 def parse_action(text: str,
                  tool_protocol: str,
                  *,
-                 qwen35_reasoning_mode: Optional[str] = None) -> ParsedAction:
+                 qwen35_reasoning_mode: Optional[str] = None,
+                 qwen35_answer_only: bool = False) -> ParsedAction:
     protocol = normalize_tool_protocol(tool_protocol)
     if not isinstance(text, str):
         raise TypeError("model response must be a string")
+    if not isinstance(qwen35_answer_only, bool):
+        raise TypeError("qwen35_answer_only must be boolean")
     if protocol == LEGACY_XML:
-        if qwen35_reasoning_mode is not None:
+        if qwen35_reasoning_mode is not None or qwen35_answer_only:
             raise ProtocolError(
-                "qwen35 reasoning mode is invalid for the legacy protocol")
+                "qwen35 parsing options are invalid for the legacy protocol")
         match = _LEGACY_ACTION.search(text)
         if match is None:
             return ParsedAction(None, "", "missing_legacy_action")
         return ParsedAction(match.group(1), match.group(2).strip())
     if qwen35_reasoning_mode is None:
         raise ProtocolError("qwen35 reasoning mode is required")
-    return _parse_qwen35_action(text, qwen35_reasoning_mode)
+    parsed = _parse_qwen35_action(text, qwen35_reasoning_mode)
+    if qwen35_answer_only:
+        if parsed.valid and parsed.action == "search":
+            return ParsedAction(
+                action="search",
+                content=parsed.content,
+                error="search_disallowed_after_budget",
+                prefix=parsed.prefix,
+            )
+        if parsed.valid and parsed.action == "answer":
+            located = locate_qwen35_action_boundary(text,
+                                                     qwen35_reasoning_mode)
+            if located.action_start is None:
+                raise AssertionError("valid native answer has no action start")
+            terminal_candidate = text[located.action_start:]
+            exact_answer = _TERMINAL_ANSWER_ONLY.fullmatch(
+                terminal_candidate)
+            if (exact_answer is None
+                    or terminal_candidate.count("<answer>") != 1
+                    or terminal_candidate.count("</answer>") != 1):
+                return ParsedAction(
+                    action="answer",
+                    content=parsed.content,
+                    error="invalid_terminal_answer_format",
+                    prefix=parsed.prefix,
+                )
+    return parsed
 
 
 def _parse_qwen35_action(text: str, reasoning_mode: str) -> ParsedAction:
@@ -484,6 +528,7 @@ class Qwen35Conversation:
         action: ParsedAction,
         observation: str,
         observation_token_limit: Optional[int] = None,
+        terminal_answer_only: bool = False,
     ) -> tuple[list[dict[str, Any]], list[int], str]:
         messages = deepcopy(self.messages)
         if not action.valid:
@@ -541,9 +586,18 @@ class Qwen35Conversation:
                 observation_ids, skip_special_tokens=True).strip()
             messages.append({"role": "tool", "content": visible_observation})
         elif not action.valid:
-            messages.append({"role": "user", "content": QWEN35_RETRY_PROMPT})
+            if not terminal_answer_only:
+                messages.append({
+                    "role": "user",
+                    "content": QWEN35_RETRY_PROMPT,
+                })
         else:
             raise ProtocolError("answer actions do not have a follow-up prompt")
+        if terminal_answer_only:
+            messages.append({
+                "role": "user",
+                "content": QWEN35_TERMINAL_PROMPT,
+            })
 
         rendered = render_qwen35_prompt(self.tokenizer, messages)
         sentinel_index = 0
@@ -578,6 +632,7 @@ class Qwen35Conversation:
                         observation: str,
                         max_obs_length: int,
                         response_token_ids: Optional[Sequence[int]] = None,
+                        terminal_answer_only: bool = False,
                         ) -> ProtocolFollowup:
         if (isinstance(max_obs_length, bool)
                 or not isinstance(max_obs_length, int)
@@ -592,7 +647,12 @@ class Qwen35Conversation:
 
         def render(limit: Optional[int]):
             messages, template_suffix, visible = self._render_candidate(
-                response_text, action, observation, limit)
+                response_text,
+                action,
+                observation,
+                limit,
+                terminal_answer_only,
+            )
             suffix = list(template_suffix)
             eos_token_id = getattr(self.tokenizer, "eos_token_id", None)
             if (response_ids and eos_token_id is not None
@@ -612,6 +672,8 @@ class Qwen35Conversation:
             best = render(0)
             if len(best[3]) > max_obs_length:
                 raise ProtocolError(
+                    "max_obs_length cannot fit the native terminal wrapper"
+                    if terminal_answer_only else
                     "max_obs_length cannot fit the native tool-response wrapper")
             while low <= high:
                 middle = (low + high) // 2
@@ -624,11 +686,17 @@ class Qwen35Conversation:
             messages, prompt_ids, visible, suffix = best
         if len(suffix) > max_obs_length:
             raise ProtocolError(
+                "max_obs_length cannot fit the native terminal instruction"
+                if terminal_answer_only else
                 "max_obs_length cannot fit the native retry wrapper")
 
         self.messages = messages
         self.prompt_token_ids = prompt_ids
-        return ProtocolFollowup(tuple(suffix), visible)
+        return ProtocolFollowup(
+            tuple(suffix),
+            visible,
+            terminal_instruction_applied=terminal_answer_only,
+        )
 
 
 def validate_presence_penalty(value: Any) -> float:

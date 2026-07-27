@@ -307,6 +307,35 @@ class PairedEvalTest(unittest.TestCase):
         }) + "\n", encoding="utf-8")
         return paths, manifest, catalog
 
+    def make_v4_formal_inputs(
+        self, root: Path, artifact_key: str = "nq_test_eval"
+    ) -> tuple[dict[str, Path], Path, dict[object, dict[str, object]]]:
+        paths, manifest, catalog = self.make_v3_formal_inputs(root, artifact_key)
+        payload = json.loads(manifest.read_text())
+        v3_spec = PAIRED_EVAL.V3_EVAL_ARTIFACTS[artifact_key]
+        v4_spec = PAIRED_EVAL.V4_EVAL_ARTIFACTS[artifact_key]
+        old_artifact = root / str(v3_spec["file"])
+        new_artifact = root / str(v4_spec["file"])
+        if new_artifact != old_artifact:
+            new_artifact.write_bytes(old_artifact.read_bytes())
+        payload.update({
+            "schema_version": 5,
+            "prompt_contract": {
+                "tool_protocol": "qwen35_native",
+                "prompt_version": PAIRED_EVAL.V4_PROMPT_VERSION,
+                "terminal_answer_only": True,
+                "terminal_prompt_version": PAIRED_EVAL.TERMINAL_PROMPT_VERSION,
+                "terminal_prompt_sha256": PAIRED_EVAL.TERMINAL_PROMPT_SHA256,
+            },
+        })
+        payload["artifacts"][artifact_key].update({
+            "file": v4_spec["file"],
+            "sha256": hashlib.sha256(new_artifact.read_bytes()).hexdigest(),
+        })
+        manifest.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+
+        return paths, manifest, catalog
+
     def formal_args(
         self,
         paths: dict[str, Path],
@@ -809,20 +838,21 @@ class PairedEvalTest(unittest.TestCase):
             record["action_count"] = 5
             record["policy_token_count"] += 1
 
-            PAIRED_EVAL._validate_v3_record(record, "terminal fixture")
+            PAIRED_EVAL._validate_native_record(
+                record, "terminal fixture", "v3")
 
             unmarked = json.loads(json.dumps(record))
             unmarked["raw_generations"][-1]["terminal_generation"] = False
             unmarked["generation_events"][-1]["terminal_generation"] = False
             with self.assertRaisesRegex(ValueError, "terminal generation"):
-                PAIRED_EVAL._validate_v3_record(
-                    unmarked, "unmarked terminal fixture")
+                PAIRED_EVAL._validate_native_record(
+                    unmarked, "unmarked terminal fixture", "v3")
 
             over_budget = json.loads(json.dumps(record))
             over_budget["action_count"] = 6
             with self.assertRaisesRegex(ValueError, "plus terminal generation"):
-                PAIRED_EVAL._validate_v3_record(
-                    over_budget, "over-budget terminal fixture")
+                PAIRED_EVAL._validate_native_record(
+                    over_budget, "over-budget terminal fixture", "v3")
 
     def test_v3_contract_reports_greedy_metrics_and_paired_bootstrap(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -908,6 +938,95 @@ class PairedEvalTest(unittest.TestCase):
             self.assertIn("`do_sample=false` (greedy)", markdown)
             self.assertIn("Mean trajectory tokens", markdown)
 
+    def test_v4_contract_has_distinct_schema_mode_and_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths, manifest, catalog = self.make_v4_formal_inputs(root)
+            output = root / "v4-results"
+            args = self.args(
+                paths,
+                output,
+                include_old=False,
+                data_manifest=manifest,
+                control_digest=FORMAL_CONTROL_DIGEST,
+                cost_digest=FORMAL_COST_DIGEST,
+                eval_artifact="nq_test_eval",
+            )
+            for role, digest in (
+                ("control", FORMAL_CONTROL_DIGEST),
+                ("cost_aware_gated", FORMAL_COST_DIGEST),
+            ):
+                records = [
+                    json.loads(line) for line in paths[role].read_text().splitlines()
+                ]
+                for record in records:
+                    record["checkpoint_digest"] = digest
+                self.write_jsonl(paths[role], records)
+
+            with mock.patch.object(
+                PAIRED_EVAL,
+                "read_eval_parquet_catalog",
+                return_value=(catalog, tuple(catalog)),
+            ):
+                PAIRED_EVAL.analyze(args)
+
+            summary = json.loads((output / "summary.json").read_text())
+            contract = summary["formal_contract"]
+            self.assertEqual(summary["schema_version"], 3)
+            self.assertEqual(contract["mode"], "qwen35_native_v4_b_c_efficiency")
+            self.assertEqual(contract["native_contract_version"], "v4")
+            self.assertEqual(contract["data_manifest"]["schema_version"], 5)
+            self.assertEqual(
+                contract["evaluation_artifact"]["file"],
+                "nq_test_128_native_v4.parquet",
+            )
+            self.assertEqual(
+                contract["endpoints"]["control"]["stage"],
+                "qwen_native_b_nq_test",
+            )
+
+    def test_v4_terminal_generation_requires_answer_only_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths, _, _ = self.make_v4_formal_inputs(root)
+            record = json.loads(paths["control"].read_text().splitlines()[0])
+            terminal = dict(record["raw_generations"][-1])
+            terminal.update({
+                "turn": 4,
+                "generation_context": "terminal_answer",
+                "terminal_generation": True,
+            })
+            record["raw_generations"].append(terminal)
+            record["generation_events"] = [{
+                "turn": turn,
+                "terminal_generation": turn == 4,
+                "executed_search": False,
+            } for turn in range(5)]
+            record["generation_events"][-1].update({
+                "terminal_instruction_applied": True,
+                "terminal_prompt_version": PAIRED_EVAL.TERMINAL_PROMPT_VERSION,
+                "terminal_prompt_sha256": PAIRED_EVAL.TERMINAL_PROMPT_SHA256,
+                "terminal_prompt_text": PAIRED_EVAL.TERMINAL_PROMPT_TEXT,
+                "terminal_prompt_policy_token_count": 0,
+                "terminal_followup_token_count": 25,
+                "generation_context": "terminal_answer",
+                "done": True,
+                "requested_action": "answer",
+                "action": "answer",
+                "parse_error": None,
+                "terminal_rejection_reason": None,
+                "valid_action": True,
+            })
+            record["action_count"] = 5
+            record["policy_token_count"] += 1
+
+            PAIRED_EVAL._validate_native_record(record, "v4 fixture", "v4")
+
+            record["generation_events"][-1].pop("terminal_instruction_applied")
+            with self.assertRaisesRegex(ValueError, "lacks answer-only evidence"):
+                PAIRED_EVAL._validate_native_record(
+                    record, "v4 fixture without instruction", "v4")
+
     def test_v3_multihop_contract_and_trace_order_are_fixed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -954,7 +1073,11 @@ class PairedEvalTest(unittest.TestCase):
 
     def test_manifest_schema_and_prompt_version_must_match(self) -> None:
         cases = (
+            ("v4_with_schema4", 4, PAIRED_EVAL.V4_PROMPT_VERSION,
+             "v4 prompt requires.*schema_version 5"),
             ("v3_with_schema3", 3, PAIRED_EVAL.V3_PROMPT_VERSION,
+             "v3 prompt requires.*schema_version 4"),
+            ("v3_with_schema5", 5, PAIRED_EVAL.V3_PROMPT_VERSION,
              "v3 prompt requires.*schema_version 4"),
             ("v2_with_schema4", 4, PAIRED_EVAL.V2_PROMPT_VERSION,
              "v2 prompt requires.*schema_version 3"),
@@ -978,6 +1101,33 @@ class PairedEvalTest(unittest.TestCase):
                     eval_artifact="nq_test_eval",
                 )
                 with self.assertRaisesRegex(ValueError, error):
+                    PAIRED_EVAL._load_formal_contract(args)
+
+    def test_v4_manifest_requires_terminal_prompt_binding(self) -> None:
+        for field in (
+            "terminal_answer_only",
+            "terminal_prompt_version",
+            "terminal_prompt_sha256",
+        ):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                paths, manifest, _ = self.make_v4_formal_inputs(root)
+                payload = json.loads(manifest.read_text())
+                payload["prompt_contract"].pop(field)
+                manifest.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+                args = self.args(
+                    paths,
+                    root / "unused",
+                    include_old=False,
+                    data_manifest=manifest,
+                    control_digest=FORMAL_CONTROL_DIGEST,
+                    cost_digest=FORMAL_COST_DIGEST,
+                    eval_artifact="nq_test_eval",
+                )
+
+                with self.assertRaisesRegex(
+                    ValueError, "terminal prompt contract mismatch"
+                ):
                     PAIRED_EVAL._load_formal_contract(args)
 
     def test_parent_reproduced_capability_reports_all_sealed_artifacts(self) -> None:

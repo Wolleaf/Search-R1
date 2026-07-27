@@ -4,11 +4,14 @@ import numpy as np
 from copy import deepcopy
 from collections import defaultdict
 import os
-from typing import List, Dict, Any, Tuple, Sequence
+from typing import List, Dict, Any, Optional, Tuple, Sequence
 from dataclasses import dataclass
 from .tensor_helper import TensorHelper, TensorConfig
 from .tool_protocol import (LEGACY_XML, QWEN35_NATIVE,
                             QWEN35_REASONING_CONTINUATION, ParsedAction,
+                            QWEN35_TERMINAL_PROMPT,
+                            QWEN35_TERMINAL_PROMPT_SHA256,
+                            QWEN35_TERMINAL_PROMPT_VERSION,
                             Qwen35Conversation,
                             locate_qwen35_action_boundary,
                             normalize_tool_protocol, parse_action)
@@ -261,6 +264,7 @@ class LLMGenerationManager:
         return {
             'turn': int(turn),
             'action': parsed.action if parsed.valid else 'invalid',
+            'requested_action': parsed.action,
             'content': parsed.content,
             'parse_error': parsed.error,
             'reasoning_prefix': parsed.prefix,
@@ -274,10 +278,14 @@ class LLMGenerationManager:
         parsed_actions: List[ParsedAction],
         observations: List[str],
         active_mask: torch.Tensor,
+        terminal_answer_only: bool = False,
         device=None,
-    ) -> Tuple[torch.Tensor, List[str]]:
+    ) -> Tuple[torch.Tensor, List[str], List[Optional[Dict[str, Any]]]]:
         suffix_rows = []
         visible_observations = [''] * len(responses_str)
+        terminal_metadata: List[Optional[Dict[str, Any]]] = [
+            None for _ in responses_str
+        ]
         for index, active in enumerate(active_mask.tolist()):
             parsed = parsed_actions[index]
             if active and (parsed.action == 'search' or not parsed.valid):
@@ -296,13 +304,29 @@ class LLMGenerationManager:
                     observations[index],
                     self.config.max_obs_length,
                     response_token_ids=sampled_ids,
+                    terminal_answer_only=terminal_answer_only,
                 )
                 suffix_rows.append(list(followup.token_ids))
                 visible_observations[index] = followup.visible_observation
+                if followup.terminal_instruction_applied:
+                    terminal_metadata[index] = {
+                        'terminal_instruction_applied': True,
+                        'terminal_prompt_version':
+                        QWEN35_TERMINAL_PROMPT_VERSION,
+                        'terminal_prompt_sha256':
+                        QWEN35_TERMINAL_PROMPT_SHA256,
+                        'terminal_prompt_text': QWEN35_TERMINAL_PROMPT,
+                        'terminal_followup_token_count': len(
+                            followup.token_ids),
+                        'terminal_prompt_policy_token_count': 0,
+                    }
             else:
                 suffix_rows.append([])
-        return (self._pad_token_rows(suffix_rows, device=device),
-                visible_observations)
+        return (
+            self._pad_token_rows(suffix_rows, device=device),
+            visible_observations,
+            terminal_metadata,
+        )
 
     def _process_next_obs(
             self, next_obs: List[str],
@@ -488,6 +512,9 @@ class LLMGenerationManager:
         parsed_action_history = [[] for _ in range(gen_batch.batch['input_ids'].shape[0])]
         generation_contexts = ['initial_question'
                                for _ in range(gen_batch.batch['input_ids'].shape[0])]
+        terminal_followup_metadata: List[Optional[Dict[str, Any]]] = [
+            None for _ in range(gen_batch.batch['input_ids'].shape[0])
+        ]
         active_num_list = [active_mask.sum().item()]
         rollings = gen_batch
         meta_info = gen_batch.meta_info.copy()
@@ -569,6 +596,7 @@ class LLMGenerationManager:
                         generation_events[index][-1].update({
                             'tool_protocol': QWEN35_NATIVE,
                             'action': parsed.action if parsed.valid else None,
+                            'requested_action': parsed.action,
                             'content': parsed.content,
                             'parse_error': parsed.error,
                             'reasoning_prefix': parsed.prefix,
@@ -586,15 +614,19 @@ class LLMGenerationManager:
             executed_search_count += torch.tensor(executed_search, dtype=torch.long)
 
             if native_protocol:
-                next_obs_ids, visible_observations = self._process_native_followups(
+                (next_obs_ids, visible_observations,
+                 followup_metadata) = self._process_native_followups(
                     conversations,
                     responses_ids,
                     responses_str,
                     parsed_actions,
                     next_obs,
                     turn_active_mask,
+                    terminal_answer_only=(step == self.config.max_turns - 1),
                     device=responses_ids.device,
                 )
+                if step == self.config.max_turns - 1:
+                    terminal_followup_metadata = followup_metadata
             else:
                 next_obs_ids, visible_observations = self._process_next_obs(
                     next_obs, device=responses_ids.device)
@@ -638,6 +670,7 @@ class LLMGenerationManager:
                              if native_protocol else None)
             responses_ids, responses_str = self.tensor_fn._example_level_pad(
                 responses_ids, responses_str, active_mask)
+            terminal_predictions = list(responses_str)
             slice_index = 0
             for index, active in enumerate(active_mask.tolist()):
                 if active:
@@ -654,6 +687,11 @@ class LLMGenerationManager:
                             responses_ids.shape[1]),
                     }
                     if native_slices is not None:
+                        terminal_metadata = terminal_followup_metadata[index]
+                        if terminal_metadata is None:
+                            raise RuntimeError(
+                                'native terminal generation is missing its '
+                                'answer-only instruction')
                         action_slice = native_slices[slice_index]
                         raw_clipped = (
                             len(action_slice.raw_token_ids) >= getattr(
@@ -672,17 +710,24 @@ class LLMGenerationManager:
                             'tail_dropped': action_slice.tail_dropped,
                             'raw_clipped': raw_clipped,
                             'clipped': raw_clipped,
-                            'generation_context': generation_contexts[index],
+                            'generation_context': 'terminal_answer',
                         })
+                        event.update(terminal_metadata)
+                        # The terminal allowlist validates the complete sampled
+                        # text, including any raw tail dropped from PPO tokens.
+                        terminal_predictions[index] = action_slice.raw_text
                         slice_index += 1
                     generation_events[index].append(event)
             action_count += terminal_active_mask.to(dtype=torch.long)
 
+            terminal_execute_kwargs = (
+                {'terminal_answer_only': True} if native_protocol else {})
             _, dones, valid_action, executed_search = self.execute_predictions(
-                responses_str,
+                terminal_predictions,
                 self.tokenizer.pad_token,
                 active_mask,
                 do_search=False,
+                **terminal_execute_kwargs,
             )
             if any(executed_search):
                 raise RuntimeError(
@@ -705,8 +750,11 @@ class LLMGenerationManager:
                             'tool_protocol': QWEN35_NATIVE,
                             'action': (parsed.action
                                        if parsed.valid else None),
+                            'requested_action': parsed.action,
                             'content': parsed.content,
                             'parse_error': parsed.error,
+                            'terminal_rejection_reason': (
+                                None if parsed.valid else parsed.error),
                             'reasoning_prefix': parsed.prefix,
                         })
                         if parsed.action == 'answer' and parsed.valid:
@@ -731,6 +779,31 @@ class LLMGenerationManager:
         # Keep the legacy aggregate for existing dashboards. Per-example reward
         # code must use the tensor because meta_info is not batch-reordered.
         meta_info['valid_search_stats'] = executed_search_count.tolist()
+        if native_protocol:
+            terminal_events = [
+                event for events in generation_events for event in events
+                if event.get('terminal_generation') is True
+            ]
+            meta_info.update({
+                'terminal_instruction_applied_count': sum(
+                    event.get('terminal_instruction_applied') is True
+                    for event in terminal_events),
+                'terminal_answer_count': sum(
+                    event.get('action') == 'answer'
+                    and event.get('parse_error') is None
+                    for event in terminal_events),
+                'terminal_requested_search_count': sum(
+                    event.get('requested_action') == 'search'
+                    for event in terminal_events),
+                'terminal_invalid_count': sum(
+                    event.get('parse_error') is not None
+                    and event.get('requested_action') != 'search'
+                    for event in terminal_events),
+                'terminal_accepted_search_count': 0,
+                'terminal_executed_search_count': sum(
+                    bool(event.get('executed_search'))
+                    for event in terminal_events),
+            })
         
         print("ACTIVE_TRAJ_NUM:", active_num_list)
         
@@ -814,7 +887,9 @@ class LLMGenerationManager:
                             predictions: List[str],
                             pad_token: str,
                             active_mask=None,
-                            do_search=True) -> Tuple[List[str], List[int], List[int], List[int]]:
+                            do_search=True,
+                            terminal_answer_only=False,
+                            ) -> Tuple[List[str], List[int], List[int], List[int]]:
         """
         Execute predictions across multiple environments.
         NOTE: the function is the actual `step` function in the environment
@@ -829,7 +904,15 @@ class LLMGenerationManager:
             Observations, done flags, valid-action flags, and per-example
             executed-search flags.
         """
-        cur_actions, contents = self.postprocess_predictions(predictions)
+        if terminal_answer_only:
+            if self._current_tool_protocol() != QWEN35_NATIVE:
+                raise ValueError(
+                    'terminal answer-only mode requires qwen35_native')
+            if do_search:
+                raise ValueError(
+                    'terminal answer-only mode cannot execute retrieval')
+        cur_actions, contents = self.postprocess_predictions(
+            predictions, terminal_answer_only=terminal_answer_only)
         next_obs, dones, valid_action, executed_search = [], [], [], []
 
         if active_mask is None:
@@ -879,13 +962,14 @@ class LLMGenerationManager:
                     } if do_search else None)
                 else:
                     if self._current_tool_protocol() == QWEN35_NATIVE:
-                        # The adapter renders a native user retry message.
+                        # The adapter renders a native user retry message on
+                        # normal turns; the terminal turn ends immediately.
                         next_obs.append('')
                     else:
                         next_obs.append(f'\nMy previous action is invalid. \
 If I want to search, I should put the query between <search> and </search>. \
 If I want to give the final answer, I should put the answer between <answer> and </answer>. Let me try again.\n')
-                    dones.append(0)
+                    dones.append(int(terminal_answer_only))
                     valid_action.append(0)
                     executed_search.append(0)
                     retrieval_events.append(None)
@@ -896,7 +980,9 @@ If I want to give the final answer, I should put the answer between <answer> and
             
         return next_obs, dones, valid_action, executed_search
 
-    def postprocess_predictions(self, predictions: List[Any]) -> Tuple[List[int], List[bool]]:
+    def postprocess_predictions(
+            self, predictions: List[Any],
+            terminal_answer_only: bool = False) -> Tuple[List[int], List[bool]]:
         """
         Process (text-based) predictions from llm into actions and validity flags.
         
@@ -917,6 +1003,7 @@ If I want to give the final answer, I should put the answer between <answer> and
                         prediction,
                         QWEN35_NATIVE,
                         qwen35_reasoning_mode=QWEN35_REASONING_CONTINUATION,
+                        qwen35_answer_only=terminal_answer_only,
                     )
                     action = parsed.action if parsed.valid else None
                     content = parsed.content

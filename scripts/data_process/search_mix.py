@@ -24,6 +24,8 @@ from search_r1.llm_agent.tool_protocol import (
     QWEN35_MODEL_REVISION,
     QWEN35_NATIVE,
     QWEN35_PROMPT_VERSION,
+    QWEN35_TERMINAL_PROMPT_SHA256,
+    QWEN35_TERMINAL_PROMPT_VERSION,
     SUPPORTED_TOOL_PROTOCOLS,
     normalize_tool_protocol,
     qwen35_messages,
@@ -46,7 +48,7 @@ ROLLOUT_OBSERVATION_LENGTH = 500
 # Selection remains tied to the historical 384-token visibility filter.
 MAX_OBS_LENGTH = SELECTION_OBSERVATION_LENGTH
 SCHEMA_VERSION = 2
-MATERIALIZED_SCHEMA_VERSION = 4
+MATERIALIZED_SCHEMA_VERSION = 5
 SELECTION_POLICY = "retrieval-verified-search-mix-v1"
 LEGACY_PROMPT_VERSION = "search-r1-legacy-xml-v1"
 
@@ -103,6 +105,10 @@ EVIDENCE_FILE = "retrieval_evidence.jsonl"
 RETRIEVAL_LEDGER_FILE = "retrieval_ledger.json"
 CATALOG_FILE = "catalog.jsonl"
 EXCLUSIONS_FILE = "exclusions.json"
+ANSWER_QUALITY_EXCLUSIONS_FILE = (
+    "search_mix_answer_quality_exclusions.v1.json")
+ANSWER_QUALITY_EXCLUSIONS_PATH = Path(__file__).with_name(
+    ANSWER_QUALITY_EXCLUSIONS_FILE)
 MANIFEST_FILE = "manifest.json"
 REPLAY_FILE = "retrieval_replay.json"
 SELECTION_FUNNEL_FILE = "selection_funnel.json"
@@ -116,10 +122,22 @@ NATIVE_PROBE_FILES = {
     "probe_autonomous": ("probe_autonomous_16.parquet", 16),
 }
 NATIVE_EVAL_FILES = {
-    "nq_test_eval": "nq_test_128_native_v3.parquet",
-    "multihop_eval": "multihop_eval_256_native_v3.parquet",
+    "nq_test_eval": "nq_test_128_native_v4.parquet",
+    "multihop_eval": "multihop_eval_256_native_v4.parquet",
 }
 BAD_ANSWERS = {"yes", "no", "true", "false", "unknown"}
+ANSWER_QUALITY_EXCLUSIONS_SCHEMA_VERSION = 1
+ANSWER_QUALITY_AUDIT_DISPOSITIONS = {
+    "retain_alias",
+    "exclude_incorrect_gold",
+    "exclude_multi_required",
+    "exclude_ambiguous",
+}
+ANSWER_QUALITY_EXCLUSION_DISPOSITIONS = {
+    disposition
+    for disposition in ANSWER_QUALITY_AUDIT_DISPOSITIONS
+    if disposition.startswith("exclude_")
+}
 
 
 class JsonlRows:
@@ -286,6 +304,11 @@ def prompt_contract(tool_protocol: str) -> dict[str, Any]:
                                MODEL_REVISION),
         "chat_template_sha256": (QWEN35_CHAT_TEMPLATE_SHA256
                                  if protocol == QWEN35_NATIVE else None),
+        "terminal_prompt_version": (QWEN35_TERMINAL_PROMPT_VERSION
+                                    if protocol == QWEN35_NATIVE else None),
+        "terminal_prompt_sha256": (QWEN35_TERMINAL_PROMPT_SHA256
+                                   if protocol == QWEN35_NATIVE else None),
+        "terminal_answer_only": protocol == QWEN35_NATIVE,
     }
 
 
@@ -334,6 +357,125 @@ def verify_source(local_dir: Path, source: str) -> Path:
             path) != spec["sha256"]:
         raise ValueError(f"Pinned source identity mismatch: {source}")
     return path
+
+
+def load_answer_quality_exclusions(
+    path: Optional[Path] = None,
+) -> tuple[Mapping[str, Any], dict[str, Mapping[str, Any]], bytes]:
+    """Load the repository-owned, fail-closed answer-quality exclusions."""
+    path = Path(path) if path is not None else ANSWER_QUALITY_EXCLUSIONS_PATH
+    if not path.is_file() or path.is_symlink():
+        raise ValueError(
+            f"Answer-quality exclusion manifest must be a regular file: {path}"
+        )
+    raw = path.read_bytes()
+    try:
+        raw.decode("ascii")
+        payload = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(
+            "Answer-quality exclusion manifest must be ASCII JSON") from error
+    if (not isinstance(payload, Mapping)
+            or set(payload) != {"schema_version", "dataset", "entries"}
+            or canonical_json_bytes(payload) != raw
+            or payload.get("schema_version") !=
+            ANSWER_QUALITY_EXCLUSIONS_SCHEMA_VERSION
+            or payload.get("dataset") != {
+                "name": DATASET_NAME,
+                "revision": DATASET_REVISION,
+            }
+            or not isinstance(payload.get("entries"), list)):
+        raise ValueError("Answer-quality exclusion manifest contract mismatch")
+
+    expected_keys = {
+        "source_id", "source_revision", "expected_category",
+        "expected_question", "expected_golden_answers", "disposition",
+        "reason", "evidence"
+    }
+    entries: dict[str, Mapping[str, Any]] = {}
+    for entry in payload["entries"]:
+        if not isinstance(entry, Mapping) or set(entry) != expected_keys:
+            raise ValueError("Answer-quality exclusion entry contract mismatch")
+        source_id = entry.get("source_id")
+        match = (re.fullmatch(r"(nq|hotpotqa):train:(0|[1-9][0-9]*)",
+                              source_id)
+                 if isinstance(source_id, str) else None)
+        if match is None or source_id in entries:
+            raise ValueError("Answer-quality exclusion source_id is invalid")
+        source = match.group(1)
+        category = entry.get("expected_category")
+        allowed_categories = ({"single"} if source == "nq" else
+                              {"comparison", "bridge"})
+        question = entry.get("expected_question")
+        answers = entry.get("expected_golden_answers")
+        reason = entry.get("reason")
+        evidence = entry.get("evidence")
+        if (entry.get("source_revision") != DATASET_REVISION
+                or category not in allowed_categories
+                or not isinstance(question, str)
+                or clean_question(question) != question
+                or not isinstance(answers, list)
+                or list(clean_answers(answers)) != answers
+                or entry.get("disposition") not in
+                ANSWER_QUALITY_AUDIT_DISPOSITIONS
+                or not isinstance(reason, str)
+                or re.fullmatch(r"[a-z][a-z0-9_]*", reason) is None
+                or not isinstance(evidence, str) or not evidence.strip()
+                or evidence.strip() != evidence):
+            raise ValueError("Answer-quality exclusion entry is invalid")
+        entries[source_id] = entry
+    if list(entries) != sorted(entries):
+        raise ValueError(
+            "Answer-quality exclusion entries must be source_id-sorted")
+    return payload, entries, raw
+
+
+def verify_answer_quality_exclusion_sources(
+        local_dir: Path,
+        exclusions: Mapping[str, Mapping[str, Any]]) -> None:
+    """Prove every expected question and gold list against the pinned source."""
+    rows_by_source: dict[str, JsonlRows] = {}
+    for source_id, entry in exclusions.items():
+        source, split, index_text = source_id.split(":")
+        if split != "train":
+            raise ValueError("Answer-quality exclusion split is invalid")
+        if source not in rows_by_source:
+            rows_by_source[source] = JsonlRows(verify_source(local_dir, source))
+        try:
+            row = rows_by_source[source][int(index_text)]
+            question = row.get("question")
+            answers = row.get("golden_answers")
+            category = "single" if source == "nq" else _hotpot_type(row)
+        except (IndexError, TypeError, ValueError) as error:
+            raise ValueError(
+                f"Cannot resolve answer-quality exclusion: {source_id}") from error
+        if (question != entry["expected_question"]
+                or answers != entry["expected_golden_answers"]
+                or category != entry["expected_category"]):
+            raise ValueError(
+                f"Answer-quality exclusion differs from pinned source: {source_id}"
+            )
+
+
+def verify_answer_quality_audit_catalog(
+        catalog: Sequence[Mapping[str, Any]],
+        audit_entries: Mapping[str, Mapping[str, Any]]) -> None:
+    """Bind every human-audited entry to the sealed pre-filter catalog."""
+    catalog_by_id = {str(row.get("source_id")): row for row in catalog}
+    if len(catalog_by_id) != len(catalog):
+        raise ValueError("Source catalog contains duplicate source IDs")
+    for source_id, entry in audit_entries.items():
+        row = catalog_by_id.get(source_id)
+        if (row is None
+                or row.get("data_source") != source_id.split(":", 1)[0]
+                or row.get("category") != entry["expected_category"]
+                or clean_question(row.get("question")) !=
+                entry["expected_question"]
+                or list(clean_answers(row.get("golden_answers"))) !=
+                entry["expected_golden_answers"]):
+            raise ValueError(
+                f"Answer-quality audit differs from sealed catalog: {source_id}"
+            )
 
 
 def download_sources(local_dir: Path) -> dict[str, Path]:
@@ -1182,8 +1324,17 @@ def _read_excluded_questions(
 
 def select_catalog(
     evidence: Sequence[Mapping[str, Any]], tokenizer: Any,
-    excluded_questions: set[str]
+    excluded_questions: set[str],
+    answer_quality_exclusions: Optional[Mapping[str,
+                                                Mapping[str, Any]]] = None,
 ) -> tuple[list[dict[str, Any]], Counter[str], dict[str, Any]]:
+    quality_filter_enabled = answer_quality_exclusions is not None
+    quality_audit = dict(answer_quality_exclusions or {})
+    quality_exclusions = {
+        source_id: entry
+        for source_id, entry in quality_audit.items()
+        if entry.get("disposition") in ANSWER_QUALITY_EXCLUSION_DISPOSITIONS
+    }
     accepted: dict[str, list[tuple[Mapping[str, Any], dict[str, Any]]]] = {
         category: []
         for category in QUOTAS
@@ -1191,6 +1342,8 @@ def select_catalog(
     rejected: Counter[str] = Counter()
     evidence_by_category: Counter[str] = Counter()
     seen_source_ids: set[str] = set()
+    matched_audit_ids: set[str] = set()
+    eligible_audit_ids: set[str] = set()
     for record in evidence:
         source_id = str(record.get("source_id"))
         if source_id in seen_source_ids:
@@ -1200,6 +1353,18 @@ def select_catalog(
         if category not in accepted:
             raise ValueError(f"Evidence has an unknown category: {category}")
         evidence_by_category[category] += 1
+        audit_entry = quality_audit.get(source_id)
+        if audit_entry is not None:
+            matched_audit_ids.add(source_id)
+            if (record.get("data_source") != source_id.split(":", 1)[0]
+                    or category != audit_entry["expected_category"]
+                    or clean_question(record.get("question")) !=
+                    audit_entry["expected_question"]
+                    or list(clean_answers(record.get("golden_answers"))) !=
+                    audit_entry["expected_golden_answers"]):
+                raise ValueError(
+                    "Answer-quality audit differs from retrieval evidence: "
+                    f"{source_id}")
         question_key = normalize_question(record.get("question"))
         if question_key in excluded_questions:
             rejected["materialize:question_in_existing_eval"] += 1
@@ -1208,14 +1373,29 @@ def select_catalog(
         if not valid:
             rejected[f"materialize:{category}:{reason}"] += 1
             continue
+        if (quality_filter_enabled
+                and len(clean_answers(record.get("golden_answers"))) > 1
+                and audit_entry is None):
+            rejected[(f"materialize:{category}:"
+                      "answer_quality_unaudited_multi_gold")] += 1
+            continue
+        if audit_entry is not None:
+            eligible_audit_ids.add(source_id)
+        exclusion = quality_exclusions.get(source_id)
+        if exclusion is not None:
+            rejected[(f"materialize:{category}:answer_quality_exclusion:"
+                      f"{exclusion['disposition']}:{exclusion['reason']}")] += 1
         accepted[category].append((record, audit))
 
     used_questions: set[str] = set(excluded_questions)
-    chosen_by_category: dict[str, list[tuple[Mapping[str, Any],
-                                             dict[str, Any]]]] = {}
+    chosen_by_category: dict[
+        str, list[tuple[Mapping[str, Any], dict[str, Any], str]]] = {}
     valid_after_visibility: dict[str, int] = {}
     unique_available: dict[str, int] = {}
     shortfalls: dict[str, dict[str, int]] = {}
+    replacement_lineage: list[dict[str, Any]] = []
+    selected_reason_counts: Counter[str] = Counter()
+    selected_disposition_counts: Counter[str] = Counter()
     for category, split_quotas in QUOTAS.items():
         values = accepted[category]
         values.sort(key=lambda item: (item[1][
@@ -1231,17 +1411,65 @@ def select_catalog(
             local_questions.add(question_key)
             unique.append((record, audit))
         valid_after_visibility[category] = len(values)
-        unique_available[category] = len(unique)
-        if len(unique) < needed:
+        available = [
+            item for item in unique
+            if str(item[0]["source_id"]) not in quality_exclusions
+        ]
+        unique_available[category] = len(available)
+        if len(available) < needed:
             shortfalls[category] = {
-                "available": len(unique),
+                "available": len(available),
                 "required": needed,
-                "missing": needed - len(unique),
+                "missing": needed - len(available),
             }
-        chosen = unique[:needed]
+
+        # Assign the original deterministic split first, then replace only an
+        # excluded selected row. This keeps every unaffected sample in place.
+        baseline = unique[:needed]
+        baseline.sort(
+            key=lambda item: stable_key("split", str(item[0]["source_id"])))
+        assignments = (["train"] * split_quotas["train"] +
+                       ["val"] * split_quotas["val"])
+        replacement_pool = [
+            item for item in unique[needed:]
+            if str(item[0]["source_id"]) not in quality_exclusions
+        ]
+        chosen: list[tuple[Mapping[str, Any], dict[str, Any], str]] = []
+        for (record, audit), split in zip(baseline, assignments):
+            excluded_source_id = str(record["source_id"])
+            exclusion = quality_exclusions.get(excluded_source_id)
+            if exclusion is None:
+                chosen.append((record, audit, split))
+                continue
+            source = str(record["data_source"])
+            replacement_index = next(
+                (index for index, item in enumerate(replacement_pool)
+                 if item[0].get("data_source") == source
+                 and item[0].get("category") == category), None)
+            if replacement_index is None:
+                shortfalls[category] = {
+                    "available": len(available),
+                    "required": needed,
+                    "missing": 1,
+                }
+                chosen = []
+                break
+            replacement, replacement_audit = replacement_pool.pop(
+                replacement_index)
+            chosen.append((replacement, replacement_audit, split))
+            selected_reason_counts[str(exclusion["reason"])] += 1
+            selected_disposition_counts[str(exclusion["disposition"])] += 1
+            replacement_lineage.append({
+                "category": category,
+                "data_source": source,
+                "excluded_source_id": excluded_source_id,
+                "output_split": split,
+                "replacement_source_id": str(replacement["source_id"]),
+            })
         chosen_by_category[category] = chosen
         used_questions.update(
-            normalize_question(record["question"]) for record, _ in chosen)
+            normalize_question(record["question"])
+            for record, _, _ in chosen)
 
     stats = {
         "evidence_by_category": {
@@ -1255,17 +1483,50 @@ def select_catalog(
             for category in QUOTAS
         },
     }
+    if quality_filter_enabled:
+        configured_dispositions = Counter(
+            str(entry["disposition"]) for entry in quality_audit.values())
+        excluded_reasons = Counter(
+            str(entry["reason"]) for entry in quality_exclusions.values())
+        stats["answer_quality_exclusions"] = {
+            "configured_count": len(quality_audit),
+            "configured_disposition_counts":
+            dict(sorted(configured_dispositions.items())),
+            "configured_reason_counts": dict(
+                sorted(
+                    Counter(
+                        str(entry["reason"])
+                        for entry in quality_audit.values()).items())),
+            "audited_multi_gold_count": sum(
+                len(entry["expected_golden_answers"]) > 1
+                for entry in quality_audit.values()),
+            "exclusion_count": len(quality_exclusions),
+            "retained_count": len(quality_audit) - len(quality_exclusions),
+            "excluded_reason_counts": dict(sorted(excluded_reasons.items())),
+            "eligible_count": len(eligible_audit_ids),
+            "matched_evidence_count": len(matched_audit_ids),
+            "replacement_count": len(replacement_lineage),
+            "replacement_lineage": replacement_lineage,
+            "selected_reason_counts":
+            dict(sorted(selected_reason_counts.items())),
+            "selected_disposition_counts":
+            dict(sorted(selected_disposition_counts.items())),
+        }
     if shortfalls:
         raise SelectionQuotaError(shortfalls, rejected, stats)
 
     selected: list[dict[str, Any]] = []
-    for category, split_quotas in QUOTAS.items():
+    for category in QUOTAS:
         chosen = chosen_by_category[category]
-        chosen.sort(
-            key=lambda item: stable_key("split", str(item[0]["source_id"])))
-        train_count = split_quotas["train"]
-        assignments = (["train"] * train_count + ["val"] * split_quotas["val"])
-        for (record, audit), split in zip(chosen, assignments):
+        for record, audit, split in chosen:
+            if len(clean_answers(record.get("golden_answers"))) > 1:
+                entry = quality_audit.get(str(record["source_id"]))
+                if (quality_filter_enabled
+                        and (entry is None
+                             or entry.get("disposition") != "retain_alias")):
+                    raise ValueError(
+                        "Selected multi-gold row lacks a retain_alias audit: "
+                        f"{record['source_id']}")
             catalog = _catalog_base(record, audit)
             catalog["output_split"] = split
             catalog["sample_id"] = record["source_id"]
@@ -1500,6 +1761,142 @@ def _validate_derived_from(value: object) -> dict[str, str]:
     return lineage
 
 
+def _answer_quality_exclusion_contract(
+        payload: Mapping[str, Any], raw: bytes,
+        selection_stats: Mapping[str, Any]) -> dict[str, Any]:
+    runtime = selection_stats.get("answer_quality_exclusions")
+    expected_runtime_keys = {
+        "configured_count", "configured_disposition_counts",
+        "configured_reason_counts", "audited_multi_gold_count",
+        "exclusion_count", "retained_count", "excluded_reason_counts",
+        "eligible_count", "matched_evidence_count", "replacement_count",
+        "replacement_lineage", "selected_reason_counts",
+        "selected_disposition_counts"
+    }
+    if not isinstance(runtime, Mapping) or set(runtime) != expected_runtime_keys:
+        raise ValueError("Answer-quality exclusion selection stats are invalid")
+    contract = {
+        "schema_version": payload["schema_version"],
+        "manifest_sha256": hashlib.sha256(raw).hexdigest(),
+        "source_lineage": dict(payload["dataset"]),
+        **dict(runtime),
+    }
+    _validate_answer_quality_exclusion_contract(payload, raw, contract)
+    return contract
+
+
+def _validate_answer_quality_exclusion_contract(
+        payload: Mapping[str, Any], raw: bytes, value: object) -> None:
+    runtime_keys = {
+        "configured_count", "configured_disposition_counts",
+        "configured_reason_counts", "audited_multi_gold_count",
+        "exclusion_count", "retained_count", "excluded_reason_counts",
+        "eligible_count", "matched_evidence_count", "replacement_count",
+        "replacement_lineage", "selected_reason_counts",
+        "selected_disposition_counts"
+    }
+    expected_keys = {
+        "schema_version", "manifest_sha256", "source_lineage", *runtime_keys
+    }
+    if not isinstance(value, Mapping) or set(value) != expected_keys:
+        raise ValueError("Answer-quality exclusion output contract mismatch")
+    entries = payload["entries"]
+    entries_by_id = {str(entry["source_id"]): entry for entry in entries}
+    configured_reasons = dict(
+        sorted(Counter(str(entry["reason"]) for entry in entries).items()))
+    configured_dispositions = dict(
+        sorted(
+            Counter(str(entry["disposition"])
+                    for entry in entries).items()))
+    excluded_entries = [
+        entry for entry in entries
+        if entry["disposition"] in ANSWER_QUALITY_EXCLUSION_DISPOSITIONS
+    ]
+    excluded_reasons = dict(
+        sorted(
+            Counter(str(entry["reason"])
+                    for entry in excluded_entries).items()))
+    excluded_dispositions = dict(
+        sorted(
+            Counter(str(entry["disposition"])
+                    for entry in excluded_entries).items()))
+    audited_multi_gold_count = sum(
+        len(entry["expected_golden_answers"]) > 1 for entry in entries)
+    if (value.get("schema_version") != payload["schema_version"]
+            or value.get("manifest_sha256") !=
+            hashlib.sha256(raw).hexdigest()
+            or value.get("source_lineage") != payload["dataset"]
+            or value.get("configured_count") != len(entries)
+            or value.get("configured_disposition_counts") !=
+            configured_dispositions
+            or value.get("configured_reason_counts") != configured_reasons
+            or value.get("audited_multi_gold_count") !=
+            audited_multi_gold_count
+            or value.get("exclusion_count") != len(excluded_entries)
+            or value.get("retained_count") !=
+            len(entries) - len(excluded_entries)
+            or value.get("excluded_reason_counts") != excluded_reasons):
+        raise ValueError("Answer-quality exclusion output lineage mismatch")
+    counts = [
+        value.get("matched_evidence_count"),
+        value.get("eligible_count"),
+        value.get("replacement_count"),
+    ]
+    if (any(type(count) is not int or count < 0 for count in counts)
+            or counts[0] != len(entries) or counts[1] != len(entries)
+            or counts[2] != len(excluded_entries)):
+        raise ValueError("Answer-quality exclusion output counts are invalid")
+    selected_reasons = value.get("selected_reason_counts")
+    if (not isinstance(selected_reasons, Mapping)
+            or not all(reason in excluded_reasons
+                       and type(count) is int and count > 0
+                       for reason, count in selected_reasons.items())
+            or dict(selected_reasons) != excluded_reasons):
+        raise ValueError(
+            "Answer-quality exclusion selected reason counts are invalid")
+    selected_dispositions = value.get("selected_disposition_counts")
+    if (not isinstance(selected_dispositions, Mapping)
+            or dict(selected_dispositions) != excluded_dispositions):
+        raise ValueError(
+            "Answer-quality exclusion selected disposition counts are invalid")
+    lineage = value.get("replacement_lineage")
+    if not isinstance(lineage, list) or len(lineage) != counts[2]:
+        raise ValueError("Answer-quality exclusion replacement lineage is invalid")
+    seen_exclusions: set[str] = set()
+    for replacement in lineage:
+        expected_lineage_keys = {
+            "category", "data_source", "excluded_source_id", "output_split",
+            "replacement_source_id"
+        }
+        if not isinstance(replacement, Mapping) or set(
+                replacement) != expected_lineage_keys:
+            raise ValueError(
+                "Answer-quality exclusion replacement lineage is invalid")
+        excluded_id = replacement.get("excluded_source_id")
+        entry = entries_by_id.get(str(excluded_id))
+        data_source = replacement.get("data_source")
+        replacement_id = replacement.get("replacement_source_id")
+        if (entry is None
+                or entry["disposition"] not in
+                ANSWER_QUALITY_EXCLUSION_DISPOSITIONS
+                or excluded_id in seen_exclusions
+                or replacement.get("category") != entry["expected_category"]
+                or not isinstance(data_source, str)
+                or not str(excluded_id).startswith(f"{data_source}:train:")
+                or not isinstance(replacement_id, str)
+                or not replacement_id.startswith(f"{data_source}:train:")
+                or replacement_id == excluded_id
+                or replacement.get("output_split") not in {"train", "val"}):
+            raise ValueError(
+                "Answer-quality exclusion replacement lineage is invalid")
+        seen_exclusions.add(str(excluded_id))
+    if seen_exclusions != {
+            str(entry["source_id"]) for entry in excluded_entries
+    }:
+        raise ValueError(
+            "Answer-quality exclusion lineage does not cover all exclusions")
+
+
 def materialize(
     local_dir: Path,
     model_dir: Path,
@@ -1510,14 +1907,9 @@ def materialize(
 ) -> Path:
     protocol = normalize_tool_protocol(tool_protocol)
     if protocol == QWEN35_NATIVE:
-        if derived_from is None:
-            raise ValueError(
-                "Native data must be created with materialize-native")
-        native_lineage = _validate_derived_from(derived_from)
-    else:
-        if derived_from is not None:
-            raise ValueError("Legacy data must not define native lineage")
-        native_lineage = None
+        raise ValueError("Native data must be created with materialize-native")
+    if derived_from is not None:
+        raise ValueError("Legacy data must not define native lineage")
 
     from transformers import AutoTokenizer
 
@@ -1677,10 +2069,6 @@ def materialize(
         },
         "artifacts": artifacts,
     }
-    if protocol == QWEN35_NATIVE:
-        manifest["prompt_contract"] = prompt_contract(protocol)
-        manifest["derived_from"] = native_lineage
-        manifest["evaluation_sources"] = {}
     manifest_path = local_dir / MANIFEST_FILE
     atomic_write(manifest_path, canonical_json_bytes(manifest))
     write_digest_sidecar(manifest_path)
@@ -1700,7 +2088,7 @@ def _native_eval_materializations(
 ) -> dict[str, dict[str, Any]]:
     """Load sealed held-out rows and replace only their legacy prompts."""
     if len(eval_catalogs) > 1 or len(eval_parquets) > 1:
-        raise ValueError("Native v3 accepts one NQ and one multihop eval source")
+        raise ValueError("Native v4 accepts one NQ and one multihop eval source")
     materializations: dict[str, dict[str, Any]] = {}
     if eval_parquets:
         from scripts.data_process import nq_small
@@ -1746,6 +2134,38 @@ def _native_eval_source_contract(
     return result
 
 
+def _verify_catalog_replacement_lineage(
+        source_catalog: Sequence[Mapping[str, Any]],
+        target_catalog: Sequence[Mapping[str, Any]],
+        lineage: Sequence[Mapping[str, Any]]) -> None:
+    source_by_id = {str(row["source_id"]): row for row in source_catalog}
+    target_by_id = {str(row["source_id"]): row for row in target_catalog}
+    if (len(source_by_id) != len(source_catalog)
+            or len(target_by_id) != len(target_catalog)
+            or len(source_catalog) != len(target_catalog)):
+        raise ValueError("Answer-quality replacement changed catalog cardinality")
+    removed = set(source_by_id) - set(target_by_id)
+    added = set(target_by_id) - set(source_by_id)
+    expected_removed = {str(item["excluded_source_id"]) for item in lineage}
+    expected_added = {str(item["replacement_source_id"]) for item in lineage}
+    if removed != expected_removed or added != expected_added:
+        raise ValueError("Catalog delta does not match replacement lineage")
+    for source_id in set(source_by_id) & set(target_by_id):
+        if source_by_id[source_id] != target_by_id[source_id]:
+            raise ValueError("Answer-quality reselection changed an unaffected row")
+    for item in lineage:
+        old = source_by_id[str(item["excluded_source_id"])]
+        new = target_by_id[str(item["replacement_source_id"])]
+        expected_scope = (item["data_source"], item["category"],
+                          item["output_split"])
+        if ((old["data_source"], old["category"], old["output_split"])
+                != expected_scope
+                or (new["data_source"], new["category"], new["output_split"])
+                != expected_scope):
+            raise ValueError(
+                "Answer-quality replacement left its source/category/split")
+
+
 def materialize_native(
     source_manifest: Path,
     output_dir: Path,
@@ -1754,7 +2174,10 @@ def materialize_native(
     eval_parquets: Sequence[Path] = (),
     reselect_catalog: bool = True,
 ) -> Path:
-    """Re-materialize native prompts from a verified, sealed catalog."""
+    """Build native-v4 data by quality-filtering sealed legacy evidence."""
+    if not reselect_catalog:
+        raise ValueError(
+            "native schema 5 requires deterministic catalog reselection")
     source_manifest = source_manifest.resolve()
     source_dir = source_manifest.parent
     output_dir = output_dir.resolve()
@@ -1772,8 +2195,37 @@ def materialize_native(
         source_manifest, expected_tool_protocol=LEGACY_XML)
     verify_replay_receipt(source_manifest)
     source_catalog_path = source_dir / CATALOG_FILE
-    source_catalog = source_catalog_path.read_bytes()
-    catalog = read_canonical_jsonl(source_catalog_path)
+    source_catalog = read_canonical_jsonl(source_catalog_path)
+    ledger, evidence = _load_retrieval_contract(source_dir)
+    source_funnel = _load_selection_funnel(source_dir, ledger, "complete")
+
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(model_dir, local_files_only=True)
+    excluded_questions, exclusions = _read_excluded_questions(
+        eval_catalogs, eval_parquets)
+    source_exclusions_path = source_dir / EXCLUSIONS_FILE
+    if source_exclusions_path.read_bytes() != canonical_json_bytes(exclusions):
+        raise ValueError("Legacy evaluation exclusions do not match inputs")
+
+    (quality_payload, quality_exclusions,
+     quality_raw) = load_answer_quality_exclusions()
+    verify_answer_quality_exclusion_sources(source_dir, quality_exclusions)
+    verify_answer_quality_audit_catalog(source_catalog, quality_exclusions)
+    catalog, rejection_counts, selection_stats = select_catalog(
+        evidence, tokenizer, excluded_questions, quality_exclusions)
+    catalog.sort(
+        key=lambda item: stable_key("catalog", str(item["source_id"])))
+    quality_contract = _answer_quality_exclusion_contract(
+        quality_payload, quality_raw, selection_stats)
+    _verify_catalog_replacement_lineage(
+        source_catalog, catalog, quality_contract["replacement_lineage"])
+    materialize_summary = {
+        **selection_stats,
+        "evidence_rows": len(evidence),
+        "excluded_question_count": len(excluded_questions),
+        "rejection_counts": dict(sorted(rejection_counts.items())),
+    }
     native_evals = _native_eval_materializations(eval_catalogs, eval_parquets)
     derived_from = {
         "source_manifest_sha256": sha256_file(source_manifest),
@@ -1788,18 +2240,9 @@ def materialize_native(
             _copy_regular_file(verify_source(source_dir, source),
                                source_path(staging, source))
         artifacts: dict[str, dict[str, Any]] = {}
-        bound_labels = (
-            "catalog",
-            "exclusions",
-            "retrieval_evidence",
-            "retrieval_ledger",
-            "selection_funnel",
-        )
-        sidecar_labels = {
-            "retrieval_evidence",
-            "retrieval_ledger",
-            "selection_funnel",
-        }
+        bound_labels = ("exclusions", "retrieval_evidence",
+                        "retrieval_ledger")
+        sidecar_labels = {"retrieval_evidence", "retrieval_ledger"}
         for label in bound_labels:
             artifact = source_payload["artifacts"][label]
             source_path_value = source_dir / artifact["file"]
@@ -1812,6 +2255,33 @@ def materialize_native(
                 source_path_value.with_suffix(source_path_value.suffix +
                                               ".sha256"),
                 target_path.with_suffix(target_path.suffix + ".sha256"))
+
+        catalog_path = staging / CATALOG_FILE
+        atomic_write(catalog_path,
+                     b"".join(canonical_json_bytes(row) for row in catalog))
+        artifacts["catalog"] = {
+            "file": CATALOG_FILE,
+            "bytes": catalog_path.stat().st_size,
+            "sha256": sha256_file(catalog_path),
+        }
+        quality_path = staging / ANSWER_QUALITY_EXCLUSIONS_FILE
+        atomic_write(quality_path, quality_raw)
+        artifacts["answer_quality_exclusions"] = {
+            "file": ANSWER_QUALITY_EXCLUSIONS_FILE,
+            "bytes": quality_path.stat().st_size,
+            "sha256": sha256_file(quality_path),
+        }
+        funnel_path = _write_selection_funnel(
+            staging,
+            _selection_funnel_payload("complete",
+                                      "materialize",
+                                      source_funnel["retrieval"],
+                                      materialize=materialize_summary))
+        artifacts["selection_funnel"] = {
+            "file": SELECTION_FUNNEL_FILE,
+            "bytes": funnel_path.stat().st_size,
+            "sha256": sha256_file(funnel_path),
+        }
 
         output_records: dict[str, list[dict[str, Any]]] = {}
         for split, filename in OUTPUT_FILES.items():
@@ -1871,7 +2341,8 @@ def materialize_native(
             },
             "quotas": source_payload["quotas"],
             "materialize_rejection_counts":
-            source_payload["materialize_rejection_counts"],
+            dict(sorted(rejection_counts.items())),
+            "answer_quality_exclusions": quality_contract,
             "overlap_checks": source_payload["overlap_checks"],
             "artifacts": artifacts,
             "prompt_contract": prompt_contract(QWEN35_NATIVE),
@@ -1882,34 +2353,15 @@ def materialize_native(
         atomic_write(staged_manifest, canonical_json_bytes(manifest))
         write_digest_sidecar(staged_manifest)
 
-        if (staging / CATALOG_FILE).read_bytes() != source_catalog:
-            raise ValueError(
-                "Native materialization changed the selected catalog")
-        for split in OUTPUT_FILES:
-            source_rows = _read_parquet(source_dir / OUTPUT_FILES[split])
-            source_non_prompt = [{
-                key: value
-                for key, value in row.items() if key != "prompt"
-            } for row in source_rows]
-            target_non_prompt = [{
-                key: value
-                for key, value in row.items() if key != "prompt"
-            } for row in output_records[split]]
-            if source_non_prompt != target_non_prompt:
-                raise ValueError(
-                    f"Native materialization changed non-prompt {split} fields"
-                )
-            if (artifacts[split]["sample_ids"] !=
-                    source_payload["artifacts"][split]["sample_ids"]):
-                raise ValueError(
-                    f"Native materialization changed {split} sample IDs")
+        _verify_catalog_replacement_lineage(
+            source_catalog, catalog, quality_contract["replacement_lineage"])
         verify_manifest(staged_manifest,
                         model_dir,
                         eval_catalogs,
                         eval_parquets,
                         expected_tool_protocol=QWEN35_NATIVE,
                         source_manifest=source_manifest,
-                        reselect_catalog=reselect_catalog)
+                        reselect_catalog=True)
         os.replace(staging, output_dir)
     finally:
         if staging.exists():
@@ -1985,8 +2437,9 @@ def _manifest_tool_protocol(manifest: Mapping[str, Any]) -> str:
         expected_keys = {
             "schema_version", "selection_policy", "seed", "sources",
             "retrieval", "tokenizer", "quotas",
-            "materialize_rejection_counts", "overlap_checks", "artifacts",
-            "prompt_contract", "derived_from", "evaluation_sources"
+            "materialize_rejection_counts", "answer_quality_exclusions",
+            "overlap_checks", "artifacts", "prompt_contract", "derived_from",
+            "evaluation_sources"
         }
         if set(manifest) != expected_keys:
             raise ValueError("Native manifest contract mismatch")
@@ -2085,6 +2538,8 @@ def _verify_manifest_artifacts(
         "selection_funnel": SELECTION_FUNNEL_FILE,
     }
     if protocol == QWEN35_NATIVE:
+        expected_artifact_names["answer_quality_exclusions"] = (
+            ANSWER_QUALITY_EXCLUSIONS_FILE)
         expected_artifact_names.update({
             label: values[0]
             for label, values in NATIVE_PROBE_FILES.items()
@@ -2131,6 +2586,9 @@ def verify_manifest(
 ) -> Mapping[str, Any]:
     manifest_path, manifest, protocol = _verify_manifest_artifacts(
         manifest_path, expected_tool_protocol)
+    if protocol == QWEN35_NATIVE and not reselect_catalog:
+        raise ValueError(
+            "native schema 5 verification requires catalog reselection")
     local_dir = manifest_path.parent
     artifacts = manifest["artifacts"]
     source_payload: Optional[Mapping[str, Any]] = None
@@ -2147,7 +2605,7 @@ def verify_manifest(
             eval_catalogs,
             eval_parquets,
             expected_tool_protocol=LEGACY_XML,
-            reselect_catalog=reselect_catalog)
+            reselect_catalog=True)
         source_catalog_sha256 = sha256_file(source_manifest.parent /
                                             CATALOG_FILE)
         expected_lineage = {
@@ -2161,20 +2619,15 @@ def verify_manifest(
         if manifest["evaluation_sources"] != _native_eval_source_contract(
                 native_evals):
             raise ValueError("Native evaluation lineage does not match source")
-        if reselect_catalog:
-            verify_replay_receipt(source_manifest)
+        verify_replay_receipt(source_manifest)
     elif not reselect_catalog:
         # Skipping selection never skips the sealed retrieval provenance.
         verify_replay_receipt(manifest_path)
     if protocol == QWEN35_NATIVE:
-        if sha256_file(local_dir / CATALOG_FILE) != source_catalog_sha256:
-            raise ValueError("Native catalog does not match source catalog")
         assert source_payload is not None
         for label in (
-                "catalog",
                 "retrieval_evidence",
                 "retrieval_ledger",
-                "selection_funnel",
                 "exclusions",
         ):
             if artifacts[label] != source_payload["artifacts"][label]:
@@ -2184,20 +2637,18 @@ def verify_manifest(
         if (manifest["seed"] != source_payload["seed"]
                 or manifest["quotas"] != source_payload["quotas"]):
             raise ValueError("Native seed or quotas do not match source")
-        if (manifest["materialize_rejection_counts"] !=
-                source_payload["materialize_rejection_counts"]):
-            raise ValueError(
-                "Native rejection counts do not match source")
-        for split in OUTPUT_FILES:
-            if (artifacts[split]["sample_ids"] !=
-                    source_payload["artifacts"][split]["sample_ids"]):
-                raise ValueError(
-                    f"Native {split} sample IDs do not match source")
-        # Source verification already proved these byte-identical artifacts.
-        # Check the copied sidecars without loading the evidence pool again.
+        # The evidence remains byte-identical; selection is deliberately new.
         for filename in (EVIDENCE_FILE, RETRIEVAL_LEDGER_FILE,
-                         SELECTION_FUNNEL_FILE):
+                          SELECTION_FUNNEL_FILE):
             _verify_sidecar(local_dir / filename)
+        ledger, evidence = _load_retrieval_contract(local_dir)
+        funnel = _load_selection_funnel(local_dir, ledger, "complete")
+        assert source_manifest is not None
+        source_funnel = json.loads((source_manifest.parent /
+                                    SELECTION_FUNNEL_FILE).read_bytes())
+        if funnel["retrieval"] != source_funnel["retrieval"]:
+            raise ValueError(
+                "Native retrieval funnel does not match sealed source")
     elif reselect_catalog:
         ledger, evidence = _load_retrieval_contract(local_dir)
         funnel = _load_selection_funnel(local_dir, ledger, "complete")
@@ -2221,6 +2672,27 @@ def verify_manifest(
             eval_catalogs, eval_parquets)
         if exclusions != expected_exclusions:
             raise ValueError("Exclusions do not match the evaluation sources")
+
+    quality_payload: Optional[Mapping[str, Any]] = None
+    quality_exclusions: dict[str, Mapping[str, Any]] = {}
+    quality_raw: Optional[bytes] = None
+    if protocol == QWEN35_NATIVE:
+        (quality_payload, quality_exclusions,
+         quality_raw) = load_answer_quality_exclusions(
+             local_dir / ANSWER_QUALITY_EXCLUSIONS_FILE)
+        _, _, expected_quality_raw = load_answer_quality_exclusions()
+        if quality_raw != expected_quality_raw:
+            raise ValueError(
+                "Native answer-quality exclusions differ from repository manifest"
+            )
+        verify_answer_quality_exclusion_sources(local_dir, quality_exclusions)
+        assert source_manifest is not None
+        verify_answer_quality_audit_catalog(
+            read_canonical_jsonl(source_manifest.parent / CATALOG_FILE),
+            quality_exclusions)
+        _validate_answer_quality_exclusion_contract(
+            quality_payload, quality_raw,
+            manifest.get("answer_quality_exclusions"))
 
     from transformers import AutoTokenizer
 
@@ -2246,6 +2718,40 @@ def verify_manifest(
         if funnel.get("materialize") != expected_materialize:
             raise ValueError(
                 "Selection funnel does not match deterministic reselection")
+    elif protocol == QWEN35_NATIVE:
+        assert quality_payload is not None and quality_raw is not None
+        recomputed, rejection_counts, selection_stats = select_catalog(
+            evidence, tokenizer, set(excluded_list), quality_exclusions)
+        recomputed.sort(
+            key=lambda item: stable_key("catalog", str(item["source_id"])))
+        if catalog != recomputed:
+            raise ValueError(
+                "Native catalog does not match quality-filtered reselection")
+        if manifest.get("materialize_rejection_counts") != dict(
+                sorted(rejection_counts.items())):
+            raise ValueError(
+                "Native rejection counts do not match quality reselection")
+        expected_materialize = {
+            **selection_stats,
+            "evidence_rows": len(evidence),
+            "excluded_question_count": len(excluded_list),
+            "rejection_counts": dict(sorted(rejection_counts.items())),
+        }
+        if funnel.get("materialize") != expected_materialize:
+            raise ValueError(
+                "Native funnel does not match quality-filtered reselection")
+        expected_quality_contract = _answer_quality_exclusion_contract(
+            quality_payload, quality_raw, selection_stats)
+        if manifest.get(
+                "answer_quality_exclusions") != expected_quality_contract:
+            raise ValueError(
+                "Native answer-quality exclusion contract mismatch")
+        assert source_manifest is not None
+        source_catalog = read_canonical_jsonl(source_manifest.parent /
+                                              CATALOG_FILE)
+        _verify_catalog_replacement_lineage(
+            source_catalog, catalog,
+            expected_quality_contract["replacement_lineage"])
     counts = Counter(
         (record["category"], record["output_split"]) for record in catalog)
     for category, split_quotas in QUOTAS.items():
@@ -2342,7 +2848,7 @@ def validate_native_rollout_evidence(
                                eval_parquets,
                                expected_tool_protocol=QWEN35_NATIVE,
                                source_manifest=source_manifest,
-                               reselect_catalog=False)
+                               reselect_catalog=True)
     if manifest["tokenizer"][
             "rollout_observation_length"] != ROLLOUT_OBSERVATION_LENGTH:
         raise ValueError("Native rollout observation contract mismatch")

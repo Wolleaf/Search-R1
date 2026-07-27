@@ -11,6 +11,9 @@ from search_r1.trajectory_trace import (TRACE_SCHEMA, TRACE_SCHEMA_VERSION,
                                         prepare_trace_record,
                                         stable_sample_id,
                                         verify_trace_manifest)
+from search_r1.llm_agent.tool_protocol import (
+    QWEN35_TERMINAL_PROMPT, QWEN35_TERMINAL_PROMPT_SHA256,
+    QWEN35_TERMINAL_PROMPT_VERSION)
 
 
 def _eval_record(sample_index=7, raw_trajectory=None):
@@ -140,15 +143,33 @@ def _terminal_eval_record():
         generation = deepcopy(template)
         generation.update({
             "turn": turn,
-            "generation_context": "tool_response",
+            "generation_context": (
+                "terminal_answer" if terminal else "tool_response"),
             "terminal_generation": terminal,
         })
         record["raw_generations"].append(generation)
-        record["generation_events"].append({
+        event = {
             "turn": turn,
             "terminal_generation": terminal,
             "executed_search": False,
-        })
+        }
+        if terminal:
+            event.update({
+                "generation_context": "terminal_answer",
+                "terminal_instruction_applied": True,
+                "terminal_prompt_version": QWEN35_TERMINAL_PROMPT_VERSION,
+                "terminal_prompt_sha256": QWEN35_TERMINAL_PROMPT_SHA256,
+                "terminal_prompt_text": QWEN35_TERMINAL_PROMPT,
+                "terminal_followup_token_count": 42,
+                "terminal_prompt_policy_token_count": 0,
+                "requested_action": "answer",
+                "action": "answer",
+                "parse_error": None,
+                "terminal_rejection_reason": None,
+                "valid_action": True,
+                "done": True,
+            })
+        record["generation_events"].append(event)
     record["action_count"] = 5
     record["policy_token_count"] = sum(
         generation["action_token_count"]
@@ -193,6 +214,44 @@ def test_v3_rejects_retrieval_or_a_second_generation_beyond_terminal():
     with pytest.raises(ValueError, match="plus terminal generation"):
         prepare_trace_record(over_budget, "eval", "unit", "terminal")
 
+
+def test_v3_validates_terminal_answer_only_prompt_and_search_rejection():
+    rejected_search = _terminal_eval_record()
+    terminal = rejected_search["generation_events"][-1]
+    terminal.update({
+        "requested_action": "search",
+        "action": None,
+        "parse_error": "search_disallowed_after_budget",
+        "terminal_rejection_reason": "search_disallowed_after_budget",
+        "valid_action": False,
+    })
+
+    prepared = prepare_trace_record(rejected_search, "eval", "unit",
+                                    "terminal-search")
+    assert prepared["generation_events"][-1]["action"] is None
+
+    bad_hash = _terminal_eval_record()
+    bad_hash["generation_events"][-1]["terminal_prompt_sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="invalid terminal_prompt_sha256"):
+        prepare_trace_record(bad_hash, "eval", "unit", "bad-terminal-hash")
+
+    accepted_search = deepcopy(rejected_search)
+    accepted_search["generation_events"][-1]["action"] = "search"
+    with pytest.raises(ValueError, match="not rejected consistently"):
+        prepare_trace_record(accepted_search, "eval", "unit",
+                             "accepted-terminal-search")
+
+    rejected_answer = _terminal_eval_record()
+    rejected_answer["generation_events"][-1].update({
+        "requested_action": "answer",
+        "action": None,
+        "parse_error": "invalid_terminal_answer_format",
+        "terminal_rejection_reason": "invalid_terminal_answer_format",
+        "valid_action": False,
+    })
+    prepared_answer = prepare_trace_record(
+        rejected_answer, "eval", "unit", "terminal-invalid-answer")
+    assert prepared_answer["generation_events"][-1]["action"] is None
 
 @pytest.mark.parametrize(
     ("action_text", "boundary", "wrong_boundary"),

@@ -8,8 +8,11 @@ import torch
 from search_r1.llm_agent.generation import (
     LLMGenerationManager, slice_first_complete_native_action)
 from search_r1.llm_agent.tool_protocol import (
+    ProtocolError,
     QWEN35_NATIVE, QWEN35_REASONING_CONTINUATION, QWEN35_RETRY_PROMPT,
-    parse_action, qwen35_messages, qwen35_tools)
+    QWEN35_TERMINAL_PROMPT, QWEN35_TERMINAL_PROMPT_SHA256,
+    QWEN35_TERMINAL_PROMPT_VERSION, parse_action, qwen35_messages,
+    qwen35_tools)
 from verl import DataProto
 
 
@@ -723,7 +726,7 @@ def test_native_conversations_copy_raw_messages_and_require_alignment():
         raise AssertionError("oversized native prompts must fail")
 
 
-def test_native_loop_restores_upstream_terminal_generation_after_four_searches():
+def test_native_loop_injects_answer_only_terminal_prompt_after_four_searches():
     tokenizer = _CharTokenizer()
     search = _native_continuation(
         "<tool_call><function=search><parameter=query>"
@@ -738,6 +741,8 @@ def test_native_loop_restores_upstream_terminal_generation_after_four_searches()
         tokenizer,
         worker,
         max_turns=4,
+        max_response_length=500,
+        max_obs_length=500,
         max_prompt_length=4500,
     )
     raw_messages = [qwen35_messages("Capital of France?")]
@@ -759,8 +764,34 @@ def test_native_loop_restores_upstream_terminal_generation_after_four_searches()
     assert events[-1]["content"] == "Paris"
     assert events[-1]["terminal_generation"] is True
     assert events[-1]["executed_search"] is False
+    assert events[-1]["generation_context"] == "terminal_answer"
+    assert events[-1]["terminal_instruction_applied"] is True
+    assert events[-1]["terminal_prompt_version"] == (
+        QWEN35_TERMINAL_PROMPT_VERSION)
+    assert events[-1]["terminal_prompt_sha256"] == (
+        QWEN35_TERMINAL_PROMPT_SHA256)
+    assert events[-1]["terminal_prompt_text"] == QWEN35_TERMINAL_PROMPT
+    assert events[-1]["terminal_prompt_policy_token_count"] == 0
+    assert events[-1]["terminal_rejection_reason"] is None
     assert output.non_tensor_batch["final_answer"].tolist() == ["Paris"]
+    assert output.meta_info["terminal_instruction_applied_count"] == 1
+    assert output.meta_info["terminal_answer_count"] == 1
+    assert output.meta_info["terminal_requested_search_count"] == 0
+    assert output.meta_info["terminal_invalid_count"] == 0
+    assert output.meta_info["terminal_accepted_search_count"] == 0
+    assert output.meta_info["terminal_executed_search_count"] == 0
     answer_ids = tokenizer(answer, add_special_tokens=False)["input_ids"]
+    search_ids = tokenizer(search, add_special_tokens=False)["input_ids"]
+    pre_terminal_prompt = worker.prompts[3][0].tolist()
+    terminal_prompt = worker.prompts[4][0].tolist()
+    terminal_suffix_ids = terminal_prompt[
+        len(pre_terminal_prompt) + len(search_ids):]
+    assert terminal_prompt == (pre_terminal_prompt + search_ids
+                               + terminal_suffix_ids)
+    rendered_terminal_suffix = tokenizer.decode(terminal_suffix_ids)
+    assert QWEN35_TERMINAL_PROMPT in rendered_terminal_suffix
+    assert "<tool>Doc 1 says Paris" in rendered_terminal_suffix
+    assert rendered_terminal_suffix.endswith("<assistant><think>\n")
     response_row = output.batch["responses"][0]
     response_length = int(
         (response_row != tokenizer.pad_token_id).sum().item())
@@ -768,11 +799,243 @@ def test_native_loop_restores_upstream_terminal_generation_after_four_searches()
         response_length - len(answer_ids):response_length].tolist() == answer_ids
     response_info_mask = output.batch["info_mask"][
         0, -output.batch["responses"].shape[1]:]
+    terminal_suffix_start = (response_length - len(answer_ids)
+                             - len(terminal_suffix_ids))
+    assert response_row[
+        terminal_suffix_start:terminal_suffix_start
+        + len(terminal_suffix_ids)].tolist() == terminal_suffix_ids
+    assert response_info_mask[
+        terminal_suffix_start:terminal_suffix_start
+        + len(terminal_suffix_ids)].tolist() == [0] * len(terminal_suffix_ids)
     assert response_info_mask[
         response_length - len(answer_ids):response_length].tolist() == [
             1
         ] * len(answer_ids)
     assert not worker.turns
+
+
+def test_native_terminal_search_is_rejected_without_retrieval_and_terminates():
+    tokenizer = _CharTokenizer()
+    search = _native_continuation(
+        "<tool_call><function=search><parameter=query>"
+        "capital of France</parameter></function></tool_call>",
+        "I need more evidence.",
+    )
+    worker = _ScriptedWorker(tokenizer, [[search] for _ in range(5)])
+    manager = _native_manager(
+        tokenizer,
+        worker,
+        max_turns=4,
+        max_response_length=500,
+        max_obs_length=500,
+        max_prompt_length=4500,
+    )
+    raw_messages = [qwen35_messages("Capital of France?")]
+    gen_batch, _ = _generation_batch(tokenizer, raw_messages)
+
+    output = manager.run_llm_loop(
+        gen_batch,
+        gen_batch.batch["input_ids"].clone(),
+        raw_messages=raw_messages,
+    )
+
+    events = output.non_tensor_batch["generation_events"][0]
+    terminal = events[-1]
+    assert len(events) == 5
+    assert len(output.non_tensor_batch["retrieval_events"][0]) == 4
+    assert output.batch["executed_search_count"].tolist() == [4]
+    assert output.batch["action_count"].tolist() == [5]
+    assert output.meta_info["active_mask"] == [False]
+    assert output.non_tensor_batch["final_answer"].tolist() == [None]
+    assert terminal["action"] is None
+    assert terminal["requested_action"] == "search"
+    assert terminal["parse_error"] == "search_disallowed_after_budget"
+    assert terminal["terminal_rejection_reason"] == (
+        "search_disallowed_after_budget")
+    assert terminal["valid_action"] is False
+    assert terminal["done"] is True
+    assert terminal["executed_search"] is False
+    assert output.meta_info["terminal_requested_search_count"] == 1
+    assert output.meta_info["terminal_answer_count"] == 0
+    assert output.meta_info["terminal_invalid_count"] == 0
+    assert output.meta_info["terminal_accepted_search_count"] == 0
+    assert output.meta_info["terminal_executed_search_count"] == 0
+    terminal_parsed = output.non_tensor_batch["parsed_actions"][0][-1]
+    assert terminal_parsed["action"] == "invalid"
+    assert terminal_parsed["requested_action"] == "search"
+    assert terminal_parsed["parse_error"] == "search_disallowed_after_budget"
+    assert not worker.turns
+
+
+def test_native_terminal_answer_with_raw_tail_is_rejected():
+    tokenizer = _CharTokenizer()
+    search = _native_continuation(
+        "<tool_call><function=search><parameter=query>"
+        "capital of France</parameter></function></tool_call>",
+        "I need more evidence.",
+    )
+    answer_with_tail = _native_continuation(
+        "<answer>Paris</answer> garbage",
+        "I will now answer.",
+    )
+    worker = _ScriptedWorker(
+        tokenizer,
+        [[search] for _ in range(4)] + [[answer_with_tail]],
+    )
+    manager = _native_manager(
+        tokenizer,
+        worker,
+        max_turns=4,
+        max_response_length=500,
+        max_obs_length=500,
+        max_prompt_length=4500,
+    )
+    raw_messages = [qwen35_messages("Capital of France?")]
+    gen_batch, _ = _generation_batch(tokenizer, raw_messages)
+
+    output = manager.run_llm_loop(
+        gen_batch,
+        gen_batch.batch["input_ids"].clone(),
+        raw_messages=raw_messages,
+    )
+
+    terminal = output.non_tensor_batch["generation_events"][0][-1]
+    assert terminal["text"].endswith("<answer>Paris</answer>")
+    assert terminal["raw_text"].endswith("<answer>Paris</answer> garbage")
+    assert terminal["tail_dropped"] is True
+    assert terminal["requested_action"] == "answer"
+    assert terminal["action"] is None
+    assert terminal["parse_error"] == "invalid_terminal_answer_format"
+    assert terminal["terminal_rejection_reason"] == (
+        "invalid_terminal_answer_format")
+    assert terminal["valid_action"] is False
+    assert terminal["done"] is True
+    assert output.non_tensor_batch["final_answer"].tolist() == [None]
+    assert output.meta_info["terminal_answer_count"] == 0
+    assert output.meta_info["terminal_invalid_count"] == 1
+
+
+def test_native_last_invalid_action_uses_terminal_prompt_without_retry():
+    tokenizer = _CharTokenizer()
+    search = _native_continuation(
+        "<tool_call><function=search><parameter=query>"
+        "capital of France</parameter></function></tool_call>",
+        "I need more evidence.",
+    )
+    invalid = _native_continuation("I should search again.",
+                                   "I still need evidence.")
+    answer = _native_continuation("<answer>Paris</answer>",
+                                  "I will give my best answer.")
+    worker = _ScriptedWorker(
+        tokenizer,
+        [[search], [search], [search], [invalid], [answer]],
+    )
+    manager = _native_manager(
+        tokenizer,
+        worker,
+        max_turns=4,
+        max_response_length=500,
+        max_obs_length=500,
+        max_prompt_length=4500,
+    )
+    raw_messages = [qwen35_messages("Capital of France?")]
+    gen_batch, _ = _generation_batch(tokenizer, raw_messages)
+
+    output = manager.run_llm_loop(
+        gen_batch,
+        gen_batch.batch["input_ids"].clone(),
+        raw_messages=raw_messages,
+    )
+
+    invalid_ids = (tokenizer(invalid, add_special_tokens=False)["input_ids"]
+                   + [tokenizer.eos_token_id])
+    pre_invalid_prompt = worker.prompts[3][0].tolist()
+    terminal_prompt = worker.prompts[4][0].tolist()
+    terminal_suffix_ids = terminal_prompt[
+        len(pre_invalid_prompt) + len(invalid_ids):]
+    rendered_suffix = tokenizer.decode(terminal_suffix_ids)
+    assert terminal_prompt == (pre_invalid_prompt + invalid_ids
+                               + terminal_suffix_ids)
+    assert QWEN35_TERMINAL_PROMPT in rendered_suffix
+    assert QWEN35_RETRY_PROMPT not in rendered_suffix
+    assert rendered_suffix.endswith("<assistant><think>\n")
+    assert output.batch["executed_search_count"].tolist() == [3]
+    events = output.non_tensor_batch["generation_events"][0]
+    assert events[-2]["parse_error"] == "missing_native_action"
+    assert events[-1]["action"] == "answer"
+    assert output.non_tensor_batch["final_answer"].tolist() == ["Paris"]
+
+
+def test_native_terminal_followup_truncates_observation_not_instruction():
+    tokenizer = _CharTokenizer()
+    search = _native_continuation(
+        "<tool_call><function=search><parameter=query>"
+        "capital of France</parameter></function></tool_call>",
+        "I need more evidence.",
+    )
+    answer = _native_continuation("<answer>Paris</answer>",
+                                  "I will give my best answer.")
+    worker = _ScriptedWorker(tokenizer,
+                             [[search] for _ in range(4)] + [[answer]])
+    manager = _native_manager(
+        tokenizer,
+        worker,
+        max_turns=4,
+        max_response_length=500,
+        max_obs_length=500,
+        max_prompt_length=4500,
+    )
+    long_observation = "Evidence: " + "x" * 1000
+
+    def batch_search(queries):
+        assert queries == ["capital of France"]
+        manager._last_batch_search_metadata = [[]]
+        return [long_observation]
+
+    manager.batch_search = batch_search
+    raw_messages = [qwen35_messages("Capital of France?")]
+    gen_batch, _ = _generation_batch(tokenizer, raw_messages)
+
+    output = manager.run_llm_loop(
+        gen_batch,
+        gen_batch.batch["input_ids"].clone(),
+        raw_messages=raw_messages,
+    )
+
+    terminal = output.non_tensor_batch["generation_events"][0][-1]
+    final_retrieval = output.non_tensor_batch["retrieval_events"][0][-1]
+    assert terminal["terminal_followup_token_count"] <= 500
+    assert terminal["terminal_prompt_text"] == QWEN35_TERMINAL_PROMPT
+    assert QWEN35_TERMINAL_PROMPT in tokenizer.decode(worker.prompts[-1][0])
+    assert final_retrieval["visible_observation"] != long_observation
+    assert long_observation.startswith(final_retrieval["visible_observation"])
+
+
+def test_native_terminal_instruction_fails_closed_when_suffix_cannot_fit():
+    tokenizer = _CharTokenizer()
+    search = _native_continuation(
+        "<tool_call><function=search><parameter=query>"
+        "capital of France</parameter></function></tool_call>",
+        "I need more evidence.",
+    )
+    worker = _ScriptedWorker(tokenizer, [[search] for _ in range(4)])
+    manager = _native_manager(
+        tokenizer,
+        worker,
+        max_turns=4,
+        max_response_length=500,
+        max_obs_length=256,
+        max_prompt_length=3524,
+    )
+    raw_messages = [qwen35_messages("Capital of France?")]
+    gen_batch, _ = _generation_batch(tokenizer, raw_messages)
+
+    with pytest.raises(ProtocolError, match="native terminal wrapper"):
+        manager.run_llm_loop(
+            gen_batch,
+            gen_batch.batch["input_ids"].clone(),
+            raw_messages=raw_messages,
+        )
 
 
 def test_native_capacity_counts_only_the_policy_right_side():

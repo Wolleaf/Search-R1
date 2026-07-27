@@ -39,7 +39,7 @@ def _record(slot: int, answer: str | None, em: int) -> dict[str, object]:
     }
 
 
-def _v3_record(slot: int, action: str = "answer") -> dict[str, object]:
+def _active_record(slot: int, action: str = "answer") -> dict[str, object]:
     record = _record(slot, "Paris" if action == "answer" else None,
                      1 if action == "answer" else 0)
     action_text = ("Reasoning</think><answer>Paris</answer>" if action == "answer"
@@ -64,6 +64,59 @@ def _v3_record(slot: int, action: str = "answer") -> dict[str, object]:
         "observation_token_count": 0,
         "observation_policy_token_count": 0,
         "info_mask_consistent": True,
+    })
+    return record
+
+
+def _terminal_record(requested_action: str = "answer") -> dict[str, object]:
+    record = _active_record(0)
+    normal = []
+    for turn in range(4):
+        event = dict(record["generation_events"][0])
+        event.update({
+            "turn": turn,
+            "terminal_generation": False,
+            "executed_search": False,
+        })
+        normal.append(event)
+    if requested_action == "answer":
+        result = {
+            "requested_action": "answer",
+            "action": "answer",
+            "parse_error": None,
+            "terminal_rejection_reason": None,
+            "valid_action": True,
+        }
+    elif requested_action == "search":
+        result = {
+            "requested_action": "search",
+            "action": None,
+            "parse_error": "search_disallowed_after_budget",
+            "terminal_rejection_reason": "search_disallowed_after_budget",
+            "valid_action": False,
+        }
+    else:
+        result = {
+            "requested_action": None,
+            "action": None,
+            "parse_error": "missing_qwen35_action",
+            "terminal_rejection_reason": "missing_qwen35_action",
+            "valid_action": False,
+        }
+    terminal = dict(normal[-1])
+    terminal.update({
+        "turn": 4,
+        "terminal_generation": True,
+        "terminal_instruction_applied": True,
+        "terminal_prompt_version": ANALYSIS.TERMINAL_PROMPT_VERSION,
+        "terminal_prompt_sha256": ANALYSIS.TERMINAL_PROMPT_SHA256,
+        "terminal_prompt_policy_token_count": 0,
+        "generation_context": "terminal_answer",
+        **result,
+    })
+    record.update({
+        "generation_events": [*normal, terminal],
+        "action_count": 5,
     })
     return record
 
@@ -96,6 +149,11 @@ def _data_contract(tmp_path: Path, schema_version: int,
         "prompt_contract": {
             "tool_protocol": "qwen35_native",
             "prompt_version": prompt_version,
+            **({
+                "terminal_answer_only": True,
+                "terminal_prompt_version": ANALYSIS.TERMINAL_PROMPT_VERSION,
+                "terminal_prompt_sha256": ANALYSIS.TERMINAL_PROMPT_SHA256,
+            } if prompt_version == ANALYSIS.ACTIVE_PROMPT_VERSION else {}),
         },
         "artifacts": {
             "catalog": {
@@ -322,11 +380,11 @@ def test_subem_only_signal_does_not_unlock_g2() -> None:
     assert "subem_positive_count" not in overall["criteria"]
 
 
-def test_v3_g1_structure_does_not_gate_search_em_or_thinking() -> None:
-    records = [_v3_record(0), _v3_record(1)]
+def test_v4_g1_structure_does_not_gate_search_em_or_thinking() -> None:
+    records = [_active_record(0), _active_record(1)]
 
     overall, _, _ = ANALYSIS.analyze_trace_stage(
-        "g0_g1", records, active_v3=True)
+        "g0_g1", records, active_v4=True)
 
     assert overall["search_turn_count"] == 0
     assert overall["em_count"] == 2
@@ -336,12 +394,12 @@ def test_v3_g1_structure_does_not_gate_search_em_or_thinking() -> None:
     assert "legal_first_action_count" not in overall["criteria"]
 
 
-def test_data_contract_distinguishes_active_schema4_from_legacy_schema3(
+def test_data_contract_distinguishes_active_schema5_from_legacy_schema3(
         tmp_path: Path) -> None:
     active_dir = tmp_path / "active"
     active_dir.mkdir()
     manifest, catalog = _data_contract(
-        active_dir, 4, ANALYSIS.ACTIVE_PROMPT_VERSION)
+        active_dir, 5, ANALYSIS.ACTIVE_PROMPT_VERSION)
     expected_ids, _, _, _, active = ANALYSIS.load_data_contract(
         manifest, catalog, "g0_g1")
     assert active is True
@@ -364,12 +422,75 @@ def test_active_prompt_cannot_reuse_legacy_data_schema(tmp_path: Path) -> None:
         ANALYSIS.load_data_contract(manifest, catalog, "g0_g1")
 
 
-def test_v3_g1_separates_requested_executed_retrieval_and_tool_response() -> None:
-    record = _v3_record(0, action="search")
+def test_historical_v3_schema4_cannot_authorize_active_gate(
+        tmp_path: Path) -> None:
+    manifest, catalog = _data_contract(
+        tmp_path, 4, "qwen35-native-search-v3-original-aligned")
+
+    with pytest.raises(ValueError, match="manifest contract mismatch"):
+        ANALYSIS.load_data_contract(manifest, catalog, "g0_g1")
+
+
+def test_v4_terminal_answer_contract_and_metrics(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    record = _terminal_record("answer")
+    record["checkpoint_digest"] = "a" * 64
+    monkeypatch.setitem(ANALYSIS.STAGE_SHAPES, "g0_g1", (1, 1))
+
+    ANALYSIS.validate_traces(
+        [record], "g0_g1", "a" * 64, ["hotpotqa:train:0"],
+        {"hotpotqa:train:0": "What is the capital city?"},
+        active_v4=True)
+    overall, _, _ = ANALYSIS.analyze_trace_stage(
+        "g0_g1", [record], active_v4=True)
+
+    assert overall["terminal_generation_count"] == 1
+    assert overall["terminal_instruction_applied_count"] == 1
+    assert overall["terminal_answer_rate"] == 1.0
+    assert overall["terminal_requested_search_rate"] == 0.0
+    assert all(item["passed"] for item in overall["criteria"].values())
+
+
+def test_v4_terminal_search_is_rejected_but_fails_behavior_target(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    record = _terminal_record("search")
+    record["checkpoint_digest"] = "a" * 64
+    monkeypatch.setitem(ANALYSIS.STAGE_SHAPES, "g0_g1", (1, 1))
+
+    ANALYSIS.validate_traces(
+        [record], "g0_g1", "a" * 64, ["hotpotqa:train:0"],
+        {"hotpotqa:train:0": "What is the capital city?"},
+        active_v4=True)
+    overall, _, _ = ANALYSIS.analyze_trace_stage(
+        "g0_g1", [record], active_v4=True)
+
+    assert overall["terminal_search_request_count"] == 1
+    assert overall["terminal_accepted_search_count"] == 0
+    assert overall["terminal_executed_search_count"] == 0
+    assert overall["criteria"]["terminal_answer_rate"]["passed"] is False
+    assert overall["criteria"]["terminal_requested_search_rate"]["passed"] is False
+
+
+def test_v4_terminal_generation_requires_answer_only_instruction(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    record = _terminal_record("answer")
+    record["checkpoint_digest"] = "a" * 64
+    record["generation_events"][-1].pop("terminal_instruction_applied")
+    monkeypatch.setitem(ANALYSIS.STAGE_SHAPES, "g0_g1", (1, 1))
+
+    with pytest.raises(ValueError, match="terminal answer-only contract"):
+        ANALYSIS.validate_traces(
+            [record], "g0_g1", "a" * 64, ["hotpotqa:train:0"],
+            {"hotpotqa:train:0": "What is the capital city?"},
+            active_v4=True)
+
+
+def test_v4_g1_separates_requested_executed_retrieval_and_tool_response() -> None:
+    record = _active_record(0, action="search")
     record["executed_search_count"] = 0
 
     overall, decorated, _ = ANALYSIS.analyze_trace_stage(
-        "g0_g1", [record], active_v3=True)
+        "g0_g1", [record], active_v4=True)
 
     diagnostics = decorated[0]["diagnostics"]
     assert diagnostics["requested_search_count"] == 1
@@ -379,9 +500,9 @@ def test_v3_g1_separates_requested_executed_retrieval_and_tool_response() -> Non
     assert overall["criteria"]["retrieval_alignment_error_count"]["passed"] is False
 
 
-def test_v3_validation_rejects_terminal_search_compatibility_field(
+def test_v4_validation_rejects_terminal_search_compatibility_field(
         monkeypatch: pytest.MonkeyPatch) -> None:
-    record = _v3_record(0)
+    record = _active_record(0)
     record.update({
         "sample_id": "hotpotqa:train:0",
         "checkpoint_digest": "a" * 64,
@@ -393,4 +514,4 @@ def test_v3_validation_rejects_terminal_search_compatibility_field(
         ANALYSIS.validate_traces(
             [record], "g0_g1", "a" * 64, ["hotpotqa:train:0"],
             {"hotpotqa:train:0": "What is the capital city?"},
-            active_v3=True)
+            active_v4=True)

@@ -364,7 +364,7 @@ run_job() {
             [[ "$TOOL_PROTOCOL" == qwen35_native && -z "$EVAL_DATA_FILE" &&
                 ( "$EVAL_EXPECTED_ROWS" == 128 || "$EVAL_EXPECTED_ROWS" == 256 ) &&
                 "$EVAL_GROUP_SIZE" == 1 ]] || {
-                printf 'Qwen native endpoint evaluation requires a sealed v3 artifact and group size 1.\n' >&2
+                printf 'Qwen native endpoint evaluation requires a sealed v4 artifact and group size 1.\n' >&2
                 return 64
             }
         elif [[ -n "$EVAL_DATA_FILE" ]]; then
@@ -711,11 +711,13 @@ PY
         handoff_verify_args+=(
             --require-artifact data/search_mix/retrieval_replay.json
             --require-artifact data/search_mix/retrieval_replay.json.sha256
-            --require-artifact data/search_mix_qwen35_native_v3/manifest.json
-            --require-artifact data/search_mix_qwen35_native_v3/manifest.json.sha256
-            --require-artifact data/search_mix_qwen35_native_v3/probe_g0_8.parquet
-            --require-artifact data/search_mix_qwen35_native_v3/probe_autonomous_16.parquet
-            --expect-native-prompt-version qwen35-native-search-v3-original-aligned
+            --require-artifact data/search_mix_qwen35_native_v4/manifest.json
+            --require-artifact data/search_mix_qwen35_native_v4/manifest.json.sha256
+            --require-artifact data/search_mix_qwen35_native_v4/catalog.jsonl
+            --require-artifact data/search_mix_qwen35_native_v4/search_mix_answer_quality_exclusions.v1.json
+            --require-artifact data/search_mix_qwen35_native_v4/probe_g0_8.parquet
+            --require-artifact data/search_mix_qwen35_native_v4/probe_autonomous_16.parquet
+            --expect-native-prompt-version qwen35-native-search-v4-terminal-answer-only
             --expect-native-thinking-enabled
             --expect-max-action-budget 4
             --expect-selection-observation-length 384
@@ -724,11 +726,11 @@ PY
     fi
     if [[ "${AUTODL_GPU_PIPELINE:-legacy}" == qwen_native_train ]]; then
         handoff_verify_args+=(
-            --require-artifact data/search_mix_qwen35_native_v3/train_512.parquet
-            --require-artifact data/search_mix_qwen35_native_v3/val_128.parquet
-            --require-artifact data/search_mix_qwen35_native_v3/probe_multi_64.parquet
-            --require-artifact data/search_mix_qwen35_native_v3/nq_test_128_native_v3.parquet
-            --require-artifact data/search_mix_qwen35_native_v3/multihop_eval_256_native_v3.parquet
+            --require-artifact data/search_mix_qwen35_native_v4/train_512.parquet
+            --require-artifact data/search_mix_qwen35_native_v4/val_128.parquet
+            --require-artifact data/search_mix_qwen35_native_v4/probe_multi_64.parquet
+            --require-artifact data/search_mix_qwen35_native_v4/nq_test_128_native_v4.parquet
+            --require-artifact data/search_mix_qwen35_native_v4/multihop_eval_256_native_v4.parquet
         )
     fi
     "$TRAIN_ENV/bin/python" "$CHECKOUT_DIR/scripts/autodl/handoff.py" verify \

@@ -87,7 +87,7 @@ source "$ENTRYPOINT"
         "$(printf 'a%.0s' {1..64})" "$(printf 'b%.0s' {1..64})"
 )
 
-# The shared run record must describe the neutral native-v3 sampling contract.
+# The shared run record must describe the neutral native-v4 sampling contract.
 record_dir="$TEST_ROOT/project/runs/record"
 mkdir -p "$record_dir"
 : >"$record_dir/.running"
@@ -149,25 +149,50 @@ set -Eeuo pipefail
 printf 'python|%s\n' "$*" >>"$CALLS"
 tool="${1##*/}"
 output=''
+receipt=''
+wandb_dir=''
 while (($#)); do
-    if [[ "$1" == --output-dir || "$1" == --output ]]; then
+    if [[ "$1" == --wandb-dir ]]; then
+        wandb_dir="$2"
+        shift 2
+        continue
+    elif [[ "$1" == --output-dir || "$1" == --output ]]; then
         output="$2"
+        break
+    elif [[ "$1" == --verify-receipt ]]; then
+        receipt="$2"
         break
     fi
     shift
 done
-[[ -n "$output" ]]
-if [[ "$tool" == qwen_native_smoke_analysis.py ]]; then
+if [[ "$tool" == wandb_history.py ]]; then
+    decision="${WANDB_OUTCOME:-GO}"
+    [[ -n "$wandb_dir" ]]
+    find "$wandb_dir" -type f -name 'run-*.wandb' -size +0c | grep -q .
+    if [[ -n "$output" ]]; then
+        mkdir -p "$(dirname -- "$output")"
+        printf '{"decision":"%s","schema":"search-r1.wandb-offline-receipt","schema_version":1}\n' \
+            "$decision" >"$output"
+    else
+        [[ -f "$receipt" ]]
+    fi
+    printf '%s\n' "$decision"
+elif [[ "$tool" == qwen_native_smoke_analysis.py ]]; then
+    decision="${SMOKE_ANALYSIS_OUTCOME:-GO}"
+    [[ -n "$output" ]]
     mkdir -p "$(dirname -- "$output")"
-    printf '{"decision":"GO","schema":"search-r1.qwen-native-smoke-decision","schema_version":1}\n' >"$output"
-    printf 'GO\n'
+    printf '{"decision":"%s","schema":"search-r1.qwen-native-smoke-decision","schema_version":2}\n' \
+        "$decision" >"$output"
+    printf '%s\n' "$decision"
 elif [[ "$tool" == paired_eval.py ]]; then
+    [[ -n "$output" ]]
     mkdir -p "$output"
     for name in summary.json paired_results.csv correct_questions.csv wrong_questions.csv search_transition.csv; do
         printf 'paired\n' >"$output/$name"
     done
     printf '# paired\n' >"$output/summary.md"
 else
+    [[ -n "$output" ]]
     mkdir -p "$output"
     for name in summary.json go_no_go.json; do printf '{}\n' >"$output/$name"; done
     printf '# analysis\n' >"$output/summary.md"
@@ -274,6 +299,20 @@ prepare_preflight() {
     fi
 }
 
+# Smoke may archive a structurally valid NO-GO receipt; main still requires GO.
+receipt_run="$TEST_ROOT/project/runs/receipt-no-go"
+mkdir -p "$receipt_run/wandb/offline-run-test"
+printf 'offline-history\n' >"$receipt_run/wandb/offline-run-test/run-test.wandb"
+printf 'step:1\nstep:2\n' >"$receipt_run/train.log"
+export WANDB_OUTCOME=NO-GO
+write_wandb_receipt "$receipt_run" 2 GO_OR_NO_GO
+verify_wandb_receipt "$receipt_run" 2 GO_OR_NO_GO
+if verify_wandb_receipt "$receipt_run" 2 >/dev/null 2>&1; then
+    printf 'Main-style verification accepted a NO-GO WandB receipt.\n' >&2
+    exit 1
+fi
+unset WANDB_OUTCOME
+
 # Smoke is an independent outer attempt and stops after exactly two steps.
 : >"$CALLS"
 prepare_preflight smoke
@@ -285,7 +324,7 @@ mapfile -t smoke_jobs < <(grep '^run_job|' "$CALLS")
 [[ "${#smoke_jobs[@]}" == 1 ]]
 [[ "${smoke_jobs[0]}" == "run_job|train|smoke|2||$BASE_DIGEST|eval=|rows=128|group=1" ]]
 ! grep -Eq 'run_job\|train\|(reproduce|control|cost_aware_gated)' "$CALLS"
-grep -q '^publish|.*|qwen-native-training-smoke|qwen-native-training-smoke-v3$' "$CALLS"
+grep -q '^publish|.*|qwen-native-training-smoke|qwen-native-training-smoke-v4$' "$CALLS"
 smoke_results="$NATIVE_TRAIN_RESULTS_ROOT/attempts/$(basename -- "$smoke_outer")"
 grep -Fxq 'stage_order=S2' "$smoke_results/contract.env"
 grep -Fxq 'decision=GO' "$smoke_results/contract.env"
@@ -432,7 +471,7 @@ for eval_key in val nq_test multihop; do
     [[ -s "$no_go_results/paired-ar-$eval_key/summary.json" ]]
     [[ ! -e "$no_go_results/paired-$eval_key" ]]
 done
-grep -q '^publish|.*|qwen-native-training-main|qwen-native-training-main-v3$' "$CALLS"
+grep -q '^publish|.*|qwen-native-training-main|qwen-native-training-main-v4$' "$CALLS"
 
 # GO alone is insufficient when fewer than eight groups provide cost contrast.
 : >"$CALLS"

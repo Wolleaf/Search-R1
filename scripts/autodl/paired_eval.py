@@ -38,7 +38,7 @@ REQUIRED_FIELDS = frozenset({
     "posthoc_utility",
 })
 PASSTHROUGH_FIELDS = ("checkpoint_digest", "raw_trajectory", "turns")
-V3_REPORT_FIELDS = (
+NATIVE_REPORT_FIELDS = (
     "response_tokens",
     "action_count",
     "invalid_action_count",
@@ -64,8 +64,36 @@ FORMAL_STAGE_NAMES = {
     "control": "qwen_native_b",
     "cost_aware_gated": "qwen_native_c",
 }
+V4_PROMPT_VERSION = "qwen35-native-search-v4-terminal-answer-only"
 V3_PROMPT_VERSION = "qwen35-native-search-v3-original-aligned"
 V2_PROMPT_VERSION = "qwen35-native-search-v2-answer-tag"
+TERMINAL_PROMPT_VERSION = "qwen35-terminal-answer-v1"
+TERMINAL_PROMPT_TEXT = (
+    "The search budget is exhausted. You must not call the search tool again. "
+    "Using only the question and information already available, give your best "
+    "answer even if uncertain. After reasoning, output exactly one concise "
+    "final answer inside <answer> and </answer>, with no text after </answer>."
+)
+TERMINAL_PROMPT_SHA256 = (
+    "afc18b79afaafccece6927aec5ccd7898ef2ae17766bce7ffda244eef388d7f2"
+)
+V4_EVAL_ARTIFACTS = {
+    "val": {
+        "file": "val_128.parquet",
+        "rows": 128,
+        "stage_suffix": "val",
+    },
+    "nq_test_eval": {
+        "file": "nq_test_128_native_v4.parquet",
+        "rows": 128,
+        "stage_suffix": "nq_test",
+    },
+    "multihop_eval": {
+        "file": "multihop_eval_256_native_v4.parquet",
+        "rows": 256,
+        "stage_suffix": "multihop",
+    },
+}
 V3_EVAL_ARTIFACTS = {
     "val": {
         "file": "val_128.parquet",
@@ -196,7 +224,7 @@ def _load_formal_contract(args: argparse.Namespace) -> dict[str, Any] | None:
         if getattr(args, "eval_artifact", None) is not None:
             raise ValueError("--eval-artifact requires the formal evaluation arguments")
         if comparison_mode == "capability":
-            raise ValueError("A/R capability evaluation requires the formal v3 contract")
+            raise ValueError("A/R capability evaluation requires a formal native contract")
         return None
     if getattr(args, "cost_aware_old", None) is not None:
         raise ValueError("formal paired evaluation accepts only control and cost_aware_gated")
@@ -224,30 +252,45 @@ def _load_formal_contract(args: argparse.Namespace) -> dict[str, Any] | None:
             "formal data manifest must bind tool_protocol qwen35_native"
         )
     prompt_version = prompt_contract.get("prompt_version")
-    if prompt_version == V3_PROMPT_VERSION:
+    if prompt_version == V4_PROMPT_VERSION:
+        if manifest_schema_version != 5:
+            raise ValueError("native v4 prompt requires data manifest schema_version 5")
+        if (prompt_contract.get("terminal_answer_only") is not True
+                or prompt_contract.get("terminal_prompt_version") !=
+                TERMINAL_PROMPT_VERSION
+                or prompt_contract.get("terminal_prompt_sha256") !=
+                TERMINAL_PROMPT_SHA256):
+            raise ValueError("native v4 terminal prompt contract mismatch")
+        native_contract_version = "v4"
+        artifact_specs = V4_EVAL_ARTIFACTS
+    elif prompt_version == V3_PROMPT_VERSION:
         if manifest_schema_version != 4:
             raise ValueError("native v3 prompt requires data manifest schema_version 4")
-        is_v3 = True
+        native_contract_version = "v3"
+        artifact_specs = V3_EVAL_ARTIFACTS
     elif prompt_version == V2_PROMPT_VERSION:
         if manifest_schema_version != 3:
             raise ValueError("legacy v2 prompt requires data manifest schema_version 3")
         if comparison_mode != "efficiency":
-            raise ValueError("A/R capability evaluation requires native v3 data")
-        is_v3 = False
+            raise ValueError("A/R capability evaluation requires native data")
+        native_contract_version = None
+        artifact_specs = None
     else:
         raise ValueError(f"unsupported formal prompt_version: {prompt_version!r}")
+    is_native_endpoint = native_contract_version is not None
     eval_artifact = getattr(args, "eval_artifact", None)
-    if is_v3 and eval_artifact not in V3_EVAL_ARTIFACTS:
+    if is_native_endpoint and eval_artifact not in artifact_specs:
         raise ValueError(
-            "native v3 formal evaluation requires --eval-artifact with a sealed key"
+            f"native {native_contract_version} formal evaluation requires "
+            "--eval-artifact with a sealed key"
         )
-    if not is_v3 and eval_artifact is not None:
-        raise ValueError("--eval-artifact is supported only by the native v3 contract")
+    if not is_native_endpoint and eval_artifact is not None:
+        raise ValueError("--eval-artifact is supported only by a native contract")
 
     artifacts = manifest.get("artifacts")
     if not isinstance(artifacts, dict):
         raise ValueError("formal data manifest artifacts must be an object")
-    if is_v3:
+    if is_native_endpoint:
         tokenizer = manifest.get("tokenizer")
         if (
             not isinstance(tokenizer, dict)
@@ -256,9 +299,10 @@ def _load_formal_contract(args: argparse.Namespace) -> dict[str, Any] | None:
             or tokenizer.get("selection_observation_length") != 384
             or tokenizer.get("rollout_observation_length") != 500
         ):
-            raise ValueError("native v3 manifest tokenizer/observation contract mismatch")
+            raise ValueError("native manifest tokenizer/observation contract mismatch")
         assert eval_artifact is not None
-        artifact_spec = V3_EVAL_ARTIFACTS[eval_artifact]
+        assert artifact_specs is not None
+        artifact_spec = artifact_specs[eval_artifact]
         selected_artifact = artifacts.get(eval_artifact)
         if not isinstance(selected_artifact, dict):
             raise ValueError(
@@ -292,7 +336,7 @@ def _load_formal_contract(args: argparse.Namespace) -> dict[str, Any] | None:
             )
         if getattr(args, "catalog", None) is not None:
             raise ValueError(
-                "native v3 formal evaluation replays the selected Parquet; omit --catalog"
+                "native formal evaluation replays the selected Parquet; omit --catalog"
             )
         catalog_path = None
         catalog_digest = None
@@ -302,13 +346,13 @@ def _load_formal_contract(args: argparse.Namespace) -> dict[str, Any] | None:
                 "control": f"qwen_native_b_{stage_suffix}",
                 "cost_aware_gated": f"qwen_native_c_{stage_suffix}",
             }
-            mode = "qwen35_native_v3_b_c_efficiency"
+            mode = f"qwen35_native_{native_contract_version}_b_c_efficiency"
         else:
             stage_names = {
                 "parent": f"qwen_native_a_{stage_suffix}",
                 "reproduced": f"qwen_native_r_{stage_suffix}",
             }
-            mode = "qwen35_native_v3_a_r_capability"
+            mode = f"qwen35_native_{native_contract_version}_a_r_capability"
         artifact_key = eval_artifact
     else:
         if args.expected_rows != 128:
@@ -380,6 +424,7 @@ def _load_formal_contract(args: argparse.Namespace) -> dict[str, Any] | None:
         "artifact_sha256": artifact_digest,
         "mode": mode,
         "comparison_mode": comparison_mode,
+        "native_contract_version": native_contract_version,
         "prompt_version": prompt_version,
         "stage_names": stage_names,
         "sample_ids": sample_ids,
@@ -472,11 +517,15 @@ def _require_nonnegative_int(record: dict[str, Any], field: str, location: str) 
     return value
 
 
-def _validate_v3_record(record: dict[str, Any], location: str) -> None:
+def _validate_native_record(
+    record: dict[str, Any], location: str, native_contract_version: str
+) -> None:
+    if native_contract_version not in {"v3", "v4"}:
+        raise ValueError("native contract version must be v3 or v4")
     try:
         validate_trace_record(record, expected_record_type="eval")
     except ValueError as error:
-        raise ValueError(f"invalid native v3 trajectory in {location}: {error}") from error
+        raise ValueError(f"invalid native trajectory in {location}: {error}") from error
     required = {
         "schema",
         "schema_version",
@@ -500,22 +549,22 @@ def _validate_v3_record(record: dict[str, Any], location: str) -> None:
     missing = sorted(required - record.keys())
     if missing:
         raise ValueError(
-            f"native v3 trace is missing fields in {location}: {', '.join(missing)}"
+            f"native trace is missing fields in {location}: {', '.join(missing)}"
         )
     if record["schema"] != "search-r1.trajectory" or record["schema_version"] != 3:
-        raise ValueError(f"native v3 trajectory schema mismatch in {location}")
+        raise ValueError(f"native trajectory schema mismatch in {location}")
     if record["record_type"] != "eval":
-        raise ValueError(f"native v3 endpoint trace must have record_type eval in {location}")
+        raise ValueError(f"native endpoint trace must have record_type eval in {location}")
     if "max_searches" in record:
-        raise ValueError(f"native v3 trace must not contain legacy max_searches in {location}")
+        raise ValueError(f"native trace must not contain legacy max_searches in {location}")
     if not isinstance(record["sample_id"], str) or not record["sample_id"]:
-        raise ValueError(f"native v3 sample_id must be a non-empty string in {location}")
+        raise ValueError(f"native sample_id must be a non-empty string in {location}")
     if record["group_uid"] != record["sample_id"]:
-        raise ValueError(f"native v3 group_uid must equal sample_id in {location}")
+        raise ValueError(f"native group_uid must equal sample_id in {location}")
     if record["group_size"] != ENDPOINT_EVAL_CONTRACT["group_size"]:
-        raise ValueError(f"native v3 endpoint group_size must be 1 in {location}")
+        raise ValueError(f"native endpoint group_size must be 1 in {location}")
     if record["group_slot"] != ENDPOINT_EVAL_CONTRACT["group_slot"]:
-        raise ValueError(f"native v3 endpoint group_slot must be 0 in {location}")
+        raise ValueError(f"native endpoint group_slot must be 0 in {location}")
 
     response_tokens = _require_nonnegative_int(record, "response_tokens", location)
     del response_tokens
@@ -537,10 +586,10 @@ def _validate_v3_record(record: dict[str, Any], location: str) -> None:
     max_actions = _require_nonnegative_int(record, "max_action_budget", location)
     action_count = _require_nonnegative_int(record, "action_count", location)
     if max_actions != 4:
-        raise ValueError(f"native v3 max_action_budget must be 4 in {location}")
+        raise ValueError(f"native max_action_budget must be 4 in {location}")
     if action_count > max_actions + 1:
         raise ValueError(
-            f"native v3 action_count exceeds its budget plus terminal generation in {location}"
+            f"native action_count exceeds its budget plus terminal generation in {location}"
         )
     if record["executed_search_count"] > action_count:
         raise ValueError(f"executed searches exceed action_count in {location}")
@@ -570,7 +619,12 @@ def _validate_v3_record(record: dict[str, Any], location: str) -> None:
                 or any(event.get("terminal_generation") is True
                        for event in events[:-1])):
             raise ValueError(
-                f"native v3 terminal generation is not auditable in {location}"
+                f"native terminal generation is not auditable in {location}"
+            )
+        if (native_contract_version == "v4"
+                and events[-1].get("terminal_instruction_applied") is not True):
+            raise ValueError(
+                f"native v4 terminal generation lacks answer-only evidence in {location}"
             )
 
 
@@ -580,7 +634,7 @@ def read_stage(
     max_searches: int,
     cost_lambda: float,
     utility_tolerance: float,
-    require_v3: bool = False,
+    native_contract_version: str | None = None,
 ) -> tuple[
     dict[tuple[str, str | int], dict[str, Any]],
     frozenset[str],
@@ -619,8 +673,9 @@ def read_stage(
                 cost_lambda,
                 utility_tolerance,
             )
-            if require_v3:
-                _validate_v3_record(record, location)
+            if native_contract_version is not None:
+                _validate_native_record(
+                    record, location, native_contract_version)
             key = _sample_key(record["sample_id"])
             if key in records:
                 raise ValueError(f"duplicate sample_id {record['sample_id']!r} in {path}")
@@ -703,7 +758,7 @@ def read_eval_parquet_catalog(
         import pyarrow.parquet as parquet
     except ImportError as error:
         raise ValueError(
-            "pyarrow is required to replay a native v3 endpoint artifact"
+            "pyarrow is required to replay a native endpoint artifact"
         ) from error
 
     rows = parquet.read_table(path).to_pylist()
@@ -871,7 +926,7 @@ def _stage_summary(records: list[dict[str, Any]], max_searches: int) -> dict[str
         "utility": total_utility / len(records),
         "search_distribution": distribution,
     }
-    if all(set(V3_REPORT_FIELDS).issubset(record) for record in records):
+    if all(set(NATIVE_REPORT_FIELDS).issubset(record) for record in records):
         summary.update({
             "mean_action_count": sum(record["action_count"] for record in records)
             / len(records),
@@ -998,7 +1053,7 @@ def _bootstrap_statistics(
             - sum(record["executed_search_count"] for record in control_correct)
             / len(control_correct)
         )
-    if all(set(V3_REPORT_FIELDS).issubset(row[baseline_role]) for row in rows):
+    if all(set(NATIVE_REPORT_FIELDS).issubset(row[baseline_role]) for row in rows):
         for name, field in (
             ("action_count", "action_count"),
             ("trajectory_tokens", "response_tokens"),
@@ -1207,10 +1262,10 @@ def analyze(args: argparse.Namespace) -> None:
     candidate_roles = active_roles[1:]
     comparison_mode = _comparison_mode(args)
     formal_contract = _load_formal_contract(args)
-    require_v3 = (
-        formal_contract is not None
-        and formal_contract["prompt_version"] == V3_PROMPT_VERSION
-    )
+    native_contract_version = (
+        formal_contract["native_contract_version"]
+        if formal_contract is not None else None)
+    require_native_trace = native_contract_version is not None
     paths = {role: Path(getattr(args, role)) for role in active_roles}
     records_by_role: dict[str, dict[tuple[str, str | int], dict[str, Any]]] = {}
     schemas: dict[str, frozenset[str]] = {}
@@ -1223,7 +1278,7 @@ def analyze(args: argparse.Namespace) -> None:
             args.max_searches,
             args.cost_lambda,
             args.utility_tolerance,
-            require_v3=require_v3,
+            native_contract_version=native_contract_version,
         )
         records_by_role[role] = records
         schemas[role] = schema
@@ -1266,7 +1321,7 @@ def analyze(args: argparse.Namespace) -> None:
                 f"sample-set mismatch between {baseline_role} and {role}; "
                 f"missing={missing}, extra={extra}"
             )
-        if require_v3 and stage_orders[role] != stage_orders[baseline_role]:
+        if require_native_trace and stage_orders[role] != stage_orders[baseline_role]:
             raise ValueError(
                 f"sample order mismatch between {baseline_role} and {role}"
             )
@@ -1281,7 +1336,7 @@ def analyze(args: argparse.Namespace) -> None:
             f"missing={missing}, extra={extra}"
         )
     if (
-        require_v3
+        require_native_trace
         and stage_orders[baseline_role] != formal_contract["sample_keys_order"]
     ):
         raise ValueError(
@@ -1291,7 +1346,7 @@ def analyze(args: argparse.Namespace) -> None:
 
     catalog_argument = getattr(args, "catalog", None)
     catalog_path = Path(catalog_argument) if catalog_argument is not None else None
-    if require_v3:
+    if require_native_trace:
         artifact_catalog, artifact_order = read_eval_parquet_catalog(
             formal_contract["artifact_path"], args.expected_rows
         )
@@ -1306,7 +1361,8 @@ def analyze(args: argparse.Namespace) -> None:
 
     paired: list[dict[str, dict[str, Any]]] = []
     paired_order = (
-        formal_contract["sample_keys_order"] if require_v3 else sorted(baseline_ids)
+        formal_contract["sample_keys_order"]
+        if require_native_trace else sorted(baseline_ids)
     )
     for sample_key in paired_order:
         row = {role: records_by_role[role][sample_key] for role in active_roles}
@@ -1324,7 +1380,8 @@ def analyze(args: argparse.Namespace) -> None:
         paired.append(row)
 
     optional_fields = [field for field in PASSTHROUGH_FIELDS if field in baseline_schema]
-    report_fields = [field for field in V3_REPORT_FIELDS if field in baseline_schema]
+    report_fields = [
+        field for field in NATIVE_REPORT_FIELDS if field in baseline_schema]
     paired_fields = ["sample_id", "question", "gold_answers"]
     for role in active_roles:
         paired_fields.extend([
@@ -1441,7 +1498,9 @@ def analyze(args: argparse.Namespace) -> None:
                 })
 
     summary: dict[str, Any] = {
-        "schema_version": 2 if require_v3 else 1,
+        "schema_version": (
+            3 if native_contract_version == "v4" else
+            2 if native_contract_version == "v3" else 1),
         "report_type": (
             "parent_reproduced_capability"
             if comparison_mode == "capability"
@@ -1472,6 +1531,7 @@ def analyze(args: argparse.Namespace) -> None:
     if formal_contract is not None:
         formal_summary: dict[str, Any] = {
             "mode": formal_contract["mode"],
+            "native_contract_version": formal_contract["native_contract_version"],
             "data_manifest": {
                 "path": str(formal_contract["manifest_path"]),
                 "sha256": formal_contract["manifest_sha256"],
@@ -1493,9 +1553,10 @@ def analyze(args: argparse.Namespace) -> None:
             "sha256": formal_contract["artifact_sha256"],
             "sample_ids_sha256": formal_contract["sample_ids_sha256"],
             "sample_set_status": "exact",
-            "sample_order_status": "exact" if require_v3 else "not_checked",
+            "sample_order_status": (
+                "exact" if require_native_trace else "not_checked"),
         }
-        if require_v3:
+        if require_native_trace:
             artifact_summary["path"] = str(formal_contract["artifact_path"])
             artifact_summary["parquet_replay_status"] = "passed"
             formal_summary["evaluation_artifact"] = artifact_summary
@@ -1525,7 +1586,7 @@ def analyze(args: argparse.Namespace) -> None:
         summary["comparisons"][candidate_role] = _comparison_summary(
             paired, baseline_role, candidate_role
         )
-        if require_v3:
+        if require_native_trace:
             summary["comparisons"][candidate_role]["paired_bootstrap"] = (
                 _paired_bootstrap(paired, baseline_role, candidate_role)
             )
@@ -1574,7 +1635,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--reproduced", type=Path)
     parser.add_argument("--catalog", type=Path)
     parser.add_argument("--data-manifest", type=Path)
-    parser.add_argument("--eval-artifact", choices=tuple(V3_EVAL_ARTIFACTS))
+    parser.add_argument("--eval-artifact", choices=tuple(V4_EVAL_ARTIFACTS))
     parser.add_argument("--expected-control-checkpoint-digest")
     parser.add_argument("--expected-cost-aware-gated-checkpoint-digest")
     parser.add_argument("--expected-parent-checkpoint-digest")

@@ -7,13 +7,13 @@ ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$ROOT"' EXIT
 
 mkdir -p "$ROOT/envs/train/bin" "$ROOT/models/Qwen3.5-2B" "$ROOT/data/nq_small" \
-    "$ROOT/data/search_mix" "$ROOT/data/search_mix_qwen35_native_v3" \
+    "$ROOT/data/search_mix" "$ROOT/data/search_mix_qwen35_native_v4" \
     "$ROOT/parent-checkpoint" "$ROOT/output" "$ROOT/traces"
 printf 'parquet-placeholder\n' >"$ROOT/data/search-opportunity.parquet"
 printf 'parquet-placeholder\n' >"$ROOT/data/group-probe.parquet"
 for file in probe_autonomous_16.parquet val_128.parquet \
-    nq_test_128_native_v3.parquet multihop_eval_256_native_v3.parquet; do
-    printf 'parquet-placeholder\n' >"$ROOT/data/search_mix_qwen35_native_v3/$file"
+    nq_test_128_native_v4.parquet multihop_eval_256_native_v4.parquet; do
+    printf 'parquet-placeholder\n' >"$ROOT/data/search_mix_qwen35_native_v4/$file"
 done
 ln -s "$CHECKOUT" "$ROOT/checkout"
 cat >"$ROOT/envs/train/bin/python" <<'SH'
@@ -130,13 +130,13 @@ grep -Fxq -- 'data.max_prompt_length=4096' "$CAPTURE"
 grep -Fxq -- "data.train_files=$ROOT/data/search_mix/train_512.parquet" "$CAPTURE"
 
 env "${COMMON[@]}" \
-    DATA_DIR="$ROOT/data/search_mix_qwen35_native_v3" \
+    DATA_DIR="$ROOT/data/search_mix_qwen35_native_v4" \
     TOOL_PROTOCOL=qwen35_native \
-    EVAL_DATA_FILE="$ROOT/data/search_mix_qwen35_native_v3/probe_autonomous_16.parquet" \
+    EVAL_DATA_FILE="$ROOT/data/search_mix_qwen35_native_v4/probe_autonomous_16.parquet" \
     EVAL_GROUP_SIZE=2 \
     bash "$AUTODL_DIR/train_small_grpo.sh" \
     eval qwen_native_g1 "$ROOT/models/Qwen3.5-2B"
-grep -Fxq -- "data.train_files=$ROOT/data/search_mix_qwen35_native_v3/train_512.parquet" "$CAPTURE"
+grep -Fxq -- "data.train_files=$ROOT/data/search_mix_qwen35_native_v4/train_512.parquet" "$CAPTURE"
 grep -Fxq -- 'actor_rollout_ref.rollout.top_k=0' "$CAPTURE"
 grep -Fxq -- 'actor_rollout_ref.rollout.presence_penalty=0.0' "$CAPTURE"
 grep -Fxq -- '++tool_protocol=qwen35_native' "$CAPTURE"
@@ -148,33 +148,33 @@ for spec in \
     'qwen_native_r_val|val_128.parquet' \
     'qwen_native_b_val|val_128.parquet' \
     'qwen_native_c_val|val_128.parquet' \
-    'qwen_native_a_nq_test|nq_test_128_native_v3.parquet' \
-    'qwen_native_r_nq_test|nq_test_128_native_v3.parquet' \
-    'qwen_native_b_nq_test|nq_test_128_native_v3.parquet' \
-    'qwen_native_c_nq_test|nq_test_128_native_v3.parquet' \
-    'qwen_native_a_multihop|multihop_eval_256_native_v3.parquet' \
-    'qwen_native_r_multihop|multihop_eval_256_native_v3.parquet' \
-    'qwen_native_b_multihop|multihop_eval_256_native_v3.parquet' \
-    'qwen_native_c_multihop|multihop_eval_256_native_v3.parquet'; do
+    'qwen_native_a_nq_test|nq_test_128_native_v4.parquet' \
+    'qwen_native_r_nq_test|nq_test_128_native_v4.parquet' \
+    'qwen_native_b_nq_test|nq_test_128_native_v4.parquet' \
+    'qwen_native_c_nq_test|nq_test_128_native_v4.parquet' \
+    'qwen_native_a_multihop|multihop_eval_256_native_v4.parquet' \
+    'qwen_native_r_multihop|multihop_eval_256_native_v4.parquet' \
+    'qwen_native_b_multihop|multihop_eval_256_native_v4.parquet' \
+    'qwen_native_c_multihop|multihop_eval_256_native_v4.parquet'; do
     IFS='|' read -r endpoint_variant endpoint_file <<<"$spec"
     env "${COMMON[@]}" \
-        DATA_DIR="$ROOT/data/search_mix_qwen35_native_v3" \
+        DATA_DIR="$ROOT/data/search_mix_qwen35_native_v4" \
         TOOL_PROTOCOL=qwen35_native \
         bash "$AUTODL_DIR/train_small_grpo.sh" \
         eval "$endpoint_variant" "$ROOT/parent-checkpoint"
     grep -Fxq -- \
-        "data.val_files=$ROOT/data/search_mix_qwen35_native_v3/$endpoint_file" \
+        "data.val_files=$ROOT/data/search_mix_qwen35_native_v4/$endpoint_file" \
         "$CAPTURE"
     grep -Fxq -- 'data.eval_group_size=1' "$CAPTURE"
     grep -Fxq -- 'actor_rollout_ref.rollout.do_sample=false' "$CAPTURE"
 done
 
 env "${COMMON[@]}" \
-    DATA_DIR="$ROOT/data/search_mix_qwen35_native_v3" \
+    DATA_DIR="$ROOT/data/search_mix_qwen35_native_v4" \
     TOOL_PROTOCOL=qwen35_native \
     bash "$AUTODL_DIR/train_small_grpo.sh" train smoke 2
-grep -Fxq -- "data.train_files=$ROOT/data/search_mix_qwen35_native_v3/train_512.parquet" "$CAPTURE"
-grep -Fxq -- "data.val_files=$ROOT/data/search_mix_qwen35_native_v3/val_128.parquet" "$CAPTURE"
+grep -Fxq -- "data.train_files=$ROOT/data/search_mix_qwen35_native_v4/train_512.parquet" "$CAPTURE"
+grep -Fxq -- "data.val_files=$ROOT/data/search_mix_qwen35_native_v4/val_128.parquet" "$CAPTURE"
 grep -Fxq -- 'data.train_batch_size=8' "$CAPTURE"
 grep -Fxq -- 'data.val_batch_size=8' "$CAPTURE"
 grep -Fxq -- 'data.max_response_length=500' "$CAPTURE"
@@ -189,11 +189,11 @@ grep -Fxq -- 'actor_rollout_ref.rollout.presence_penalty=0.0' "$CAPTURE"
 grep -Fxq -- 'actor_rollout_ref.rollout.repetition_penalty=1.0' "$CAPTURE"
 grep -Fxq -- 'actor_rollout_ref.rollout.do_sample=true' "$CAPTURE"
 grep -Fxq -- 'data.return_raw_chat=true' "$CAPTURE"
-grep -Fxq -- '++qwen35_prompt_version=qwen35-native-search-v3-original-aligned' "$CAPTURE"
+grep -Fxq -- '++qwen35_prompt_version=qwen35-native-search-v4-terminal-answer-only' "$CAPTURE"
 grep -Fxq -- '++trainer.native_training_variant=smoke' "$CAPTURE"
 
 env "${COMMON[@]}" \
-    DATA_DIR="$ROOT/data/search_mix_qwen35_native_v3" \
+    DATA_DIR="$ROOT/data/search_mix_qwen35_native_v4" \
     TOOL_PROTOCOL=qwen35_native \
     bash "$AUTODL_DIR/train_small_grpo.sh" train reproduce 60
 grep -Fxq -- 'trainer.total_training_steps=60' "$CAPTURE"
@@ -201,7 +201,7 @@ grep -Fxq -- "actor_rollout_ref.model.path=$ROOT/models/Qwen3.5-2B" "$CAPTURE"
 grep -Fxq -- '++trainer.native_training_variant=reproduce' "$CAPTURE"
 
 env "${COMMON[@]}" \
-    DATA_DIR="$ROOT/data/search_mix_qwen35_native_v3" \
+    DATA_DIR="$ROOT/data/search_mix_qwen35_native_v4" \
     TOOL_PROTOCOL=qwen35_native \
     bash "$AUTODL_DIR/train_small_grpo.sh" \
     train control 20 "$ROOT/parent-checkpoint"
@@ -211,7 +211,7 @@ grep -Fxq -- "actor_rollout_ref.model.path=$ROOT/parent-checkpoint" "$CAPTURE"
 grep -Fxq -- '++trainer.native_training_variant=control' "$CAPTURE"
 
 env "${COMMON[@]}" \
-    DATA_DIR="$ROOT/data/search_mix_qwen35_native_v3" \
+    DATA_DIR="$ROOT/data/search_mix_qwen35_native_v4" \
     TOOL_PROTOCOL=qwen35_native \
     bash "$AUTODL_DIR/train_small_grpo.sh" \
     train cost_aware_gated 20 "$ROOT/parent-checkpoint"
@@ -241,26 +241,26 @@ expect_exit_64 env "${COMMON[@]}" \
     eval group_probe "$ROOT/models/Qwen3.5-2B"
 expect_exit_64 env "${COMMON[@]}" \
     DATA_DIR="$ROOT/data/search_mix" TOOL_PROTOCOL=qwen35_native \
-    EVAL_DATA_FILE="$ROOT/data/search_mix_qwen35_native_v3/probe_autonomous_16.parquet" \
+    EVAL_DATA_FILE="$ROOT/data/search_mix_qwen35_native_v4/probe_autonomous_16.parquet" \
     EVAL_GROUP_SIZE=2 \
     bash "$AUTODL_DIR/train_small_grpo.sh" \
     eval qwen_native_g1 "$ROOT/models/Qwen3.5-2B"
 expect_exit_64 env "${COMMON[@]}" \
-    DATA_DIR="$ROOT/data/search_mix_qwen35_native_v3" TOOL_PROTOCOL=qwen35_native \
+    DATA_DIR="$ROOT/data/search_mix_qwen35_native_v4" TOOL_PROTOCOL=qwen35_native \
     bash "$AUTODL_DIR/train_small_grpo.sh" \
     train reproduce 2
 expect_exit_64 env "${COMMON[@]}" \
-    DATA_DIR="$ROOT/data/search_mix_qwen35_native_v3" TOOL_PROTOCOL=qwen35_native \
+    DATA_DIR="$ROOT/data/search_mix_qwen35_native_v4" TOOL_PROTOCOL=qwen35_native \
     bash "$AUTODL_DIR/train_small_grpo.sh" \
     train cost_aware 20 "$ROOT/parent-checkpoint"
 expect_exit_64 env "${COMMON[@]}" GPU_COUNT=1 \
-    DATA_DIR="$ROOT/data/search_mix_qwen35_native_v3" TOOL_PROTOCOL=qwen35_native \
+    DATA_DIR="$ROOT/data/search_mix_qwen35_native_v4" TOOL_PROTOCOL=qwen35_native \
     bash "$AUTODL_DIR/train_small_grpo.sh" train smoke 2
 expect_exit_64 env "${COMMON[@]}" TRAIN_BATCH_SIZE=4 \
-    DATA_DIR="$ROOT/data/search_mix_qwen35_native_v3" TOOL_PROTOCOL=qwen35_native \
+    DATA_DIR="$ROOT/data/search_mix_qwen35_native_v4" TOOL_PROTOCOL=qwen35_native \
     bash "$AUTODL_DIR/train_small_grpo.sh" train smoke 2
 expect_exit_64 env "${COMMON[@]}" MAX_RESPONSE_LENGTH=384 \
-    DATA_DIR="$ROOT/data/search_mix_qwen35_native_v3" TOOL_PROTOCOL=qwen35_native \
+    DATA_DIR="$ROOT/data/search_mix_qwen35_native_v4" TOOL_PROTOCOL=qwen35_native \
     bash "$AUTODL_DIR/train_small_grpo.sh" train smoke 2
 
 if env "${COMMON[@]}" \

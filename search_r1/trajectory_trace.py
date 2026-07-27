@@ -12,6 +12,9 @@ from typing import Any, Dict, List, Mapping, Optional, Set
 
 from search_r1.llm_agent.tool_protocol import (
     QWEN35_REASONING_CONTINUATION,
+    QWEN35_TERMINAL_PROMPT,
+    QWEN35_TERMINAL_PROMPT_SHA256,
+    QWEN35_TERMINAL_PROMPT_VERSION,
     locate_qwen35_action_boundary,
 )
 
@@ -494,6 +497,8 @@ def validate_trace_record(record: Mapping[str, Any],
                 raise ValueError(
                     "terminal generation event is not marked or executed retrieval"
                 )
+            if terminal_event.get("terminal_instruction_applied") is True:
+                _validate_terminal_answer_only_event(terminal_event)
         elif terminal_generations or terminal_events:
             raise ValueError(
                 "terminal generation is only valid after max_action_budget")
@@ -517,6 +522,57 @@ def validate_trace_record(record: Mapping[str, Any],
             raise ValueError("group_reward_std must be non-negative")
     else:
         _require_string(record["checkpoint_digest"], "checkpoint_digest")
+
+
+def _validate_terminal_answer_only_event(event: Mapping[str, Any]) -> None:
+    """Validate the auditable v4 terminal instruction and allowlist result."""
+    expected = {
+        "terminal_prompt_version": QWEN35_TERMINAL_PROMPT_VERSION,
+        "terminal_prompt_sha256": QWEN35_TERMINAL_PROMPT_SHA256,
+        "terminal_prompt_text": QWEN35_TERMINAL_PROMPT,
+        "terminal_prompt_policy_token_count": 0,
+        "generation_context": "terminal_answer",
+        "done": True,
+        "executed_search": False,
+    }
+    for name, value in expected.items():
+        if event.get(name) != value:
+            raise ValueError(
+                f"terminal answer-only event has invalid {name}")
+    _require_int(event.get("terminal_followup_token_count"),
+                 "terminal_followup_token_count",
+                 minimum=1)
+    actual_digest = hashlib.sha256(
+        event["terminal_prompt_text"].encode("utf-8")).hexdigest()
+    if actual_digest != event["terminal_prompt_sha256"]:
+        raise ValueError("terminal prompt text does not match its SHA-256")
+
+    requested_action = event.get("requested_action")
+    action = event.get("action")
+    parse_error = event.get("parse_error")
+    rejection = event.get("terminal_rejection_reason")
+    valid_action = event.get("valid_action")
+    if requested_action == "answer":
+        if parse_error is None:
+            if (action != "answer" or rejection is not None
+                    or valid_action is not True):
+                raise ValueError(
+                    "terminal answer was not accepted consistently")
+        elif (action is not None or not isinstance(parse_error, str)
+              or not parse_error or rejection != parse_error
+              or valid_action is not False):
+            raise ValueError(
+                "terminal invalid answer was not rejected consistently")
+    elif requested_action == "search":
+        if (action is not None
+                or parse_error != "search_disallowed_after_budget"
+                or rejection != "search_disallowed_after_budget"
+                or valid_action is not False):
+            raise ValueError("terminal search was not rejected consistently")
+    elif (requested_action is not None or action is not None
+          or not isinstance(parse_error, str) or not parse_error
+          or rejection != parse_error or valid_action is not False):
+        raise ValueError("terminal invalid action was not rejected consistently")
 
 
 def _canonical_json(value: Mapping[str, Any]) -> bytes:

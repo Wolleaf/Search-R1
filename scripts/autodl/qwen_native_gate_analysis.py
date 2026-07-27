@@ -25,10 +25,15 @@ import qa_em  # noqa: E402
 
 
 SCHEMA = "search-r1.qwen-native-gate"
-SCHEMA_VERSION = 3
-ACTIVE_PROMPT_VERSION = "qwen35-native-search-v3-original-aligned"
-ACTIVE_DATA_SCHEMA_VERSION = 4
+SCHEMA_VERSION = 4
+ACTIVE_PROMPT_VERSION = "qwen35-native-search-v4-terminal-answer-only"
+ACTIVE_DATA_SCHEMA_VERSION = 5
 LEGACY_DATA_SCHEMA_VERSION = 3
+ACTIVE_PROTOCOL_PROBE_SCHEMA_VERSION = 4
+TERMINAL_PROMPT_VERSION = "qwen35-terminal-answer-v1"
+TERMINAL_PROMPT_SHA256 = (
+    "afc18b79afaafccece6927aec5ccd7898ef2ae17766bce7ffda244eef388d7f2"
+)
 STAGE_SHAPES = {
     "g0_g1": (16, 2),
     "g2": (32, 3),
@@ -159,18 +164,25 @@ def load_data_contract(
         return sample_ids
 
     question_count, _ = STAGE_SHAPES[stage]
-    active_v3 = (data_schema_version == ACTIVE_DATA_SCHEMA_VERSION
-                 and prompt_contract.get("prompt_version") == ACTIVE_PROMPT_VERSION)
-    if ((data_schema_version == ACTIVE_DATA_SCHEMA_VERSION) != active_v3
+    active_v4 = (
+        data_schema_version == ACTIVE_DATA_SCHEMA_VERSION
+        and prompt_contract.get("prompt_version") == ACTIVE_PROMPT_VERSION
+        and prompt_contract.get("terminal_answer_only") is True
+        and prompt_contract.get("terminal_prompt_version") ==
+        TERMINAL_PROMPT_VERSION
+        and prompt_contract.get("terminal_prompt_sha256") ==
+        TERMINAL_PROMPT_SHA256
+    )
+    if ((data_schema_version == ACTIVE_DATA_SCHEMA_VERSION) != active_v4
             or (prompt_contract.get("prompt_version") == ACTIVE_PROMPT_VERSION
-                and not active_v3)):
+                and not active_v4)):
         raise ValueError("Qwen native data schema/prompt version mismatch")
     artifact_label = STAGE_ARTIFACTS[stage]
-    if stage == "g0_g1" and not active_v3:
+    if stage == "g0_g1" and not active_v4:
         artifact_label = "probe_forced"
     expected_ids = artifact_ids(artifact_label, question_count)
     g0_ids = artifact_ids("probe_g0", 8) if stage == "g0_g1" else []
-    return expected_ids, questions, gold_answers, g0_ids, active_v3
+    return expected_ids, questions, gold_answers, g0_ids, active_v4
 
 
 def ratio(numerator: int, denominator: int) -> float:
@@ -208,7 +220,7 @@ def trace_key(record: Mapping[str, Any]) -> tuple[str, int]:
 def validate_traces(records: list[dict[str, Any]], stage: str,
                     checkpoint_digest: str, expected_ids: Sequence[str],
                     expected_questions: Mapping[str, str],
-                    active_v3: bool = False) -> None:
+                    active_v4: bool = False) -> None:
     questions, group_size = STAGE_SHAPES[stage]
     expected_rows = questions * group_size
     if len(records) != expected_rows:
@@ -232,14 +244,14 @@ def validate_traces(records: list[dict[str, Any]], stage: str,
         if record.get("executed_search_count") != sum(
                 turn.get("retrieval_executed") is True for turn in record["turns"]):
             raise ValueError(f"executed search count is not aligned for {key}")
-        if active_v3:
+        if active_v4:
             events = record.get("generation_events")
             retrievals = record.get("retrieval_events")
             action_count = record.get("action_count")
             if record.get("schema_version") != 3:
-                raise ValueError(f"active v3 trace schema mismatch for {key}")
+                raise ValueError(f"active v4 trace schema mismatch for {key}")
             if not isinstance(events, list) or not isinstance(retrievals, list):
-                raise ValueError(f"active v3 events are missing for {key}")
+                raise ValueError(f"active v4 events are missing for {key}")
             if (record.get("max_action_budget") != 4
                     or isinstance(action_count, bool)
                     or not isinstance(action_count, int)
@@ -247,9 +259,9 @@ def validate_traces(records: list[dict[str, Any]], stage: str,
                     or action_count > 5
                     or "max_searches" in record
                     or "terminal_search_request" in record):
-                raise ValueError(f"active v3 action-budget contract mismatch for {key}")
+                raise ValueError(f"active v4 action-budget contract mismatch for {key}")
             if not all(isinstance(event, Mapping) for event in events):
-                raise ValueError(f"active v3 generation events are invalid for {key}")
+                raise ValueError(f"active v4 generation events are invalid for {key}")
             terminal_indices = [
                 index for index, event in enumerate(events)
                 if event.get("terminal_generation") is True
@@ -258,19 +270,58 @@ def validate_traces(records: list[dict[str, Any]], stage: str,
                 if (terminal_indices != [4]
                         or events[-1].get("executed_search") is not False):
                     raise ValueError(
-                        f"active v3 terminal generation contract mismatch for {key}")
+                        f"active v4 terminal generation contract mismatch for {key}")
+                terminal = events[-1]
+                if (terminal.get("terminal_instruction_applied") is not True
+                        or terminal.get("terminal_prompt_version") !=
+                        TERMINAL_PROMPT_VERSION
+                        or terminal.get("terminal_prompt_sha256") !=
+                        TERMINAL_PROMPT_SHA256
+                        or terminal.get("terminal_prompt_policy_token_count") != 0
+                        or terminal.get("generation_context") != "terminal_answer"):
+                    raise ValueError(
+                        f"active v4 terminal answer-only contract mismatch for {key}")
+                requested_action = terminal.get("requested_action")
+                if requested_action == "answer":
+                    terminal_result_valid = (
+                        terminal.get("action") == "answer"
+                        and terminal.get("parse_error") is None
+                        and terminal.get("terminal_rejection_reason") is None
+                        and terminal.get("valid_action") is True
+                    )
+                elif requested_action == "search":
+                    terminal_result_valid = (
+                        terminal.get("action") is None
+                        and terminal.get("parse_error") ==
+                        "search_disallowed_after_budget"
+                        and terminal.get("terminal_rejection_reason") ==
+                        "search_disallowed_after_budget"
+                        and terminal.get("valid_action") is False
+                    )
+                else:
+                    parse_error = terminal.get("parse_error")
+                    terminal_result_valid = (
+                        requested_action is None
+                        and terminal.get("action") is None
+                        and isinstance(parse_error, str) and bool(parse_error)
+                        and terminal.get("terminal_rejection_reason") == parse_error
+                        and terminal.get("valid_action") is False
+                    )
+                if not terminal_result_valid:
+                    raise ValueError(
+                        f"active v4 terminal allowlist result mismatch for {key}")
             elif terminal_indices:
                 raise ValueError(
-                    f"active v3 terminal generation appears before budget exhaustion for {key}")
+                    f"active v4 terminal generation appears before budget exhaustion for {key}")
             if record.get("executed_search_count") != len(retrievals):
-                raise ValueError(f"active v3 retrieval count mismatch for {key}")
+                raise ValueError(f"active v4 retrieval count mismatch for {key}")
             for name in ("policy_token_count", "observation_token_count",
                          "observation_policy_token_count"):
                 value = record.get(name)
                 if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-                    raise ValueError(f"active v3 {name} is invalid for {key}")
+                    raise ValueError(f"active v4 {name} is invalid for {key}")
             if not isinstance(record.get("info_mask_consistent"), bool):
-                raise ValueError(f"active v3 info-mask evidence is missing for {key}")
+                raise ValueError(f"active v4 info-mask evidence is missing for {key}")
     if set(groups) != set(expected_ids):
         raise ValueError(f"{stage} trace sample IDs do not match the fixed data artifact")
     expected_slots = set(range(group_size))
@@ -456,7 +507,9 @@ def trace_structure(record: Mapping[str, Any]) -> dict[str, Any]:
         if not isinstance(event, Mapping):
             continue
         context = event.get("generation_context")
-        if context not in {"initial_question", "tool_response", "user_retry"}:
+        if context not in {
+                "initial_question", "tool_response", "user_retry",
+                "terminal_answer"}:
             context = "initial_question" if index == 0 else "unknown"
         thinking.append(_thinking_diagnostic(event, str(context)))
     return {
@@ -481,10 +534,14 @@ def trace_diagnostics(record: Mapping[str, Any]) -> dict[str, Any]:
         if (isinstance(event, Mapping)
             and event.get("terminal_generation") is True)
     } if isinstance(events, list) else set())
+    terminal_events = [
+        event for event in events
+        if (isinstance(event, Mapping)
+            and event.get("terminal_generation") is True)
+    ] if isinstance(events, list) else []
     terminal_search_turns = [
-        turn for turn in turns
-        if (turn.get("action") == "search"
-            and turn.get("generation_turn") in terminal_turn_ids)
+        event for event in terminal_events
+        if event.get("requested_action") == "search"
     ]
     search_turns = [
         turn for turn in turns
@@ -514,6 +571,27 @@ def trace_diagnostics(record: Mapping[str, Any]) -> dict[str, Any]:
         "first_turn_clipped": first_turn_clipped(record),
         "search_turn_count": len(search_turns),
         "terminal_search_request_count": len(terminal_search_turns),
+        "terminal_generation_count": len(terminal_events),
+        "terminal_instruction_applied_count": sum(
+            event.get("terminal_instruction_applied") is True
+            for event in terminal_events),
+        "terminal_answer_count": sum(
+            event.get("requested_action") == "answer"
+            and event.get("action") == "answer"
+            and event.get("parse_error") is None
+            for event in terminal_events),
+        "terminal_invalid_count": sum(
+            event.get("requested_action") not in {"answer", "search"}
+            for event in terminal_events),
+        "terminal_accepted_search_count": sum(
+            event.get("action") == "search"
+            and event.get("parse_error") is None
+            for event in terminal_events),
+        "terminal_executed_search_count": sum(
+            event.get("executed_search") is True for event in terminal_events),
+        "terminal_prompt_policy_token_count": sum(
+            int(event.get("terminal_prompt_policy_token_count", 0))
+            for event in terminal_events),
         "aligned_tool_response_count": len(aligned),
         "degenerate_search_count": sum(query_is_degenerate(query) for query in queries),
         "repeated_query_count": len(normalized_queries) - len(set(normalized_queries)),
@@ -532,18 +610,19 @@ def trace_diagnostics(record: Mapping[str, Any]) -> dict[str, Any]:
 
 def analyze_protocol_probe(directory: Path, expected_sample_ids: Sequence[str],
                            checkpoint_digest: str,
-                           active_v3: bool = True) -> tuple[dict[str, Any],
+                           active_v4: bool = True) -> tuple[dict[str, Any],
                                                             list[dict[str, Any]]]:
     manifest = load_json(directory / "manifest.json")
     records = load_jsonl(directory / "records.jsonl")
     resolved = load_json(directory / "resolved-config.json")
     version = manifest.get("schema_version")
     if manifest.get("schema") != "search-r1.qwen-native-protocol-probe" \
-            or version not in {1, 3}:
+            or version not in {1, ACTIVE_PROTOCOL_PROBE_SCHEMA_VERSION}:
         raise ValueError("G0 protocol probe manifest schema mismatch")
-    if active_v3 and version != 3:
-        raise ValueError("active v3 gate requires a v3 protocol probe")
-    expected_modes = (("direct", "native_manager") if version == 3 else
+    if active_v4 and version != ACTIVE_PROTOCOL_PROBE_SCHEMA_VERSION:
+        raise ValueError("active v4 gate requires a v4 protocol probe")
+    expected_modes = (("direct", "native_manager")
+                      if version == ACTIVE_PROTOCOL_PROBE_SCHEMA_VERSION else
                       ("direct", "native_manager", "legacy_manager"))
     expected_mode_counts = {mode: 16 for mode in expected_modes}
     if manifest.get("mode_counts") != expected_mode_counts:
@@ -565,10 +644,15 @@ def analyze_protocol_probe(directory: Path, expected_sample_ids: Sequence[str],
     }
     if resolved.get("sampling") != expected_sampling:
         raise ValueError("G0 protocol probe sampling config mismatch")
-    if version == 3 and (resolved.get("prompt_version") != ACTIVE_PROMPT_VERSION
-                         or resolved.get("max_action_budget") != 4
-                         or resolved.get("max_obs_length") != 500):
-        raise ValueError("G0 v3 protocol probe contract mismatch")
+    if version == ACTIVE_PROTOCOL_PROBE_SCHEMA_VERSION and (
+            resolved.get("prompt_version") != ACTIVE_PROMPT_VERSION
+            or resolved.get("terminal_answer_only") is not True
+            or resolved.get("terminal_prompt_version") !=
+            TERMINAL_PROMPT_VERSION
+            or resolved.get("terminal_prompt_sha256") != TERMINAL_PROMPT_SHA256
+            or resolved.get("max_action_budget") != 4
+            or resolved.get("max_obs_length") != 500):
+        raise ValueError("G0 v4 protocol probe contract mismatch")
     by_mode: dict[str, dict[tuple[str, int], Mapping[str, Any]]] = defaultdict(dict)
     for record in records:
         mode = record.get("mode")
@@ -648,7 +732,7 @@ def analyze_protocol_probe(directory: Path, expected_sample_ids: Sequence[str],
         "e0_mask_leak_count": criterion(mask_leak, "==", 0),
     }
     return {
-        "schema_version": 3,
+        "schema_version": ACTIVE_PROTOCOL_PROBE_SCHEMA_VERSION,
         "records": len(records),
         "prompt_token_match_count": prompt_matches,
         "first_action_token_match_count": first_action_matches,
@@ -717,7 +801,7 @@ def per_question(records: list[dict[str, Any]],
 def analyze_trace_stage(
         stage: str, records: list[dict[str, Any]],
         reward_replay: Mapping[tuple[str, int], Mapping[str, Any]] | None = None,
-        active_v3: bool = False,
+        active_v4: bool = False,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
     if stage == "g2" and reward_replay is None:
         raise ValueError("G2 analysis requires independent strict EM replay")
@@ -731,7 +815,7 @@ def analyze_trace_stage(
             diagnostic["strict_em"] = int(replay["strict_em"])
             diagnostic["subem"] = int(replay["subem"])
     questions = per_question(records, diagnostics)
-    if stage == "g0_g1" and active_v3:
+    if stage == "g0_g1" and active_v4:
         generation_turns = sum(item["generation_turn_count"] for item in diagnostics)
         prefix_integrity = sum(
             item["action_token_prefix_integrity_count"] for item in diagnostics)
@@ -741,9 +825,33 @@ def analyze_trace_stage(
         observation_policy_tokens = sum(
             int(record.get("observation_policy_token_count", 0)) for record in records)
         retrieval_errors = sum(not item["retrieval_aligned"] for item in diagnostics)
+        terminal_generations = sum(
+            item["terminal_generation_count"] for item in diagnostics)
+        terminal_instructions = sum(
+            item["terminal_instruction_applied_count"] for item in diagnostics)
+        terminal_answers = sum(
+            item["terminal_answer_count"] for item in diagnostics)
+        terminal_requested_searches = sum(
+            item["terminal_search_request_count"] for item in diagnostics)
+        terminal_invalid = sum(
+            item["terminal_invalid_count"] for item in diagnostics)
+        terminal_accepted_searches = sum(
+            item["terminal_accepted_search_count"] for item in diagnostics)
+        terminal_executed_searches = sum(
+            item["terminal_executed_search_count"] for item in diagnostics)
+        terminal_prompt_policy_tokens = sum(
+            item["terminal_prompt_policy_token_count"] for item in diagnostics)
+        terminal_answer_rate = (
+            terminal_answers / terminal_generations
+            if terminal_generations else 1.0)
+        terminal_requested_search_rate = (
+            terminal_requested_searches / terminal_generations
+            if terminal_generations else 0.0)
         thinking_rows = [row for item in diagnostics for row in item["thinking"]]
         contexts = {}
-        for context in ("initial_question", "tool_response", "user_retry", "unknown"):
+        for context in (
+                "initial_question", "tool_response", "user_retry",
+                "terminal_answer", "unknown"):
             rows = [row for row in thinking_rows if row["context"] == context]
             if rows:
                 contexts[context] = {
@@ -763,6 +871,18 @@ def analyze_trace_stage(
             "observation_policy_token_count": criterion(
                 observation_policy_tokens, "==", 0),
             "retrieval_alignment_error_count": criterion(retrieval_errors, "==", 0),
+            "terminal_instruction_applied_count": criterion(
+                terminal_instructions, "==", terminal_generations),
+            "terminal_prompt_policy_token_count": criterion(
+                terminal_prompt_policy_tokens, "==", 0),
+            "terminal_accepted_search_count": criterion(
+                terminal_accepted_searches, "==", 0),
+            "terminal_executed_search_count": criterion(
+                terminal_executed_searches, "==", 0),
+            "terminal_answer_rate": criterion(
+                terminal_answer_rate, ">=", 0.90),
+            "terminal_requested_search_rate": criterion(
+                terminal_requested_search_rate, "<=", 0.05),
         }
         overall = {
             "legal_first_action_count": sum(
@@ -786,6 +906,15 @@ def analyze_trace_stage(
             "search_turn_count": sum(item["search_turn_count"] for item in diagnostics),
             "terminal_search_request_count": sum(
                 item["terminal_search_request_count"] for item in diagnostics),
+            "terminal_generation_count": terminal_generations,
+            "terminal_instruction_applied_count": terminal_instructions,
+            "terminal_answer_count": terminal_answers,
+            "terminal_answer_rate": terminal_answer_rate,
+            "terminal_requested_search_rate": terminal_requested_search_rate,
+            "terminal_invalid_count": terminal_invalid,
+            "terminal_accepted_search_count": terminal_accepted_searches,
+            "terminal_executed_search_count": terminal_executed_searches,
+            "terminal_prompt_policy_token_count": terminal_prompt_policy_tokens,
             "requested_search_count": sum(
                 item["requested_search_count"] for item in diagnostics),
             "executed_search_count": sum(
@@ -802,7 +931,7 @@ def analyze_trace_stage(
             },
             "thinking": {
                 "diagnostic_only": True,
-                "template_opening_source": "qwen35 v3 renderer contract",
+                "template_opening_source": "qwen35 v4 renderer contract",
                 "generation_turn_count": len(thinking_rows),
                 "template_opening_count": sum(
                     row["template_opening_provided"] for row in thinking_rows),
@@ -815,7 +944,7 @@ def analyze_trace_stage(
         }
     elif stage == "g0_g1":
         # Preserve the archived v2 interpretation without using its
-        # forced-search capability thresholds for active v3 admission.
+        # forced-search capability thresholds for active v4 admission.
         legal = sum(item["first_action_legal"] for item in diagnostics)
         non_degenerate = sum(item["first_search_non_degenerate"] for item in diagnostics)
         degenerate = sum(item["first_search_degenerate"] for item in diagnostics)
@@ -897,11 +1026,11 @@ def analyze_g3_with_registered_gate(args: argparse.Namespace) -> int:
 def write_outputs(args: argparse.Namespace, expected_ids: Sequence[str],
                   expected_questions: Mapping[str, str],
                   expected_gold_answers: Mapping[str, Sequence[str]],
-                  g0_ids: Sequence[str], active_v3: bool = False) -> dict[str, Any]:
+                  g0_ids: Sequence[str], active_v4: bool = False) -> dict[str, Any]:
     if args.stage == "g3":
         records = load_jsonl(args.trace)
         validate_traces(records, args.stage, args.expected_checkpoint_digest,
-                        expected_ids, expected_questions, active_v3=active_v3)
+                        expected_ids, expected_questions, active_v4=active_v4)
         reward_replay = replay_strict_exact_match(records,
                                                    expected_gold_answers)
         output = args.output_dir
@@ -946,11 +1075,11 @@ def write_outputs(args: argparse.Namespace, expected_ids: Sequence[str],
 
     records = load_jsonl(args.trace)
     validate_traces(records, args.stage, args.expected_checkpoint_digest,
-                    expected_ids, expected_questions, active_v3=active_v3)
+                    expected_ids, expected_questions, active_v4=active_v4)
     reward_replay = (replay_strict_exact_match(records, expected_gold_answers)
                      if args.stage == "g2" else None)
     overall, decorated, questions = analyze_trace_stage(
-        args.stage, records, reward_replay, active_v3=active_v3)
+        args.stage, records, reward_replay, active_v4=active_v4)
     protocol = None
     protocol_records: list[dict[str, Any]] = []
     if args.stage == "g0_g1":
@@ -958,8 +1087,8 @@ def write_outputs(args: argparse.Namespace, expected_ids: Sequence[str],
             raise ValueError("G0+G1 analysis requires --protocol-probe-dir")
         protocol, protocol_records = analyze_protocol_probe(
             args.protocol_probe_dir, g0_ids, args.expected_checkpoint_digest,
-            active_v3=active_v3)
-    if args.stage == "g0_g1" and active_v3:
+            active_v4=active_v4)
+    if args.stage == "g0_g1" and active_v4:
         all_criteria = {f"g1_{name}": value
                         for name, value in overall["criteria"].items()}
     else:
@@ -1045,12 +1174,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not re.fullmatch(r"[0-9a-f]{64}", args.expected_checkpoint_digest):
             raise ValueError("expected checkpoint digest must be 64 lowercase hex")
         (expected_ids, expected_questions, expected_gold_answers,
-         g0_ids, active_v3) = load_data_contract(
+         g0_ids, active_v4) = load_data_contract(
              args.data_manifest, args.catalog, args.stage)
         if args.stage != "g3":
             args.output_dir.mkdir(parents=True, exist_ok=False)
         result = write_outputs(args, expected_ids, expected_questions,
-                               expected_gold_answers, g0_ids, active_v3)
+                               expected_gold_answers, g0_ids, active_v4)
     except (OSError, ValueError, json.JSONDecodeError) as error:
         print(f"Qwen native gate analysis error: {error}", file=sys.stderr)
         return 1

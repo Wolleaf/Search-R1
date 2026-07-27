@@ -179,6 +179,21 @@ def main(config):
     ray.get(main_task.remote(config))
 
 
+def _run_trainer_with_tracking(trainer) -> None:
+    try:
+        trainer.init_workers()
+        trainer.fit()
+    except BaseException:
+        try:
+            trainer.logger.finish(exit_code=1)
+        except BaseException:
+            # Preserve the training failure as the Ray task's root cause.
+            pass
+        raise
+
+    trainer.logger.finish(exit_code=0)
+
+
 @ray.remote
 def main_task(config):
     from verl.utils.random_utils import seed_everything
@@ -285,8 +300,7 @@ def main_task(config):
                             reward_fn=reward_fn,
                             val_reward_fn=val_reward_fn,
                             )
-    trainer.init_workers()
-    trainer.fit()
+    _run_trainer_with_tracking(trainer)
 
 
 if __name__ == '__main__':

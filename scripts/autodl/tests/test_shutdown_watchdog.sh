@@ -181,7 +181,7 @@ replace_with_qwen_native_gate_results() {
     mkdir -p "$result_dir" "$(dirname -- "$marker")"
     for relative in "${files[@]}"; do printf 'evidence:%s\n' "$relative" >"$result_dir/$relative"; done
     printf '%s\n' \
-        '{"decision":"NO-GO","schema":"search-r1.qwen-native-gate","schema_version":3,"stage":"g0_g1"}' \
+        '{"decision":"NO-GO","schema":"search-r1.qwen-native-gate","schema_version":4,"stage":"g0_g1"}' \
         >"$result_dir/go_no_go.json"
     printf 'g0_g1\n' >"$result_dir/stage.txt"
     (
@@ -193,7 +193,7 @@ replace_with_qwen_native_gate_results() {
     ) >"$result_dir/evidence.sha256"
     digest="$(sha256sum "$result_dir/evidence.sha256" | cut -d' ' -f1)"
     printf '%s\n' "$digest" >"$marker"
-    printf 'qwen-native-gate-v3\n' >"$ATTEMPT/result-contract"
+    printf 'qwen-native-gate-v4\n' >"$ATTEMPT/result-contract"
     printf '%s\n' "$result_dir" >"$ATTEMPT/result-root"
     printf '%s\n' "$marker" >"$ATTEMPT/evidence-marker"
     printf '%s\n' "$digest" >"$ATTEMPT/evidence-digest"
@@ -233,7 +233,7 @@ create_native_outer_attempt() {
 }
 
 create_native_sealed_inputs() {
-    local data_dir="$PROJECT_ROOT/data/search_mix_qwen35_native_v3"
+    local data_dir="$PROJECT_ROOT/data/search_mix_qwen35_native_v4"
     local handoff="$PROJECT_ROOT/manifests/cpu_handoff.json"
     mkdir -p "$data_dir"
     "$PYTHON_BIN" - "$data_dir" <<'PY'
@@ -256,8 +256,8 @@ catalog.write_text("".join(
 artifacts = {}
 for key, filename, rows in (
     ("val", "val_128.parquet", 128),
-    ("nq_test_eval", "nq_test_128_native_v3.parquet", 128),
-    ("multihop_eval", "multihop_eval_256_native_v3.parquet", 256),
+    ("nq_test_eval", "nq_test_128_native_v4.parquet", 128),
+    ("multihop_eval", "multihop_eval_256_native_v4.parquet", 256),
 ):
     path = root / filename
     path.write_text(f"sealed test artifact: {key}\n", encoding="utf-8")
@@ -268,10 +268,13 @@ for key, filename, rows in (
         "sample_ids": [f"{key}-{index:03d}" for index in range(rows)],
     }
 manifest = {
-    "schema_version": 4,
+    "schema_version": 5,
     "prompt_contract": {
         "tool_protocol": "qwen35_native",
-        "prompt_version": "qwen35-native-search-v3-original-aligned",
+        "prompt_version": "qwen35-native-search-v4-terminal-answer-only",
+        "terminal_answer_only": True,
+        "terminal_prompt_version": "qwen35-terminal-answer-v1",
+        "terminal_prompt_sha256": "afc18b79afaafccece6927aec5ccd7898ef2ae17766bce7ffda244eef388d7f2",
     },
     "tokenizer": {
         "revision": "watchdog-test-revision",
@@ -295,8 +298,8 @@ PY
     add_native_evidence_path "$data_dir/manifest.json"
     add_native_evidence_path "$data_dir/catalog.jsonl"
     add_native_evidence_path "$data_dir/val_128.parquet"
-    add_native_evidence_path "$data_dir/nq_test_128_native_v3.parquet"
-    add_native_evidence_path "$data_dir/multihop_eval_256_native_v3.parquet"
+    add_native_evidence_path "$data_dir/nq_test_128_native_v4.parquet"
+    add_native_evidence_path "$data_dir/multihop_eval_256_native_v4.parquet"
 }
 
 write_smoke_decision() {
@@ -329,21 +332,77 @@ check_names = (
     "native_batch_policy_coverage",
     "native_batch_nonzero_advantage_tokens",
     "native_batch_advantage_abs_max",
+    "terminal_instruction_applied_count",
+    "terminal_prompt_policy_token_count",
+    "terminal_accepted_search_count",
+    "terminal_executed_search_count",
+    "terminal_answer_rate",
+    "terminal_requested_search_rate",
     "wandb_offline_history",
+    "wandb_history_steps",
+    "wandb_actor_metrics_match_log",
+    "wandb_summary_present",
+    "wandb_exit_zero",
 )
+actor_metric_names = (
+    "actor/pg_loss", "actor/kl_loss", "actor/entropy_loss",
+    "actor/grad_norm", "actor/ppo_kl",
+)
+actor_metrics = {
+    str(step): {name: [0.1] for name in actor_metric_names}
+    for step in (1, 2)
+}
 metrics = {
     "groups": 16,
     "mixed_groups": 1,
     "nonzero_trace_advantages": 1,
     "strict_em_positive_count": 1 if decision == "GO" else 0,
+    "terminal_generation_count": 80,
+    "terminal_instruction_applied_count": 80,
+    "terminal_answer_count": 80,
+    "terminal_requested_search_count": 0,
+    "terminal_invalid_count": 0,
+    "terminal_accepted_search_count": 0,
+    "terminal_executed_search_count": 0,
+    "terminal_prompt_policy_token_count": 0,
+    "terminal_answer_rate": 1.0,
+    "terminal_requested_search_rate": 0.0,
     "trajectories": 80,
-    "wandb_files": 1,
+    "wandb": {
+        "actor_metrics": actor_metrics,
+        "exit_codes": [0],
+        "files": 1,
+        "history_records": 2,
+        "history_steps": [1, 2],
+        "last_record_type": "exit",
+        "record_counts": {"exit": 1, "history": 2, "summary": 1},
+        "run_file": "offline-run/run-test.wandb",
+        "run_file_sha256": "0" * 64,
+        "summary": {"actor/pg_loss": 0.1},
+        "summary_records": 1,
+        "wandb_version": "0.21.1",
+    },
 }
 observed = {
     "strict_em_positive": metrics["strict_em_positive_count"],
     "mixed_reward_group": metrics["mixed_groups"],
     "nonzero_trace_advantage": metrics["nonzero_trace_advantages"],
-    "wandb_offline_history": metrics["wandb_files"],
+    "terminal_instruction_applied_count":
+        metrics["terminal_instruction_applied_count"],
+    "terminal_prompt_policy_token_count":
+        metrics["terminal_prompt_policy_token_count"],
+    "terminal_accepted_search_count": metrics["terminal_accepted_search_count"],
+    "terminal_executed_search_count": metrics["terminal_executed_search_count"],
+    "terminal_answer_rate": metrics["terminal_answer_rate"],
+    "terminal_requested_search_rate": metrics["terminal_requested_search_rate"],
+    "wandb_offline_history": metrics["wandb"]["history_records"],
+    "wandb_history_steps": [1, 2],
+    "wandb_actor_metrics_match_log": actor_metrics,
+    "wandb_summary_present": metrics["wandb"]["summary_records"],
+    "wandb_exit_zero": {
+        "codes": [0],
+        "last_record_type": "exit",
+    },
 }
 checks = {
     name: {
@@ -363,7 +422,7 @@ payload = {
     },
     "metrics": metrics,
     "schema": "search-r1.qwen-native-smoke-decision",
-    "schema_version": 1,
+    "schema_version": 2,
 }
 Path(output).write_text(
     json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
@@ -381,14 +440,14 @@ create_native_protocol_gate_evidence() {
     mkdir -p "$result_dir" "$(dirname -- "$NATIVE_PROTOCOL_GATE_MARKER")"
     printf 'g0_g1\n' >"$result_dir/stage.txt"
     printf '%s\n' \
-        '{"decision":"GO","schema":"search-r1.qwen-native-gate","schema_version":3,"stage":"g0_g1"}' \
+        '{"decision":"GO","schema":"search-r1.qwen-native-gate","schema_version":4,"stage":"g0_g1"}' \
         >"$result_dir/go_no_go.json"
     write_native_manifest "$result_dir/evidence.sha256" \
         "$result_dir/go_no_go.json" "$result_dir/stage.txt"
     NATIVE_PROTOCOL_GATE_DIGEST="$(sha256sum "$result_dir/evidence.sha256" | cut -d' ' -f1)"
     printf '%s\n' "$NATIVE_PROTOCOL_GATE_DIGEST" >"$NATIVE_PROTOCOL_GATE_MARKER"
     NATIVE_PROTOCOL_GATE_OUTER="$(create_native_outer_attempt "$attempt_name" \
-        qwen-native-gate-v3 "$result_dir" "$NATIVE_PROTOCOL_GATE_MARKER" \
+        qwen-native-gate-v4 "$result_dir" "$NATIVE_PROTOCOL_GATE_MARKER" \
         "$NATIVE_PROTOCOL_GATE_DIGEST")"
     add_native_evidence_path "$NATIVE_PROTOCOL_GATE_MARKER"
     add_native_evidence_path "$result_dir/evidence.sha256"
@@ -401,7 +460,7 @@ create_native_smoke_predecessor() {
     NATIVE_SMOKE_MARKER="$PROJECT_ROOT/manifests/qwen-native-training-smoke/$attempt_name.ok"
     mkdir -p "$result_dir" "$(dirname -- "$NATIVE_SMOKE_MARKER")"
     printf '%s\n' \
-        'schema=qwen-native-training-smoke-v3' \
+        'schema=qwen-native-training-smoke-v4' \
         'stage=smoke' \
         'stage_order=S2' \
         'decision=GO' \
@@ -422,7 +481,7 @@ create_native_smoke_predecessor() {
     NATIVE_SMOKE_DIGEST="$digest"
     printf '%s\n' "$digest" >"$NATIVE_SMOKE_MARKER"
     NATIVE_SMOKE_OUTER="$(create_native_outer_attempt "$attempt_name" \
-        qwen-native-training-smoke-v3 "$result_dir" "$NATIVE_SMOKE_MARKER" \
+        qwen-native-training-smoke-v4 "$result_dir" "$NATIVE_SMOKE_MARKER" \
         "$digest")"
     add_native_evidence_path "$NATIVE_SMOKE_MARKER"
     add_native_evidence_path "$result_dir/evidence.sha256"
@@ -436,6 +495,9 @@ create_native_run_evidence() {
         printf 'native evidence: %s\n' "$file" >"$run_dir/$file"
         add_native_evidence_path "$run_dir/$file"
     done
+    printf '{"decision":"GO","schema":"search-r1.wandb-offline-receipt","schema_version":1}\n' \
+        >"$run_dir/wandb-receipt.json"
+    add_native_evidence_path "$run_dir/wandb-receipt.json"
     if [[ "$kind" == train ]]; then
         for file in lineage.tsv native-training-contract.json; do
             printf 'native evidence: %s\n' "$file" >"$run_dir/$file"
@@ -595,7 +657,7 @@ metric = {
     "valid_resamples": 10000,
 }
 payload = {
-    "schema_version": 2,
+    "schema_version": 3,
     "report_type": report_type,
     "expected_rows": artifact["rows"],
     "cost_lambda": 0.10,
@@ -639,11 +701,12 @@ payload = {
     },
     "formal_contract": {
         "mode": mode,
+        "native_contract_version": "v4",
         "data_manifest": {
             "path": str(data_manifest),
             "sha256": hashlib.sha256(data_manifest.read_bytes()).hexdigest(),
-            "schema_version": 4,
-            "prompt_version": "qwen35-native-search-v3-original-aligned",
+            "schema_version": 5,
+            "prompt_version": "qwen35-native-search-v4-terminal-answer-only",
         },
         "endpoints": {
             baseline_role: {
@@ -737,7 +800,7 @@ replace_with_native_training_smoke_results() {
     run_dir="$PROJECT_ROOT/runs/smoke/attempts/smoke-$case_number"
     checkpoint="$run_dir/checkpoints/actor/global_step_2"
     base_model="$PROJECT_ROOT/models/Qwen3.5-2B"
-    catalog="$PROJECT_ROOT/data/search_mix_qwen35_native_v3/catalog.jsonl"
+    catalog="$PROJECT_ROOT/data/search_mix_qwen35_native_v4/catalog.jsonl"
     mkdir -p "$NATIVE_RESULT_DIR" "$checkpoint" "$base_model" "$(dirname -- "$catalog")"
     add_native_evidence_path "$catalog"
     create_native_run_evidence "$run_dir" train
@@ -759,7 +822,7 @@ replace_with_native_training_smoke_results() {
         | cut -d' ' -f1)"
     commit="$(git -C "$PROJECT_ROOT/checkout" rev-parse HEAD)"
     printf '%s\n' \
-        'schema=qwen-native-training-smoke-v3' \
+        'schema=qwen-native-training-smoke-v4' \
         'stage=smoke' \
         'stage_order=S2' \
         "decision=$decision" \
@@ -790,7 +853,7 @@ replace_with_native_training_smoke_results() {
     add_native_evidence_path "$NATIVE_RESULT_DIR/storage.env"
     add_native_evidence_path "$NATIVE_RESULT_DIR/checkpoint-tree.env"
     add_native_evidence_path "$NATIVE_RESULT_DIR/smoke-decision.json"
-    seal_native_training_results qwen-native-training-smoke-v3 qwen-native-training-smoke
+    seal_native_training_results qwen-native-training-smoke-v4 qwen-native-training-smoke
 }
 
 replace_with_native_training_main_results() {
@@ -825,8 +888,8 @@ replace_with_native_training_main_results() {
     base_digest="$(tree_sha256 "$base_model")"
     r_digest="$(tree_sha256 "$r_checkpoint")"
     smoke_digest="$NATIVE_SMOKE_DIGEST"
-    catalog="$PROJECT_ROOT/data/search_mix_qwen35_native_v3/catalog.jsonl"
-    data_manifest="$PROJECT_ROOT/data/search_mix_qwen35_native_v3/manifest.json"
+    catalog="$PROJECT_ROOT/data/search_mix_qwen35_native_v4/catalog.jsonl"
+    data_manifest="$PROJECT_ROOT/data/search_mix_qwen35_native_v4/manifest.json"
     stage_order=R60,G3,A-VAL-EVAL,R-VAL-EVAL,A-NQ-TEST-EVAL,R-NQ-TEST-EVAL,A-MULTIHOP-EVAL,R-MULTIHOP-EVAL
     if [[ "$authorized" == true ]]; then
         decision=GO
@@ -837,7 +900,7 @@ replace_with_native_training_main_results() {
         count=2
     fi
     printf '%s\n' \
-        'schema=qwen-native-training-main-v3' \
+        'schema=qwen-native-training-main-v4' \
         'stage=main' \
         "stage_order=$stage_order" \
         "analysis_decision=$decision" \
@@ -848,7 +911,7 @@ replace_with_native_training_main_results() {
         "smoke_evidence=$NATIVE_SMOKE_MARKER" \
         "smoke_evidence_sha256=$smoke_digest" \
         >"$NATIVE_RESULT_DIR/contract.env"
-    printf '{"analysis_decision":"%s","branches_authorized":%s,"cost_contrast_group_count":%s,"cost_contrast_group_minimum":8,"decision":"%s","schema":"qwen-native-post-r-gate-v3"}\n' \
+    printf '{"analysis_decision":"%s","branches_authorized":%s,"cost_contrast_group_count":%s,"cost_contrast_group_minimum":8,"decision":"%s","schema":"qwen-native-post-r-gate-v4"}\n' \
         "$decision" "$authorized" "$count" "$([[ "$authorized" == true ]] && printf GO || printf NO-GO)" \
         >"$NATIVE_RESULT_DIR/branch-decision.json"
     write_native_g3_analysis "$NATIVE_RESULT_DIR/r-g3-analysis" "$decision" "$count" \
@@ -885,7 +948,7 @@ replace_with_native_training_main_results() {
             >>"$NATIVE_RESULT_DIR/run-index.tsv"
         paired="$NATIVE_RESULT_DIR/paired-ar-$eval_key"
         create_native_paired_fixture "$paired" "$data_manifest" "$artifact_key" \
-            qwen35_native_v3_a_r_capability parent reproduced \
+            qwen35_native_v4_a_r_capability parent reproduced \
             "$a_eval_run/traces/eval_predictions.jsonl" \
             "$r_eval_run/traces/eval_predictions.jsonl" \
             "qwen_native_a_$eval_key" "qwen_native_r_$eval_key" \
@@ -931,7 +994,7 @@ replace_with_native_training_main_results() {
                 >>"$NATIVE_RESULT_DIR/run-index.tsv"
             paired="$NATIVE_RESULT_DIR/paired-$eval_key"
             create_native_paired_fixture "$paired" "$data_manifest" "$artifact_key" \
-                qwen35_native_v3_b_c_efficiency control cost_aware_gated \
+                qwen35_native_v4_b_c_efficiency control cost_aware_gated \
                 "$b_eval_run/traces/eval_predictions.jsonl" \
                 "$c_eval_run/traces/eval_predictions.jsonl" \
                 "qwen_native_b_$eval_key" "qwen_native_c_$eval_key" \
@@ -945,7 +1008,7 @@ replace_with_native_training_main_results() {
     for file in summary.json summary.md go_no_go.json per_trajectory.jsonl per_question.jsonl; do
         add_native_evidence_path "$NATIVE_RESULT_DIR/r-g3-analysis/$file"
     done
-    seal_native_training_results qwen-native-training-main-v3 qwen-native-training-main
+    seal_native_training_results qwen-native-training-main-v4 qwen-native-training-main
 }
 
 run_watchdog() {
@@ -1140,7 +1203,27 @@ payload = json.loads(path.read_bytes())
 del payload["checks"]["wandb_offline_history"]
 path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
 PY
-    seal_native_training_results qwen-native-training-smoke-v3 qwen-native-training-smoke
+    seal_native_training_results qwen-native-training-smoke-v4 qwen-native-training-smoke
+run_watchdog 0 --test-foreground
+[[ -f "$ATTEMPT/shutdown-skipped" && ! -e "$ATTEMPT/shutdown-safe" ]]
+grep -Fq 'reason=authorization-revalidation-failed' "$ATTEMPT/shutdown-skipped"
+assert_no_backend_event
+
+# Re-sealing cannot turn a prohibited accepted terminal search into GO.
+new_case qwen-native-training-smoke-terminal-search-forged 0 success
+replace_with_native_training_smoke_results
+"$PYTHON_BIN" - "$NATIVE_RESULT_DIR/smoke-decision.json" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+payload = json.loads(path.read_bytes())
+payload["metrics"]["terminal_accepted_search_count"] = 1
+payload["checks"]["terminal_accepted_search_count"]["observed"] = 1
+path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+PY
+seal_native_training_results qwen-native-training-smoke-v4 qwen-native-training-smoke
 run_watchdog 0 --test-foreground
 [[ -f "$ATTEMPT/shutdown-skipped" && ! -e "$ATTEMPT/shutdown-safe" ]]
 grep -Fq 'reason=authorization-revalidation-failed' "$ATTEMPT/shutdown-skipped"
@@ -1156,7 +1239,7 @@ assert_order
 # A predecessor marker cannot borrow a same-named result from a mismatched outer attempt.
 new_case qwen-native-training-main-predecessor-outer-tampered 0 success
 replace_with_native_training_main_results false
-printf 'qwen-native-training-main-v3\n' >"$NATIVE_SMOKE_OUTER/result-contract"
+printf 'qwen-native-training-main-v4\n' >"$NATIVE_SMOKE_OUTER/result-contract"
 run_watchdog 0 --test-foreground
 [[ -f "$ATTEMPT/shutdown-skipped" && ! -e "$ATTEMPT/shutdown-safe" ]]
 grep -Fq 'reason=authorization-revalidation-failed' "$ATTEMPT/shutdown-skipped"
@@ -1175,7 +1258,7 @@ payload = json.loads(path.read_bytes())
 payload["input"]["trace_sha256"] = "0" * 64
 path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
 PY
-seal_native_training_results qwen-native-training-main-v3 qwen-native-training-main
+seal_native_training_results qwen-native-training-main-v4 qwen-native-training-main
 run_watchdog 0 --test-foreground
 [[ -f "$ATTEMPT/shutdown-skipped" && ! -e "$ATTEMPT/shutdown-safe" ]]
 grep -Fq 'reason=authorization-revalidation-failed' "$ATTEMPT/shutdown-skipped"
@@ -1194,7 +1277,7 @@ payload = json.loads(path.read_bytes())
 payload["formal_contract"]["endpoints"]["parent"]["checkpoint_digest"] = "0" * 64
 path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
 PY
-seal_native_training_results qwen-native-training-main-v3 qwen-native-training-main
+seal_native_training_results qwen-native-training-main-v4 qwen-native-training-main
 run_watchdog 0 --test-foreground
 [[ -f "$ATTEMPT/shutdown-skipped" && ! -e "$ATTEMPT/shutdown-safe" ]]
 grep -Fq 'reason=authorization-revalidation-failed' "$ATTEMPT/shutdown-skipped"
@@ -1227,7 +1310,7 @@ with path.open("w", newline="", encoding="utf-8") as handle:
     writer.writeheader()
     writer.writerows(rows)
 PY
-seal_native_training_results qwen-native-training-main-v3 qwen-native-training-main
+seal_native_training_results qwen-native-training-main-v4 qwen-native-training-main
 run_watchdog 0 --test-foreground
 [[ -f "$ATTEMPT/shutdown-skipped" && ! -e "$ATTEMPT/shutdown-safe" ]]
 grep -Fq 'reason=authorization-revalidation-failed' "$ATTEMPT/shutdown-skipped"
@@ -1253,7 +1336,7 @@ with path.open("w", newline="", encoding="utf-8") as handle:
     writer.writeheader()
     writer.writerows(rows)
 PY
-seal_native_training_results qwen-native-training-main-v3 qwen-native-training-main
+seal_native_training_results qwen-native-training-main-v4 qwen-native-training-main
 run_watchdog 0 --test-foreground
 [[ -f "$ATTEMPT/shutdown-skipped" && ! -e "$ATTEMPT/shutdown-safe" ]]
 grep -Fq 'reason=authorization-revalidation-failed' "$ATTEMPT/shutdown-skipped"
@@ -1279,7 +1362,7 @@ payload = json.loads(path.read_bytes())
 payload["formal_contract"]["endpoints"]["control"]["checkpoint_digest"] = "0" * 64
 path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
 PY
-seal_native_training_results qwen-native-training-main-v3 qwen-native-training-main
+seal_native_training_results qwen-native-training-main-v4 qwen-native-training-main
 run_watchdog 0 --test-foreground
 [[ -f "$ATTEMPT/shutdown-skipped" && ! -e "$ATTEMPT/shutdown-safe" ]]
 grep -Fq 'reason=authorization-revalidation-failed' "$ATTEMPT/shutdown-skipped"
@@ -1289,9 +1372,9 @@ assert_no_backend_event
 new_case qwen-native-training-main-forged 0 success
 replace_with_native_training_main_results true
 printf '%s\n' \
-    '{"analysis_decision":"GO","branches_authorized":false,"cost_contrast_group_count":9,"cost_contrast_group_minimum":8,"decision":"NO-GO","schema":"qwen-native-post-r-gate-v3"}' \
+    '{"analysis_decision":"GO","branches_authorized":false,"cost_contrast_group_count":9,"cost_contrast_group_minimum":8,"decision":"NO-GO","schema":"qwen-native-post-r-gate-v4"}' \
     >"$NATIVE_RESULT_DIR/branch-decision.json"
-seal_native_training_results qwen-native-training-main-v3 qwen-native-training-main
+seal_native_training_results qwen-native-training-main-v4 qwen-native-training-main
 run_watchdog 0 --test-foreground
 [[ -f "$ATTEMPT/shutdown-skipped" && ! -e "$ATTEMPT/shutdown-safe" ]]
 grep -Fq 'reason=authorization-revalidation-failed' "$ATTEMPT/shutdown-skipped"

@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 NATIVE_TRAIN_PROJECT_ROOT="${AUTODL_ROOT:-/root/autodl-tmp/search-r1}"
-NATIVE_TRAIN_DATA_DIR="$NATIVE_TRAIN_PROJECT_ROOT/data/search_mix_qwen35_native_v3"
+NATIVE_TRAIN_DATA_DIR="$NATIVE_TRAIN_PROJECT_ROOT/data/search_mix_qwen35_native_v4"
 NATIVE_TRAIN_STAGE="${QWEN_NATIVE_TRAIN_STAGE:-}"
 NATIVE_PROTOCOL_GATE_EVIDENCE="${QWEN_NATIVE_PROTOCOL_GATE_EVIDENCE:-}"
 NATIVE_SMOKE_EVIDENCE="${QWEN_NATIVE_SMOKE_EVIDENCE:-}"
@@ -26,13 +26,14 @@ readonly NATIVE_TRAIN_MANIFEST="$NATIVE_TRAIN_DATA_DIR/manifest.json"
 readonly NATIVE_TRAIN_CATALOG="$NATIVE_TRAIN_DATA_DIR/catalog.jsonl"
 readonly NATIVE_TRAIN_G3_DATA="$NATIVE_TRAIN_DATA_DIR/probe_multi_64.parquet"
 readonly NATIVE_TRAIN_SOURCE_DIR="$PROJECT_ROOT/data/search_mix"
-readonly NATIVE_TRAIN_PROMPT_VERSION=qwen35-native-search-v3-original-aligned
-readonly NATIVE_TRAIN_SMOKE_CONTRACT=qwen-native-training-smoke-v3
-readonly NATIVE_TRAIN_MAIN_CONTRACT=qwen-native-training-main-v3
-readonly NATIVE_TRAIN_GATE_CONTRACT=qwen-native-gate-v3
+readonly NATIVE_TRAIN_PROMPT_VERSION=qwen35-native-search-v4-terminal-answer-only
+readonly NATIVE_TRAIN_SMOKE_CONTRACT=qwen-native-training-smoke-v4
+readonly NATIVE_TRAIN_MAIN_CONTRACT=qwen-native-training-main-v4
+readonly NATIVE_TRAIN_GATE_CONTRACT=qwen-native-gate-v4
 readonly NATIVE_TRAIN_GATE_CLI="$CHECKOUT_DIR/scripts/autodl/qwen_native_gate_analysis.py"
 readonly NATIVE_TRAIN_PAIRED_CLI="$CHECKOUT_DIR/scripts/autodl/paired_eval.py"
 readonly NATIVE_TRAIN_SMOKE_CLI="$CHECKOUT_DIR/scripts/autodl/qwen_native_smoke_analysis.py"
+readonly NATIVE_TRAIN_WANDB_CLI="$CHECKOUT_DIR/scripts/autodl/wandb_history.py"
 
 NATIVE_TRAIN_PREFLIGHT_STAGE=''
 NATIVE_TRAIN_PREFLIGHT_COMMIT=''
@@ -69,7 +70,7 @@ require_qwen_native_train() {
         "$EVAL_GROUP_SIZE" == 1 && -z "$EVAL_DATA_FILE" &&
         "$RUN_BUDGET_PROFILE" == gated_followup &&
         -n "$NATIVE_PROTOCOL_GATE_EVIDENCE" ]] || {
-        printf 'Qwen native v3 training requires the exact structural G0/G1 gate, two GPUs, group 5, batch 8, response/observation 500, and total action budget 4.\n' >&2
+        printf 'Qwen native v4 training requires the exact structural G0/G1 gate, two GPUs, group 5, batch 8, response/observation 500, and total action budget 4.\n' >&2
         return 64
     }
     if [[ "$NATIVE_TRAIN_STAGE" == main && -z "$NATIVE_SMOKE_EVIDENCE" ]]; then
@@ -202,10 +203,10 @@ if (results / "stage.txt").read_text(encoding="utf-8").strip() != "g0_g1":
 decision = json.loads((results / "go_no_go.json").read_bytes())
 summary = json.loads((results / "summary.json").read_bytes())
 if (decision.get("schema") != "search-r1.qwen-native-gate" or
-        decision.get("schema_version") != 3 or
+        decision.get("schema_version") != 4 or
         decision.get("stage") != "g0_g1" or
         decision.get("decision") != "GO"):
-    raise SystemExit("structural G0/G1 decision is not a v3 GO")
+    raise SystemExit("structural G0/G1 decision is not a v4 GO")
 criteria = decision.get("criteria")
 required_criteria = {
     "g0_prompt_token_match_count",
@@ -221,15 +222,21 @@ required_criteria = {
     "g1_info_mask_consistent_count",
     "g1_observation_policy_token_count",
     "g1_retrieval_alignment_error_count",
+    "g1_terminal_instruction_applied_count",
+    "g1_terminal_prompt_policy_token_count",
+    "g1_terminal_accepted_search_count",
+    "g1_terminal_executed_search_count",
+    "g1_terminal_answer_rate",
+    "g1_terminal_requested_search_rate",
 }
 if (not isinstance(criteria, dict) or set(criteria) != required_criteria or
         any(not isinstance(item, dict) or item.get("passed") is not True
             for item in criteria.values())):
     raise SystemExit("structural G0/G1 criteria are incomplete or failed")
 if (summary.get("schema") != "search-r1.qwen-native-gate" or
-        summary.get("schema_version") != 3 or
+        summary.get("schema_version") != 4 or
         summary.get("stage") != "g0_g1" or summary.get("decision") != "GO"):
-    raise SystemExit("structural G0/G1 summary is not a v3 GO")
+    raise SystemExit("structural G0/G1 summary is not a v4 GO")
 with (results / "lineage.tsv").open(newline="", encoding="utf-8") as handle:
     rows = list(csv.DictReader(handle, delimiter="\t"))
 if len(rows) != 1:
@@ -257,7 +264,7 @@ verify_smoke_evidence() {
     local marker="$1" expected_base="$2" expected_base_digest="$3"
     local expected_commit="$4" expected_handoff="$5" expected_data="$6"
     local expected_gate_digest="$7" metadata checkpoint checkpoint_digest
-    local base base_digest commit handoff data gate_marker gate_digest
+    local run_dir base base_digest commit handoff data gate_marker gate_digest
     verify_complete_training_attempt "$marker" qwen-native-training-smoke \
         "$NATIVE_TRAIN_RESULTS_ROOT/attempts" "$NATIVE_TRAIN_SMOKE_CONTRACT" || return $?
     metadata="$("$TRAIN_ENV/bin/python" - \
@@ -290,12 +297,12 @@ def read_env(path):
 contract = read_env(results / "contract.env")
 storage = read_env(results / "storage.env")
 checkpoint_tree = read_env(results / "checkpoint-tree.env")
-if contract.get("schema") != "qwen-native-training-smoke-v3" or contract.get("stage") != "smoke":
+if contract.get("schema") != "qwen-native-training-smoke-v4" or contract.get("stage") != "smoke":
     raise SystemExit("smoke contract identity mismatch")
 decision = json.loads((results / "smoke-decision.json").read_bytes())
 if (contract.get("decision") != "GO" or
         decision.get("schema") != "search-r1.qwen-native-smoke-decision" or
-        decision.get("schema_version") != 1 or decision.get("decision") != "GO"):
+        decision.get("schema_version") != 2 or decision.get("decision") != "GO"):
     raise SystemExit("smoke decision is not GO")
 for key in ("checkpoint_bytes", "filesystem_available_bytes"):
     try:
@@ -340,10 +347,10 @@ if (inputs.get("trace_sha256") != sha256_file(
         not isinstance(inputs.get("wandb_tree_sha256"), str) or
         len(inputs["wandb_tree_sha256"]) != 64):
     raise SystemExit("smoke decision input digests are inconsistent")
-print(*(row[key] for key in keys), sep="\t")
+print(str(run_dir), *(row[key] for key in keys), sep="\t")
 PY
 )" || return 1
-    IFS=$'\t' read -r checkpoint checkpoint_digest base base_digest commit handoff \
+    IFS=$'\t' read -r run_dir checkpoint checkpoint_digest base base_digest commit handoff \
         data gate_marker gate_digest <<<"$metadata"
     [[ "$base" == "$expected_base" && "$base_digest" == "$expected_base_digest" &&
         "$commit" == "$expected_commit" && "$handoff" == "$expected_handoff" &&
@@ -361,6 +368,7 @@ PY
         return 1
     }
     verify_native_checkpoint_digest "$checkpoint" "$checkpoint_digest" || return $?
+    verify_wandb_receipt "$run_dir" "$BASE_GATE_STEPS" || return $?
     NATIVE_TRAIN_SMOKE_DIGEST="$VERIFIED_ATTEMPT_DIGEST"
     NATIVE_TRAIN_SMOKE_RESULTS="$VERIFIED_ATTEMPT_RESULTS"
     NATIVE_TRAIN_SMOKE_OUTER="$VERIFIED_ATTEMPT_OUTER"
@@ -375,10 +383,11 @@ verify_qwen_native_train_data() {
         "$NATIVE_TRAIN_MANIFEST"
         "$NATIVE_TRAIN_MANIFEST.sha256"
         "$NATIVE_TRAIN_CATALOG"
+        "$NATIVE_TRAIN_DATA_DIR/search_mix_answer_quality_exclusions.v1.json"
         "$NATIVE_TRAIN_DATA_DIR/train_512.parquet"
         "$NATIVE_TRAIN_DATA_DIR/val_128.parquet"
-        "$NATIVE_TRAIN_DATA_DIR/nq_test_128_native_v3.parquet"
-        "$NATIVE_TRAIN_DATA_DIR/multihop_eval_256_native_v3.parquet"
+        "$NATIVE_TRAIN_DATA_DIR/nq_test_128_native_v4.parquet"
+        "$NATIVE_TRAIN_DATA_DIR/multihop_eval_256_native_v4.parquet"
         "$NATIVE_TRAIN_G3_DATA"
         "$NATIVE_TRAIN_SOURCE_DIR/manifest.json"
         "$NATIVE_TRAIN_SOURCE_DIR/retrieval_replay.json"
@@ -386,6 +395,7 @@ verify_qwen_native_train_data() {
         "$NATIVE_TRAIN_GATE_CLI"
         "$NATIVE_TRAIN_PAIRED_CLI"
         "$NATIVE_TRAIN_SMOKE_CLI"
+        "$NATIVE_TRAIN_WANDB_CLI"
     )
     for path in "${required[@]}"; do
         [[ -f "$path" && ! -L "$path" ]] || {
@@ -409,7 +419,7 @@ handoff = json.loads(Path(sys.argv[1]).read_bytes())
 manifest = json.loads(Path(sys.argv[2]).read_bytes())
 expected_handoff = {
     "schema": 3,
-    "native_prompt_version": "qwen35-native-search-v3-original-aligned",
+    "native_prompt_version": "qwen35-native-search-v4-terminal-answer-only",
     "native_thinking_enabled": True,
     "max_action_budget": 4,
     "selection_observation_length": 384,
@@ -418,14 +428,14 @@ expected_handoff = {
 failed = sorted(key for key, value in expected_handoff.items()
                 if handoff.get(key) != value)
 if failed:
-    raise SystemExit("native v3 CPU handoff mismatch: " + ", ".join(failed))
+    raise SystemExit("native v4 CPU handoff mismatch: " + ", ".join(failed))
 tokenizer = manifest.get("tokenizer", {})
 prompt_contract = manifest.get("prompt_contract", {})
-if (manifest.get("schema_version") != 4 or
+if (manifest.get("schema_version") != 5 or
         prompt_contract.get("prompt_version") != expected_handoff["native_prompt_version"] or
         tokenizer.get("selection_observation_length") != 384 or
         tokenizer.get("rollout_observation_length") != 500):
-    raise SystemExit("native v3 data manifest contract mismatch")
+    raise SystemExit("native v4 data manifest contract mismatch")
 PY
 }
 
@@ -602,7 +612,7 @@ payload = {
     "cost_reward_mode": cost_reward_mode, "group_size": 5,
     "max_action_budget": 4, "max_obs_length": 500, "max_response_length": 500,
     "parent": str(parent), "parent_digest": parent_digest,
-    "prompt_version": prompt_version, "role": role, "schema": 3,
+    "prompt_version": prompt_version, "role": role, "schema": 4,
     "steps": steps, "train_batch_size": 8, "variant": variant,
 }
 print(json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
@@ -650,16 +660,83 @@ record_smoke_storage() {
 "recorded_at=$(utc_now)"$'\n'
 }
 
+write_wandb_receipt() {
+    local run_dir="$1" expected_steps="$2" expected_decision="${3:-GO}"
+    local decision step
+    local receipt="$run_dir/wandb-receipt.json"
+    local -a args=(
+        --wandb-dir "$run_dir/wandb"
+        --output "$receipt"
+    )
+    [[ "$expected_decision" == GO || "$expected_decision" == GO_OR_NO_GO ]] || {
+        printf 'Invalid expected WandB decision: %s\n' "$expected_decision" >&2
+        return 1
+    }
+    [[ ! -e "$receipt" && ! -L "$receipt" ]] || {
+        printf 'Refusing to overwrite WandB receipt: %s\n' "$receipt" >&2
+        return 1
+    }
+    if ((expected_steps > 0)); then
+        args+=(--log "$run_dir/train.log")
+        for ((step = 1; step <= expected_steps; step += 1)); do
+            args+=(--expected-step "$step")
+        done
+    fi
+    decision="$("$TRAIN_ENV/bin/python" "$NATIVE_TRAIN_WANDB_CLI" \
+        "${args[@]}")" || return $?
+    [[ -f "$receipt" && ! -L "$receipt" ]] || {
+        printf 'WandB receipt was not published: %s\n' "$run_dir" >&2
+        return 1
+    }
+    if [[ "$expected_decision" == GO ]]; then
+        [[ "$decision" == GO ]] || {
+            printf 'WandB receipt is not GO: %s\n' "$run_dir" >&2
+            return 1
+        }
+    elif [[ "$decision" != GO && "$decision" != NO-GO ]]; then
+        printf 'Unexpected WandB receipt decision: %s\n' "$decision" >&2
+        return 1
+    fi
+}
+
+verify_wandb_receipt() {
+    local run_dir="$1" expected_steps="$2" expected_decision="${3:-GO}"
+    local decision step
+    local -a args=(
+        --wandb-dir "$run_dir/wandb"
+        --verify-receipt "$run_dir/wandb-receipt.json"
+    )
+    [[ "$expected_decision" == GO || "$expected_decision" == GO_OR_NO_GO ]] || {
+        printf 'Invalid expected WandB decision: %s\n' "$expected_decision" >&2
+        return 1
+    }
+    if ((expected_steps > 0)); then
+        args+=(--log "$run_dir/train.log")
+        for ((step = 1; step <= expected_steps; step += 1)); do
+            args+=(--expected-step "$step")
+        done
+    fi
+    decision="$("$TRAIN_ENV/bin/python" "$NATIVE_TRAIN_WANDB_CLI" \
+        "${args[@]}")" || return $?
+    if [[ "$expected_decision" == GO ]]; then
+        [[ "$decision" == GO ]]
+    elif [[ "$expected_decision" == GO_OR_NO_GO ]]; then
+        [[ "$decision" == GO || "$decision" == NO-GO ]]
+    fi
+}
+
 publish_native_training_evidence() {
     local outer_attempt="$1" results_dir="$2" namespace="$3" contract="$4"
     shift 4
     local marker_dir marker evidence_digest path relative checksum_lines=''
     local -a evidence_files=(
         "$NATIVE_TRAIN_MANIFEST" "$NATIVE_TRAIN_MANIFEST.sha256"
-        "$NATIVE_TRAIN_CATALOG" "$NATIVE_TRAIN_DATA_DIR/train_512.parquet"
+        "$NATIVE_TRAIN_CATALOG"
+        "$NATIVE_TRAIN_DATA_DIR/search_mix_answer_quality_exclusions.v1.json"
+        "$NATIVE_TRAIN_DATA_DIR/train_512.parquet"
         "$NATIVE_TRAIN_DATA_DIR/val_128.parquet" "$NATIVE_TRAIN_G3_DATA"
-        "$NATIVE_TRAIN_DATA_DIR/nq_test_128_native_v3.parquet"
-        "$NATIVE_TRAIN_DATA_DIR/multihop_eval_256_native_v3.parquet"
+        "$NATIVE_TRAIN_DATA_DIR/nq_test_128_native_v4.parquet"
+        "$NATIVE_TRAIN_DATA_DIR/multihop_eval_256_native_v4.parquet"
         "$HANDOFF" "$HANDOFF.sha256" "$MANIFEST_DIR/cpu.ok"
         "$MANIFEST_DIR/git.ok" "$MANIFEST_DIR/checkout-tree.sha256" "$@"
     )
@@ -748,7 +825,7 @@ payload = {
     "cost_contrast_group_count": count,
     "cost_contrast_group_minimum": 8,
     "decision": "GO" if authorized else "NO-GO",
-    "schema": "qwen-native-post-r-gate-v3",
+    "schema": "qwen-native-post-r-gate-v4",
 }
 print(json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
 PY
@@ -794,6 +871,7 @@ qwen_native_smoke_pipeline() {
         "$run/traces/train_trajectories.manifest.json" \
         "$((BASE_GATE_STEPS * TRAIN_BATCH_SIZE * 5))")" || return 1
     IFS=$'\t' read -r trace_digest trace_manifest_digest <<<"$trace_identity"
+    write_wandb_receipt "$run" "$BASE_GATE_STEPS" GO_OR_NO_GO || return $?
     results_dir="$(create_native_training_results_dir "$outer_attempt")" || return 1
     smoke_decision="$("$TRAIN_ENV/bin/python" "$NATIVE_TRAIN_SMOKE_CLI" \
         --trace "$run/traces/train_trajectories.jsonl" \
@@ -836,6 +914,7 @@ qwen_native_smoke_pipeline() {
         "$base_digest" "$commit" "$handoff_digest" "$data_digest" || return $?
     verify_native_checkpoint_digest "$base_model" "$base_digest" || return $?
     verify_native_checkpoint_digest "$checkpoint" "$checkpoint_digest" || return $?
+    verify_wandb_receipt "$run" "$BASE_GATE_STEPS" GO_OR_NO_GO || return $?
     publish_native_training_evidence "$outer_attempt" "$results_dir" \
         qwen-native-training-smoke "$NATIVE_TRAIN_SMOKE_CONTRACT" \
         "$results_dir/contract.env" "$results_dir/lineage.tsv" \
@@ -844,6 +923,7 @@ qwen_native_smoke_pipeline() {
         "$NATIVE_TRAIN_PROTOCOL_GATE_MANIFEST" "$run/train.log" \
         "$run/resolved-config.yaml" "$run/run.env" "$run/lineage.tsv" \
         "$run/native-training-contract.json" \
+        "$run/wandb-receipt.json" \
         "$results_dir/smoke-decision.json" \
         "$run/traces/train_trajectories.jsonl" \
         "$run/traces/train_trajectories.manifest.json" \
@@ -873,7 +953,7 @@ qwen_native_main_pipeline() {
     local eval_trace_digest eval_trace_manifest_digest
     local results_dir analysis_dir decision_metadata analysis_decision contrast_count
     local branch_authorized=false branch_rows='' ar_rows='' branch_json stage_order index_content
-    local wandb_run wandb_file wandb_count wandb_history_count
+    local wandb_run wandb_file wandb_count wandb_steps
     local eval_key eval_suffix eval_artifact eval_rows eval_stage control_eval_run cost_eval_run
     local trace_identity eval_trace_digest_tmp eval_trace_manifest_digest_tmp
     local -a evidence_files wandb_runs
@@ -883,7 +963,7 @@ qwen_native_main_pipeline() {
     local -A cost_eval_trace_manifest_digests paired_dirs eval_expected_rows eval_artifacts
     local -A parent_eval_runs reproduced_eval_runs parent_eval_trace_digests
     local -A parent_eval_trace_manifest_digests reproduced_eval_trace_digests
-    local -A reproduced_eval_trace_manifest_digests ar_dirs
+    local -A reproduced_eval_trace_manifest_digests ar_dirs wandb_train_steps
     eval_expected_rows[val]=128
     eval_expected_rows[nq_test]=128
     eval_expected_rows[multihop]=256
@@ -938,7 +1018,7 @@ qwen_native_main_pipeline() {
         "$analysis_decision" "$contrast_count")" || return 1
     atomic_write "$results_dir/branch-decision.json" "$branch_json"$'\n'
 
-    # B/C use the sealed native-v3 train/eval contract, not the temporary 64x5 probe.
+    # B/C use the sealed native-v4 train/eval contract, not the temporary 64x5 probe.
     export EVAL_DATA_FILE=''
     export EVAL_EXPECTED_ROWS=128
     export EVAL_GROUP_SIZE=1
@@ -1028,7 +1108,7 @@ qwen_native_main_pipeline() {
             "$((BRANCH_STEPS * TRAIN_BATCH_SIZE * 5))")" || return 1
         IFS=$'\t' read -r cost_trace_digest cost_trace_manifest_digest <<<"$cost_trace"
 
-        # Evaluate both fixed endpoints greedily on curated and unfiltered v3 sets.
+        # Evaluate both fixed endpoints greedily on curated and unfiltered v4 sets.
         for eval_key in "${eval_keys[@]}"; do
             eval_suffix="$eval_key"
             eval_artifact="${eval_artifacts[$eval_key]}"
@@ -1198,11 +1278,14 @@ qwen_native_main_pipeline() {
         done
     fi
     wandb_runs=("$reproduce_run" "$eval_run")
+    wandb_train_steps["$reproduce_run"]="$REPRODUCE_STEPS"
     for eval_key in "${eval_keys[@]}"; do
         wandb_runs+=("${parent_eval_runs[$eval_key]}" "${reproduced_eval_runs[$eval_key]}")
     done
     if [[ "$branch_authorized" == true ]]; then
         wandb_runs+=("$control_run" "$cost_run")
+        wandb_train_steps["$control_run"]="$BRANCH_STEPS"
+        wandb_train_steps["$cost_run"]="$BRANCH_STEPS"
         for eval_key in "${eval_keys[@]}"; do
             wandb_runs+=("${control_eval_runs[$eval_key]}" "${cost_eval_runs[$eval_key]}")
         done
@@ -1212,22 +1295,17 @@ qwen_native_main_pipeline() {
             printf 'Run-specific WandB directory is missing: %s\n' "$wandb_run" >&2
             return 1
         }
+        wandb_steps="${wandb_train_steps[$wandb_run]:-0}"
+        write_wandb_receipt "$wandb_run" "$wandb_steps" || return $?
+        verify_wandb_receipt "$wandb_run" "$wandb_steps" || return $?
+        evidence_files+=("$wandb_run/wandb-receipt.json")
         wandb_count=0
-        wandb_history_count=0
         while IFS= read -r -d '' wandb_file; do
             evidence_files+=("$wandb_file")
             ((wandb_count += 1))
-            if [[ "$wandb_file" == *.wandb ]]; then
-                ((wandb_history_count += 1))
-            fi
         done < <(find "$wandb_run/wandb" -type f -size +0c -print0 | LC_ALL=C sort -z)
         ((wandb_count > 0)) || {
             printf 'Run-specific WandB history is empty: %s\n' "$wandb_run" >&2
-            return 1
-        }
-        ((wandb_history_count > 0)) || {
-            printf 'Run-specific WandB has no nonempty *.wandb history: %s\n' \
-                "$wandb_run" >&2
             return 1
         }
     done

@@ -7,7 +7,7 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$ROOT"' EXIT
 
-DATA_DIR="$ROOT/data/search_mix_qwen35_native_v3"
+DATA_DIR="$ROOT/data/search_mix_qwen35_native_v4"
 LEGACY_DIR="$ROOT/data/search_mix"
 mkdir -p "$DATA_DIR" "$LEGACY_DIR" "$ROOT/data/nq_small" \
     "$ROOT/data/search_opportunity_gate" "$ROOT/envs/train/bin" \
@@ -43,10 +43,13 @@ catalog = b"".join(
 )
 (root / "catalog.jsonl").write_bytes(catalog)
 manifest = {
-    "schema_version": 4,
+    "schema_version": 5,
     "prompt_contract": {
         "tool_protocol": "qwen35_native",
-        "prompt_version": "qwen35-native-search-v3-original-aligned",
+        "prompt_version": "qwen35-native-search-v4-terminal-answer-only",
+        "terminal_answer_only": True,
+        "terminal_prompt_version": "qwen35-terminal-answer-v1",
+        "terminal_prompt_sha256": "afc18b79afaafccece6927aec5ccd7898ef2ae17766bce7ffda244eef388d7f2",
     },
     "artifacts": {
         "catalog": {
@@ -79,7 +82,7 @@ QWEN_NATIVE_GATE_STAGE=g0_g1
 source "$AUTODL_DIR/08_gpu_qwen_native_gate.sh"
 require_native_gate
 [[ "$AUTODL_GPU_PIPELINE" == qwen_native_gate && "$TOOL_PROTOCOL" == qwen35_native ]]
-[[ "$DATA_DIR" == "$ROOT/data/search_mix_qwen35_native_v3" ]]
+[[ "$DATA_DIR" == "$ROOT/data/search_mix_qwen35_native_v4" ]]
 [[ "$EVAL_EXPECTED_ROWS" == 16 && "$EVAL_GROUP_SIZE" == 2 ]]
 
 # GPU helpers must import the sealed checkout without relying on an editable install.
@@ -214,8 +217,13 @@ for mode in ("direct", "native_manager"):
             })
 fixture = {
     "resolved_config": {
+        "schema": "search-r1.qwen-native-protocol-probe",
+        "schema_version": 4,
         "checkpoint_digest": digest, "sampling": sampling,
-        "prompt_version": "qwen35-native-search-v3-original-aligned",
+        "prompt_version": "qwen35-native-search-v4-terminal-answer-only",
+        "terminal_answer_only": True,
+        "terminal_prompt_version": "qwen35-terminal-answer-v1",
+        "terminal_prompt_sha256": "afc18b79afaafccece6927aec5ccd7898ef2ae17766bce7ffda244eef388d7f2",
         "max_action_budget": 4, "max_obs_length": 500,
     },
     "records": records,
@@ -234,28 +242,91 @@ fixture_path.write_text(json.dumps(fixture), encoding="utf-8")
 with trace_path.open("w", encoding="utf-8", newline="\n") as handle:
     for question in range(16):
         for slot in range(2):
+            turns = [{
+                "action": "search", "valid_action": True,
+                "search_query": f"capital city {question}",
+                "retrieval_executed": True,
+                "observation": "Doc 1 evidence", "retrieved_docs": [{"title": "Doc"}],
+                "generation_turn": 0,
+            }]
+            generation_events = [{
+                "turn": 0, "text": "reasoning</think><tool_call>x</tool_call>",
+                "raw_text": "reasoning</think><tool_call>x</tool_call> tail",
+                "raw_token_ids": [1, 2, 3], "action_token_ids": [1, 2],
+                "tail_dropped": True, "generation_context": "initial_question",
+                "terminal_generation": False, "action": "search", "clipped": False,
+                "executed_search": True,
+            }]
+            retrieval_events = [{"turn": 0, "query": f"capital city {question}"}]
+            executed_search_count = 1
+            final_answer = None
+            em = 0
+
+            # Exercise the v4 terminal path once while retaining ordinary
+            # zero-terminal trajectories for the other groups.
+            if question == 0 and slot == 0:
+                turns = []
+                generation_events = []
+                retrieval_events = []
+                for turn in range(4):
+                    query = f"capital city {question} evidence {turn}"
+                    turns.append({
+                        "action": "search", "valid_action": True,
+                        "search_query": query, "retrieval_executed": True,
+                        "observation": f"Doc {turn + 1} evidence",
+                        "retrieved_docs": [{"title": f"Doc {turn + 1}"}],
+                        "generation_turn": turn,
+                    })
+                    generation_events.append({
+                        "turn": turn,
+                        "text": "reasoning</think><tool_call>x</tool_call>",
+                        "raw_text": "reasoning</think><tool_call>x</tool_call> tail",
+                        "raw_token_ids": [1, 2, 3], "action_token_ids": [1, 2],
+                        "tail_dropped": True,
+                        "generation_context": (
+                            "initial_question" if turn == 0 else "tool_response"),
+                        "terminal_generation": False, "action": "search",
+                        "clipped": False, "executed_search": True,
+                    })
+                    retrieval_events.append({"turn": turn, "query": query})
+                turns.append({
+                    "action": "answer", "valid_action": True,
+                    "search_query": None, "retrieval_executed": False,
+                    "observation": None, "retrieved_docs": [],
+                    "generation_turn": 4,
+                })
+                generation_events.append({
+                    "turn": 4,
+                    "text": "reasoning</think><answer>Paris</answer>",
+                    "raw_text": "reasoning</think><answer>Paris</answer> tail",
+                    "raw_token_ids": [1, 2, 3], "action_token_ids": [1, 2],
+                    "tail_dropped": True, "generation_context": "terminal_answer",
+                    "terminal_generation": True,
+                    "terminal_instruction_applied": True,
+                    "terminal_prompt_version": "qwen35-terminal-answer-v1",
+                    "terminal_prompt_sha256": "afc18b79afaafccece6927aec5ccd7898ef2ae17766bce7ffda244eef388d7f2",
+                    "terminal_prompt_policy_token_count": 0,
+                    "requested_action": "answer", "action": "answer",
+                    "parse_error": None, "terminal_rejection_reason": None,
+                    "valid_action": True, "executed_search": False,
+                    "clipped": False,
+                })
+                executed_search_count = 4
+                final_answer = "Paris"
+                em = 1
             trace = {
                 "sample_id": f"hotpotqa:train:{question}", "group_slot": slot,
                 "schema_version": 3,
                 "checkpoint_digest": digest, "question": "What is the capital city?",
-                "turns": [{
-                    "action": "search", "valid_action": True,
-                    "search_query": f"capital city {question}", "retrieval_executed": True,
-                    "observation": "Doc 1 evidence", "retrieved_docs": [{"title": "Doc"}],
-                }],
-                "executed_search_count": 1,
-                "generation_events": [{
-                    "turn": 0, "text": "reasoning</think><tool_call>x</tool_call>",
-                    "raw_text": "reasoning</think><tool_call>x</tool_call> tail",
-                    "raw_token_ids": [1, 2, 3], "action_token_ids": [1, 2],
-                    "tail_dropped": True, "generation_context": "initial_question",
-                    "action": "search", "clipped": False,
-                }],
-                "retrieval_events": [{"turn": 0, "query": f"capital city {question}"}],
-                "max_action_budget": 4, "action_count": 1,
-                "policy_token_count": 2, "observation_token_count": 1,
+                "turns": turns, "executed_search_count": executed_search_count,
+                "generation_events": generation_events,
+                "retrieval_events": retrieval_events,
+                "max_action_budget": 4, "action_count": len(generation_events),
+                "policy_token_count": len(generation_events) * 2,
+                "observation_token_count": executed_search_count,
                 "observation_policy_token_count": 0, "info_mask_consistent": True,
-                "invalid_action_count": 0, "response_clipped": False, "em": 0,
+                "invalid_action_count": 0, "response_clipped": False,
+                "final_answer": final_answer, "em": em,
             }
             handle.write(json.dumps(trace, sort_keys=True) + "\n")
 PY
@@ -274,6 +345,23 @@ ANALYSIS="$ROOT/analysis"
     --protocol-probe-dir "$PROBE_OUTPUT" --output-dir "$ANALYSIS"
 grep -Fq '"decision":"GO"' "$ANALYSIS/go_no_go.json"
 [[ "$(wc -l <"$ANALYSIS/per_trajectory.jsonl")" == 32 ]]
+"$PYTHON_BIN" - "$ANALYSIS/summary.json" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+summary = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+overall = summary["overall"]
+criteria = summary["criteria"]
+assert overall["terminal_generation_count"] == 1
+assert overall["terminal_instruction_applied_count"] == 1
+assert overall["terminal_answer_count"] == 1
+assert overall["terminal_answer_rate"] == 1.0
+assert overall["terminal_requested_search_rate"] == 0.0
+assert criteria["g1_terminal_instruction_applied_count"]["observed"] == 1
+assert criteria["g1_terminal_answer_rate"]["observed"] == 1.0
+assert criteria["g1_terminal_requested_search_rate"]["observed"] == 0.0
+PY
 
 RAW_MISMATCH_FIXTURE="$ROOT/protocol-raw-mismatch-fixture.json"
 DIRECT_INVALID_FIXTURE="$ROOT/protocol-direct-invalid-fixture.json"
@@ -371,9 +459,9 @@ if "$PYTHON_BIN" "$AUTODL_DIR/qwen_native_gate_analysis.py" \
     exit 1
 fi
 
-# LEGACY_V2_READ_ONLY_BEGIN: active v3 has no pre-training G2/G3 shell stages.
+# LEGACY_V2_READ_ONLY_BEGIN: active v4 has no pre-training G2/G3 shell stages.
 # The historical fixtures below document old bindings and are not executed.
-printf 'qwen native v3 E0/G0/G1 pipeline tests passed\n'
+printf 'qwen native v4 E0/G0/G1 pipeline tests passed\n'
 exit 0
 
 # A complete scientific NO-GO is still exit 0 and retains its report.

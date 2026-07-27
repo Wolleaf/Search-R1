@@ -216,18 +216,23 @@ def test_registered_mix_uses_hotpot_majority_with_bridge_weighting():
     assert visibility.command == "validate-native-evidence"
     assert visibility.source_manifest == Path("source/manifest.json")
     assert search_mix.NATIVE_EVAL_FILES == {
-        "nq_test_eval": "nq_test_128_native_v3.parquet",
-        "multihop_eval": "multihop_eval_256_native_v3.parquet",
+        "nq_test_eval": "nq_test_128_native_v4.parquet",
+        "multihop_eval": "multihop_eval_256_native_v4.parquet",
     }
 
 
-def test_native_prompt_contract_registers_v3_original_alignment():
+def test_native_prompt_contract_registers_v4_terminal_answer_only():
     contract = search_mix.prompt_contract(search_mix.QWEN35_NATIVE)
     messages = search_mix.make_prompt("Who wrote Hamlet?",
                                       search_mix.QWEN35_NATIVE)
 
     assert contract[
-        "prompt_version"] == "qwen35-native-search-v3-original-aligned"
+        "prompt_version"] == "qwen35-native-search-v4-terminal-answer-only"
+    assert contract[
+        "terminal_prompt_version"] == "qwen35-terminal-answer-v1"
+    assert contract["terminal_prompt_sha256"] == (
+        search_mix.QWEN35_TERMINAL_PROMPT_SHA256)
+    assert contract["terminal_answer_only"] is True
     assert contract["tool_protocol"] == search_mix.QWEN35_NATIVE
     assert messages == search_mix.qwen35_messages("Who wrote Hamlet?")
     assert [message["role"] for message in messages] == ["user"]
@@ -689,6 +694,302 @@ def test_quota_split_builds_fixed_multihop_probe(monkeypatch):
             for record in probe} == expected_probe_indices
 
 
+def test_registered_answer_quality_manifest_covers_every_multi_gold_row():
+    payload, entries, raw = search_mix.load_answer_quality_exclusions()
+
+    assert raw == search_mix.canonical_json_bytes(payload)
+    assert len(entries) == 53
+    assert list(entries) == sorted(entries)
+    expected_ids = {
+        "retain_alias": {
+            "nq:train:40910",
+            "nq:train:8372",
+        },
+        "exclude_incorrect_gold": {
+            "nq:train:32855",
+            "nq:train:58242",
+        },
+        "exclude_multi_required": {
+            f"nq:train:{index}"
+            for index in (
+                "1012 10548 11570 14799 14949 15814 16373 20572 20760 "
+                "23248 25631 26800 29089 29435 30262 31232 31239 41264 "
+                "41887 42729 49712 50925 52332 54001 55343 58334 59065 "
+                "59778 63693 63773 75603 76310 8061"
+            ).split()
+        },
+        "exclude_ambiguous": {
+            f"nq:train:{index}"
+            for index in (
+                "10980 12536 18237 18658 21288 22109 23269 29679 32008 "
+                "34516 35339 38480 43251 54225 69768 71019"
+            ).split()
+        },
+    }
+    actual_ids = {
+        disposition: {
+            source_id
+            for source_id, entry in entries.items()
+            if entry["disposition"] == disposition
+        }
+        for disposition in expected_ids
+    }
+    assert actual_ids == expected_ids
+    assert Counter(entry["disposition"] for entry in entries.values()) == {
+        "retain_alias": 2,
+        "exclude_incorrect_gold": 2,
+        "exclude_multi_required": 33,
+        "exclude_ambiguous": 16,
+    }
+    assert Counter(entry["reason"] for entry in entries.values()) == {
+        "verified_alias_or_hierarchy": 2,
+        "incorrect_gold_answer": 1,
+        "incomplete_gold_list": 1,
+        "multiple_components_required": 33,
+        "ambiguous_scope_or_semantics": 16,
+    }
+    assert sum(
+        len(entry["expected_golden_answers"]) > 1
+        for entry in entries.values()) == 52
+    assert entries["nq:train:40910"]["expected_golden_answers"] == [
+        "Blue Head", "the Blue God"
+    ]
+    assert entries["nq:train:40910"]["disposition"] == "retain_alias"
+    assert entries["nq:train:8372"]["expected_golden_answers"] == [
+        "Colorado Springs, Colorado", "Colorado"
+    ]
+    assert entries["nq:train:8372"]["disposition"] == "retain_alias"
+    assert entries["nq:train:32855"] == {
+        "source_id": "nq:train:32855",
+        "source_revision": search_mix.DATASET_REVISION,
+        "expected_category": "single",
+        "expected_question": "one bit is equal to how many nibble",
+        "expected_golden_answers": ["four"],
+        "disposition": "exclude_incorrect_gold",
+        "reason": "incorrect_gold_answer",
+        "evidence": (
+            "A bit is one quarter of a nibble, but the pinned gold answer "
+            "says four."),
+    }
+    assert entries["nq:train:58242"]["expected_golden_answers"] == [
+        "Commonwealth Bank", "Westpac", "National Australia Bank"
+    ]
+    assert entries["nq:train:58242"]["reason"] == "incomplete_gold_list"
+
+
+def test_answer_quality_expected_content_fails_closed(tmp_path, monkeypatch):
+    source = tmp_path / "nq.jsonl"
+    source.write_bytes(
+        search_mix.canonical_json_bytes({
+            "question": "one bit is equal to how many nibble",
+            "golden_answers": ["four"],
+        }))
+    monkeypatch.setattr(search_mix, "verify_source",
+                        lambda _local_dir, _source: source)
+    _, registered, _ = search_mix.load_answer_quality_exclusions()
+    entry = dict(registered["nq:train:32855"])
+    exclusions = {"nq:train:0": {**entry, "source_id": "nq:train:0"}}
+
+    search_mix.verify_answer_quality_exclusion_sources(tmp_path, exclusions)
+    exclusions["nq:train:0"] = {
+        **exclusions["nq:train:0"],
+        "expected_golden_answers": ["0.25"],
+    }
+    with pytest.raises(ValueError, match="differs from pinned source"):
+        search_mix.verify_answer_quality_exclusion_sources(
+            tmp_path, exclusions)
+
+
+def test_answer_quality_reselection_replaces_multiple_rows_in_same_scope(
+        monkeypatch):
+    monkeypatch.setattr(search_mix, "QUOTAS", deepcopy(SMALL_QUOTAS))
+    evidence = _small_evidence() + [
+        _single_evidence(3),
+        _single_evidence(4),
+    ]
+    baseline, _, _ = search_mix.select_catalog(
+        evidence, CharacterTokenizer(), excluded_questions=set())
+    excluded = [
+        row for row in baseline if row["category"] == "single"
+    ][:2]
+    exclusions = {
+        row["source_id"]: {
+            "source_id": row["source_id"],
+            "source_revision": search_mix.DATASET_REVISION,
+            "expected_category": row["category"],
+            "expected_question": row["question"],
+            "expected_golden_answers": row["golden_answers"],
+            "disposition": "exclude_incorrect_gold",
+            "reason": "confirmed_bad_gold",
+            "evidence": "Unit-test exclusion.",
+        }
+        for row in excluded
+    }
+
+    filtered, rejected, stats = search_mix.select_catalog(
+        evidence,
+        CharacterTokenizer(),
+        excluded_questions=set(),
+        answer_quality_exclusions=exclusions)
+    lineage = stats["answer_quality_exclusions"]["replacement_lineage"]
+
+    assert stats["answer_quality_exclusions"] == {
+        "configured_count": 2,
+        "configured_disposition_counts": {
+            "exclude_incorrect_gold": 2
+        },
+        "configured_reason_counts": {
+            "confirmed_bad_gold": 2
+        },
+        "audited_multi_gold_count": 0,
+        "exclusion_count": 2,
+        "retained_count": 0,
+        "excluded_reason_counts": {
+            "confirmed_bad_gold": 2
+        },
+        "eligible_count": 2,
+        "matched_evidence_count": 2,
+        "replacement_count": 2,
+        "replacement_lineage": lineage,
+        "selected_reason_counts": {
+            "confirmed_bad_gold": 2
+        },
+        "selected_disposition_counts": {
+            "exclude_incorrect_gold": 2
+        },
+    }
+    assert rejected[
+        "materialize:single:answer_quality_exclusion:"
+        "exclude_incorrect_gold:confirmed_bad_gold"] == 2
+    assert {row["excluded_source_id"] for row in lineage} == {
+        row["source_id"]
+        for row in excluded
+    }
+    search_mix._verify_catalog_replacement_lineage(baseline, filtered, lineage)
+
+
+def test_answer_quality_retain_alias_stays_selected_without_replacement(
+        monkeypatch):
+    monkeypatch.setattr(search_mix, "QUOTAS", {
+        "single": {
+            "train": 1,
+            "val": 0,
+        }
+    })
+    evidence = _single_evidence(30)
+    evidence["golden_answers"].append("Northville")
+    audit = {
+        "source_id": evidence["source_id"],
+        "source_revision": search_mix.DATASET_REVISION,
+        "expected_category": "single",
+        "expected_question": evidence["question"],
+        "expected_golden_answers": evidence["golden_answers"],
+        "disposition": "retain_alias",
+        "reason": "verified_alias_or_hierarchy",
+        "evidence": "Both strings identify the same location.",
+    }
+
+    selected, rejected, stats = search_mix.select_catalog(
+        [evidence],
+        CharacterTokenizer(),
+        excluded_questions=set(),
+        answer_quality_exclusions={evidence["source_id"]: audit})
+
+    assert [row["source_id"] for row in selected] == [evidence["source_id"]]
+    assert selected[0]["golden_answers"] == evidence["golden_answers"]
+    assert rejected == Counter()
+    assert stats["answer_quality_exclusions"] == {
+        "configured_count": 1,
+        "configured_disposition_counts": {
+            "retain_alias": 1
+        },
+        "configured_reason_counts": {
+            "verified_alias_or_hierarchy": 1
+        },
+        "audited_multi_gold_count": 1,
+        "exclusion_count": 0,
+        "retained_count": 1,
+        "excluded_reason_counts": {},
+        "eligible_count": 1,
+        "matched_evidence_count": 1,
+        "replacement_count": 0,
+        "replacement_lineage": [],
+        "selected_reason_counts": {},
+        "selected_disposition_counts": {},
+    }
+
+
+def test_answer_quality_unaudited_multi_gold_cannot_replace_exclusion(
+        monkeypatch):
+    monkeypatch.setattr(search_mix, "QUOTAS", {
+        "single": {
+            "train": 1,
+            "val": 0,
+        }
+    })
+    evidence = [_single_evidence(index) for index in range(40, 44)]
+    ranked = sorted(
+        evidence,
+        key=lambda record: (
+            search_mix.evaluate_evidence(record, CharacterTokenizer())[2]
+            ["quality"],
+            search_mix.stable_key("quality", record["source_id"]),
+        ))
+    excluded, unaudited, expected_replacement = ranked[:3]
+    unaudited["golden_answers"].append("An unaudited alias")
+    exclusion = {
+        "source_id": excluded["source_id"],
+        "source_revision": search_mix.DATASET_REVISION,
+        "expected_category": "single",
+        "expected_question": excluded["question"],
+        "expected_golden_answers": excluded["golden_answers"],
+        "disposition": "exclude_incorrect_gold",
+        "reason": "confirmed_bad_gold",
+        "evidence": "Unit-test exclusion.",
+    }
+
+    selected, rejected, stats = search_mix.select_catalog(
+        evidence,
+        CharacterTokenizer(),
+        excluded_questions=set(),
+        answer_quality_exclusions={excluded["source_id"]: exclusion})
+
+    assert [row["source_id"] for row in selected] == [
+        expected_replacement["source_id"]
+    ]
+    assert rejected[
+        "materialize:single:answer_quality_unaudited_multi_gold"] == 1
+    assert stats["answer_quality_exclusions"]["replacement_lineage"] == [{
+        "category": "single",
+        "data_source": "nq",
+        "excluded_source_id": excluded["source_id"],
+        "output_split": "train",
+        "replacement_source_id": expected_replacement["source_id"],
+    }]
+
+
+def test_answer_quality_filter_does_not_change_multi_gold_or_semantics():
+    from verl.utils.reward_score.qa_em import em_check
+
+    catalog = {
+        "data_source": "nq",
+        "question": "Who wrote the song",
+        "golden_answers": ["Pete Seeger", "Lee Hays"],
+        "source_split": "train",
+        "source_index": 7,
+    }
+
+    record = search_mix.make_record(catalog)
+
+    assert record["reward_model"]["ground_truth"]["target"] == [
+        "Pete Seeger", "Lee Hays"
+    ]
+    assert em_check("Lee Hays", record["reward_model"]["ground_truth"][
+        "target"]) == 1
+    assert em_check("Pete Seeger and Lee Hays", record["reward_model"][
+        "ground_truth"]["target"]) == 0
+
+
 def test_native_prompt_changes_only_model_facing_messages(monkeypatch):
     monkeypatch.setattr(search_mix, "QUOTAS", deepcopy(SMALL_QUOTAS))
     catalog, _, _ = search_mix.select_catalog(_small_evidence(),
@@ -810,7 +1111,7 @@ def _write_json_rows(path, rows):
                     encoding="utf-8")
 
 
-def _build_manifest_fixture(tmp_path, monkeypatch):
+def _build_manifest_fixture(tmp_path, monkeypatch, spare_single=False):
     monkeypatch.setattr(search_mix, "QUOTAS", deepcopy(SMALL_QUOTAS))
     monkeypatch.setattr(search_mix, "RETRIEVAL_TARGETS",
                         deepcopy(SMALL_RETRIEVAL_TARGETS))
@@ -834,6 +1135,9 @@ def _build_manifest_fixture(tmp_path, monkeypatch):
     model_dir.mkdir()
 
     evidence = _small_evidence()
+    if spare_single:
+        evidence.append(_single_evidence(3))
+    single_count = 4 if spare_single else 3
     catalog, rejection_counts, selection_stats = search_mix.select_catalog(
         evidence, CharacterTokenizer(), excluded_questions=set())
     catalog.sort(
@@ -866,16 +1170,16 @@ def _build_manifest_fixture(tmp_path, monkeypatch):
 
     retrieval_summary = {
         "source_rows": {
-            "nq": 3,
+            "nq": single_count,
             "hotpotqa": 6,
         },
         "candidates_after_prescreen": {
-            "single": 3,
+            "single": single_count,
             "comparison": 4,
             "bridge": 2,
         },
         "candidates_after_cap": {
-            "single": 3,
+            "single": single_count,
             "comparison": 4,
             "bridge": 2,
         },
@@ -887,7 +1191,7 @@ def _build_manifest_fixture(tmp_path, monkeypatch):
         "candidate_items_queried": len(evidence),
         "bm25_query_calls": 15,
         "structurally_valid": {
-            "single": 3,
+            "single": single_count,
             "comparison": 4,
             "bridge": 2,
         },
@@ -1027,13 +1331,48 @@ def _regular_file_snapshot(root):
 def _prepare_native_fixture_source(tmp_path, monkeypatch):
     source_dir = tmp_path / "source"
     source_dir.mkdir()
-    paths = _build_manifest_fixture(source_dir, monkeypatch)
+    paths = _build_manifest_fixture(source_dir, monkeypatch, spare_single=True)
     source_manifest_before = paths["manifest"].read_bytes()
 
     for source in search_mix.SOURCE_SPECS:
         path = search_mix.source_path(source_dir, source)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(source, encoding="utf-8")
+        if source == "nq":
+            path.write_bytes(b"".join(
+                search_mix.canonical_json_bytes({
+                    "question": f"Where was subject {index} born",
+                    "golden_answers": [f"Northville {index}"],
+                }) for index in range(4)))
+        else:
+            path.write_bytes(search_mix.canonical_json_bytes({}))
+
+    source_catalog = search_mix.read_canonical_jsonl(paths["catalog"])
+    excluded = next(row for row in source_catalog
+                    if row["data_source"] == "nq")
+    quality_payload = {
+        "schema_version":
+        search_mix.ANSWER_QUALITY_EXCLUSIONS_SCHEMA_VERSION,
+        "dataset": {
+            "name": search_mix.DATASET_NAME,
+            "revision": search_mix.DATASET_REVISION,
+        },
+        "entries": [{
+            "source_id": excluded["source_id"],
+            "source_revision": search_mix.DATASET_REVISION,
+            "expected_category": excluded["category"],
+            "expected_question": excluded["question"],
+            "expected_golden_answers": excluded["golden_answers"],
+            "disposition": "exclude_incorrect_gold",
+            "reason": "fixture_incorrect_gold",
+            "evidence": "Fixture-only verified answer-quality exclusion.",
+        }],
+    }
+    quality_path = tmp_path / search_mix.ANSWER_QUALITY_EXCLUSIONS_FILE
+    quality_path.write_bytes(search_mix.canonical_json_bytes(quality_payload))
+    monkeypatch.setattr(search_mix, "ANSWER_QUALITY_EXCLUSIONS_PATH",
+                        quality_path)
+    paths["quality_manifest"] = quality_path
+    paths["excluded_source_id"] = excluded["source_id"]
 
     def verify_fixture_source(local_dir, source):
         path = search_mix.source_path(Path(local_dir), source)
@@ -1101,7 +1440,7 @@ def test_materialize_native_refuses_output_inside_source(tmp_path):
                                       tmp_path / "model")
 
 
-def test_materialize_native_reselects_source_once_without_generic_materialize(
+def test_materialize_native_reselects_and_verifies_without_generic_materialize(
         tmp_path, monkeypatch):
     paths, source_snapshot, _ = _prepare_native_fixture_source(
         tmp_path, monkeypatch)
@@ -1124,29 +1463,35 @@ def test_materialize_native_reselects_source_once_without_generic_materialize(
                                                    paths["model_dir"])
 
     assert manifest_path == output_dir / search_mix.MANIFEST_FILE
-    assert len(calls) == 1
+    assert len(calls) == 3
     assert (_regular_file_snapshot(paths["manifest"].parent) ==
             source_snapshot)
 
 
-def test_materialize_native_no_reselection_skips_catalog_selection(
-        tmp_path, monkeypatch):
+def test_generic_materialize_cannot_publish_native_schema_five(tmp_path):
+    lineage = {
+        "source_manifest_sha256": "1" * 64,
+        "source_catalog_sha256": "2" * 64,
+    }
+
+    with pytest.raises(ValueError,
+                       match="must be created with materialize-native"):
+        search_mix.materialize(tmp_path,
+                               tmp_path / "model",
+                               tool_protocol=search_mix.QWEN35_NATIVE,
+                               derived_from=lineage)
+
+
+def test_materialize_native_rejects_no_reselection(tmp_path, monkeypatch):
     paths, source_snapshot, _ = _prepare_native_fixture_source(
         tmp_path, monkeypatch)
 
-    def forbidden_select(*args, **kwargs):
-        del args, kwargs
-        raise AssertionError("no-reselection materialization selected a catalog")
+    with pytest.raises(ValueError, match="requires deterministic"):
+        search_mix.materialize_native(paths["manifest"],
+                                      tmp_path / "native",
+                                      paths["model_dir"],
+                                      reselect_catalog=False)
 
-    monkeypatch.setattr(search_mix, "select_catalog", forbidden_select)
-    output_dir = tmp_path / "native"
-    manifest_path = search_mix.materialize_native(
-        paths["manifest"],
-        output_dir,
-        paths["model_dir"],
-        reselect_catalog=False)
-
-    assert manifest_path == output_dir / search_mix.MANIFEST_FILE
     assert (_regular_file_snapshot(paths["manifest"].parent) ==
             source_snapshot)
 
@@ -1199,7 +1544,7 @@ def test_materialize_native_validation_failure_does_not_publish_output(
             source_snapshot)
 
 
-def test_materialize_native_is_prompt_only_and_preserves_source_and_selection(
+def test_materialize_native_reselects_one_quality_row_and_preserves_source(
         tmp_path, monkeypatch):
     paths, output_dir, manifest_path, source_manifest_before = (
         _build_native_fixture(tmp_path, monkeypatch))
@@ -1224,14 +1569,29 @@ def test_materialize_native_is_prompt_only_and_preserves_source_and_selection(
         "source_manifest_sha256": search_mix.sha256_file(paths["manifest"]),
         "source_catalog_sha256": search_mix.sha256_file(paths["catalog"]),
     }
-    assert (output_dir / search_mix.CATALOG_FILE).read_bytes() == paths[
-        "catalog"].read_bytes()
+    source_catalog = search_mix.read_canonical_jsonl(paths["catalog"])
+    native_catalog = search_mix.read_canonical_jsonl(output_dir /
+                                                      search_mix.CATALOG_FILE)
+    lineage = native["answer_quality_exclusions"]["replacement_lineage"]
+    assert native["answer_quality_exclusions"]["configured_count"] == 1
+    assert native["answer_quality_exclusions"]["replacement_count"] == 1
+    assert native["answer_quality_exclusions"][
+        "configured_disposition_counts"] == {
+            "exclude_incorrect_gold": 1
+        }
+    assert native["answer_quality_exclusions"][
+        "configured_reason_counts"] == {"fixture_incorrect_gold": 1}
+    assert native["answer_quality_exclusions"][
+        "selected_disposition_counts"] == {
+            "exclude_incorrect_gold": 1
+        }
+    assert lineage[0]["excluded_source_id"] == paths["excluded_source_id"]
+    search_mix._verify_catalog_replacement_lineage(source_catalog,
+                                                   native_catalog, lineage)
     copied_artifacts = {
-        "catalog": search_mix.CATALOG_FILE,
         "exclusions": search_mix.EXCLUSIONS_FILE,
         "retrieval_evidence": search_mix.EVIDENCE_FILE,
         "retrieval_ledger": search_mix.RETRIEVAL_LEDGER_FILE,
-        "selection_funnel": search_mix.SELECTION_FUNNEL_FILE,
     }
     for label, filename in copied_artifacts.items():
         assert (output_dir / filename).read_bytes() == (
@@ -1240,25 +1600,26 @@ def test_materialize_native_is_prompt_only_and_preserves_source_and_selection(
     for filename in (
             search_mix.EVIDENCE_FILE,
             search_mix.RETRIEVAL_LEDGER_FILE,
-            search_mix.SELECTION_FUNNEL_FILE,
     ):
         sidecar = filename + ".sha256"
         assert (output_dir / sidecar).read_bytes() == (
             paths["manifest"].parent / sidecar).read_bytes()
+    assert (output_dir / search_mix.ANSWER_QUALITY_EXCLUSIONS_FILE
+            ).read_bytes() == paths["quality_manifest"].read_bytes()
+    assert (output_dir / search_mix.SELECTION_FUNNEL_FILE).read_bytes() != (
+        paths["manifest"].parent /
+        search_mix.SELECTION_FUNNEL_FILE).read_bytes()
+    excluded_split = lineage[0]["output_split"]
     for split in search_mix.OUTPUT_FILES:
-        assert native["artifacts"][split]["sample_ids"] == legacy["artifacts"][
-            split]["sample_ids"]
-        source_rows = search_mix._read_parquet(
-            paths["manifest"].parent / search_mix.OUTPUT_FILES[split])
-        native_rows = search_mix._read_parquet(
-            output_dir / search_mix.OUTPUT_FILES[split])
-        assert [{
-            key: value
-            for key, value in row.items() if key != "prompt"
-        } for row in native_rows] == [{
-            key: value
-            for key, value in row.items() if key != "prompt"
-        } for row in source_rows]
+        source_ids = set(legacy["artifacts"][split]["sample_ids"])
+        native_ids = set(native["artifacts"][split]["sample_ids"])
+        if split == excluded_split:
+            assert source_ids - native_ids == {lineage[0]["excluded_source_id"]}
+            assert native_ids - source_ids == {
+                lineage[0]["replacement_source_id"]
+            }
+        elif split != "probe":
+            assert native_ids == source_ids
     probe_ids = native["artifacts"]["probe"]["sample_ids"]
     assert native["artifacts"]["probe_g0"]["sample_ids"] == probe_ids[:1]
     assert native["artifacts"]["probe_autonomous"][
@@ -1363,60 +1724,17 @@ def test_verify_native_scans_every_materialized_prompt(tmp_path, monkeypatch):
     assert len(calls) == expected
 
 
-def test_verify_native_without_reselection_preserves_integrity_checks(
+def test_verify_native_schema5_requires_reselection_and_detects_drift(
         tmp_path, monkeypatch):
     paths, output_dir, manifest_path, _ = _build_native_fixture(
         tmp_path, monkeypatch)
-    tokenizer_calls = []
-    prompt_calls = []
-
-    class LocalOnlyAutoTokenizer:
-
-        @staticmethod
-        def from_pretrained(model_dir, local_files_only=False):
-            tokenizer_calls.append((Path(model_dir), local_files_only))
-            if local_files_only is not True:
-                raise AssertionError("tokenizer verification was not local-only")
-            return CharacterTokenizer()
-
-    transformers = ModuleType("transformers")
-    transformers.AutoTokenizer = LocalOnlyAutoTokenizer
-    monkeypatch.setitem(sys.modules, "transformers", transformers)
-
-    def forbidden_select(*args, **kwargs):
-        del args, kwargs
-        raise AssertionError("no-reselection verification selected a catalog")
-
-    def forbidden_retrieval_load(*args, **kwargs):
-        del args, kwargs
-        raise AssertionError("no-reselection verification loaded the evidence pool")
-
-    original_prompt_validator = search_mix._validate_native_prompt
-
-    def record_prompt_validation(tokenizer,
-                                 messages,
-                                 max_start_length=1024):
-        prompt_calls.append(messages)
-        return original_prompt_validator(tokenizer, messages,
-                                         max_start_length)
-
-    monkeypatch.setattr(search_mix, "select_catalog", forbidden_select)
-    monkeypatch.setattr(search_mix, "_load_retrieval_contract",
-                        forbidden_retrieval_load)
-    monkeypatch.setattr(search_mix, "_validate_native_prompt",
-                        record_prompt_validation)
-    payload = search_mix.verify_manifest(
-        manifest_path,
-        paths["model_dir"],
-        expected_tool_protocol=search_mix.QWEN35_NATIVE,
-        source_manifest=paths["manifest"],
-        reselect_catalog=False)
-
-    assert payload["schema_version"] == search_mix.MATERIALIZED_SCHEMA_VERSION
-    assert tokenizer_calls == [(paths["model_dir"], True)] * 2
-    expected_prompts = sum(payload["artifacts"][label]["rows"] for label in (
-        *search_mix.OUTPUT_FILES, *search_mix.NATIVE_PROBE_FILES))
-    assert len(prompt_calls) == expected_prompts
+    with pytest.raises(ValueError, match="requires catalog reselection"):
+        search_mix.verify_manifest(
+            manifest_path,
+            paths["model_dir"],
+            expected_tool_protocol=search_mix.QWEN35_NATIVE,
+            source_manifest=paths["manifest"],
+            reselect_catalog=False)
 
     replay = paths["manifest"].parent / search_mix.REPLAY_FILE
     replay_bytes = replay.read_bytes()
@@ -1426,20 +1744,21 @@ def test_verify_native_without_reselection_preserves_integrity_checks(
             manifest_path,
             paths["model_dir"],
             expected_tool_protocol=search_mix.QWEN35_NATIVE,
-            source_manifest=paths["manifest"],
-            reselect_catalog=False)
+            source_manifest=paths["manifest"])
     replay.write_bytes(replay_bytes)
 
     native_catalog = output_dir / search_mix.CATALOG_FILE
-    native_catalog.write_bytes(native_catalog.read_bytes() + b"\n")
+    records = search_mix.read_canonical_jsonl(native_catalog)
+    records[0]["question"] += " drift"
+    native_catalog.write_bytes(b"".join(
+        search_mix.canonical_json_bytes(record) for record in records))
     _rewrite_manifest_artifact(manifest_path, "catalog", native_catalog)
-    with pytest.raises(ValueError, match="Native catalog does not match source"):
+    with pytest.raises(ValueError, match="quality-filtered reselection"):
         search_mix.verify_manifest(
             manifest_path,
             paths["model_dir"],
             expected_tool_protocol=search_mix.QWEN35_NATIVE,
-            source_manifest=paths["manifest"],
-            reselect_catalog=False)
+            source_manifest=paths["manifest"])
 
 
 def test_verify_native_requires_source_manifest(tmp_path, monkeypatch):
@@ -1519,10 +1838,8 @@ def test_verify_native_rejects_coordinated_selection_funnel_drift(
     search_mix.write_digest_sidecar(funnel_path)
     _rewrite_manifest_artifact(manifest_path, "selection_funnel", funnel_path)
 
-    with pytest.raises(
-            ValueError,
-            match="Native artifact identity does not match source: selection_funnel"
-    ):
+    with pytest.raises(ValueError,
+                       match="retrieval funnel does not match sealed source"):
         search_mix.verify_manifest(manifest_path,
                                    paths["model_dir"],
                                    source_manifest=paths["manifest"])
