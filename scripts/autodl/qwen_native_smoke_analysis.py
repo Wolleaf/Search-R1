@@ -85,6 +85,11 @@ def _load_jsonl(path: Path, label: str) -> list[dict[str, Any]]:
     return records
 
 
+def _materialized_native_question(question: str) -> str:
+    question = re.sub(r"\s+", " ", question).strip()
+    return question if question.endswith("?") else question + "?"
+
+
 def _catalog(path: Path) -> dict[str, dict[str, Any]]:
     records: dict[str, dict[str, Any]] = {}
     for record in _load_jsonl(path, "catalog"):
@@ -103,7 +108,7 @@ def _catalog(path: Path) -> dict[str, dict[str, Any]]:
         ):
             raise ValueError("catalog identity or answer contract is invalid")
         records[sample_id] = {
-            "question": question.strip(),
+            "question": _materialized_native_question(question),
             "gold_answers": list(answers),
         }
     return records
@@ -150,18 +155,13 @@ def _metric_lines(path: Path) -> dict[int, dict[str, list[float]]]:
 def _wandb_tree(path: Path) -> tuple[int, str]:
     if not path.is_dir() or path.is_symlink():
         return 0, ""
-    root = path.resolve()
     entries: list[tuple[str, str]] = []
     for item in sorted(path.rglob("*"), key=lambda value: value.as_posix()):
         if item.is_symlink():
-            try:
-                target = item.resolve(strict=True)
-            except OSError as error:
-                raise ValueError(f"broken WandB symlink: {item}") from error
-            if target != root and root not in target.parents:
-                raise ValueError(f"WandB symlink escapes its run directory: {item}")
+            # The evidence publisher seals only nonempty regular files; all
+            # WandB metadata links are outside that evidence set.
             continue
-        if item.is_file():
+        if item.is_file() and item.stat().st_size > 0:
             relative = item.relative_to(path).as_posix()
             entries.append((relative, _sha256_file(item)))
     if not entries or not any(name.endswith(".wandb") for name, _ in entries):

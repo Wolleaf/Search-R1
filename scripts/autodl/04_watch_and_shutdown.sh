@@ -620,20 +620,14 @@ def wandb_tree(path):
     path = Path(path)
     if not path.is_dir() or path.is_symlink():
         return 0, ""
-    root = path.resolve()
     files = []
     for item in sorted(path.rglob("*"), key=lambda value: value.as_posix()):
         if item.is_symlink():
-            try:
-                target = item.resolve(strict=True)
-            except OSError as exc:
-                fail(f"broken WandB symlink: {item}: {exc}")
-            if target != root and root not in target.parents:
-                fail(f"WandB symlink escapes its run directory: {item}")
             continue
         if item.is_file():
             protected_file(item)
-            files.append((item.relative_to(path).as_posix(), sha256(item)))
+            if item.stat().st_size > 0:
+                files.append((item.relative_to(path).as_posix(), sha256(item)))
     if not files or not any(name.endswith(".wandb") for name, _ in files):
         return len(files), ""
     payload = "".join(

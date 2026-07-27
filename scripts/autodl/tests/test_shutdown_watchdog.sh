@@ -1099,6 +1099,18 @@ run_watchdog 0 --test-foreground
 [[ -f "$ATTEMPT/shutdown-safe" && -f "$ATTEMPT/shutdown-dispatched" ]]
 assert_order
 
+# WandB metadata links are not published evidence and must not change its tree.
+new_case qwen-native-training-smoke-wandb-metadata-link 0 success
+replace_with_native_training_smoke_results
+smoke_run="$PROJECT_ROOT/runs/smoke/attempts/smoke-$case_number"
+external_wandb_log="$PROJECT_ROOT/wandb-core-debug.log"
+printf 'external WandB metadata\n' >"$external_wandb_log"
+ln -s "$external_wandb_log" "$smoke_run/wandb/debug-core.log"
+: >"$smoke_run/wandb/empty.log"
+run_watchdog 0 --test-foreground
+[[ -f "$ATTEMPT/shutdown-safe" && -f "$ATTEMPT/shutdown-dispatched" ]]
+assert_order
+
 # A smoke scientific NO-GO is still a complete terminal result and may shut down.
 new_case qwen-native-training-smoke-no-go 0 success
 replace_with_native_training_smoke_results NO-GO

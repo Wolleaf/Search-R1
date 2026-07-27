@@ -111,6 +111,26 @@ class QwenNativeSmokeAnalysisTest(unittest.TestCase):
         self.assertEqual(result["metrics"]["mixed_groups"], 16)
         self.assertTrue(all(check["passed"] for check in result["checks"].values()))
 
+    def test_catalog_question_replays_native_prompt_materialization(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            args = self._fixture(Path(temporary))
+            catalog = [
+                json.loads(line) for line in args.catalog.read_text().splitlines()
+            ]
+            catalog[0]["question"] = "Question 0"
+            self._write_jsonl(args.catalog, catalog)
+
+            result = SMOKE.analyze(args)
+            self.assertEqual(result["decision"], "GO")
+
+            traces = [
+                json.loads(line) for line in args.trace.read_text().splitlines()
+            ]
+            traces[0]["question"] = "Different question?"
+            self._write_jsonl(args.trace, traces)
+            with self.assertRaisesRegex(ValueError, "question differs"):
+                SMOKE.analyze(args)
+
     def test_one_zero_advantage_step_is_analyzed_across_the_full_smoke(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             args = self._fixture(Path(temporary))
@@ -151,6 +171,45 @@ class QwenNativeSmokeAnalysisTest(unittest.TestCase):
             (args.wandb_dir / "offline-run-test" / "run-test.wandb").unlink()
             result = SMOKE.analyze(args)
         self.assertEqual(result["decision"], "NO-GO")
+        self.assertFalse(result["checks"]["wandb_offline_history"]["passed"])
+
+    def test_ignores_wandb_metadata_symlinks(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args = self._fixture(root)
+            external_log = root / "core-debug.log"
+            external_log.write_text("wandb core log", encoding="utf-8")
+            logs = args.wandb_dir / "offline-run-test" / "logs"
+            logs.mkdir()
+            (logs / "empty.log").touch()
+            link = logs / "debug-core.log"
+            try:
+                link.symlink_to(external_log)
+            except OSError as error:
+                self.skipTest(f"symlinks are unavailable: {error}")
+
+            result = SMOKE.analyze(args)
+
+        self.assertEqual(result["decision"], "GO")
+        self.assertEqual(result["metrics"]["wandb_files"], 1)
+
+    def test_symlink_only_wandb_history_is_not_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args = self._fixture(root)
+            history = args.wandb_dir / "offline-run-test" / "run-test.wandb"
+            history.unlink()
+            external_history = root / "external.wandb"
+            external_history.write_bytes(b"unsealed-history")
+            try:
+                history.symlink_to(external_history)
+            except OSError as error:
+                self.skipTest(f"symlinks are unavailable: {error}")
+
+            result = SMOKE.analyze(args)
+
+        self.assertEqual(result["decision"], "NO-GO")
+        self.assertEqual(result["metrics"]["wandb_files"], 0)
         self.assertFalse(result["checks"]["wandb_offline_history"]["passed"])
 
     def test_rejects_strict_em_or_catalog_drift(self) -> None:
