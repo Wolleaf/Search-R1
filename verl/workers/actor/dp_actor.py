@@ -76,11 +76,13 @@ class DataParallelPPOActor(BasePPOActor):
         wrapped_module = getattr(actor_module, '_fsdp_wrapped_module',
                                  actor_module)
         model_config = getattr(wrapped_module, 'config', None)
+        model_type = getattr(model_config, 'model_type', None)
         self.use_qwen35_policy_logits = (
             not self.use_remove_padding
             and self.config.get('state_masking', False)
-            and getattr(model_config, 'model_type', None) == 'qwen3_5')
-        print(f'Actor use_qwen35_policy_logits={self.use_qwen35_policy_logits}')
+            and model_type in {'qwen3_5', 'qwen3_5_text'})
+        print(f'Actor model_type={model_type!r} '
+              f'use_qwen35_policy_logits={self.use_qwen35_policy_logits}')
         self.ulysses_sequence_parallel_size = self.config.ulysses_sequence_parallel_size
         self.use_ulysses_sp = self.ulysses_sequence_parallel_size > 1
 

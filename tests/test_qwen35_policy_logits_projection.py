@@ -42,6 +42,16 @@ class _FakeCausalLM(torch.nn.Module):
         return SimpleNamespace(logits=logits)
 
 
+class _FakeFSDP(torch.nn.Module):
+
+    def __init__(self, module):
+        super().__init__()
+        self._fsdp_wrapped_module = module
+
+    def forward(self, *args, **kwargs):
+        return self._fsdp_wrapped_module(*args, **kwargs)
+
+
 def _make_actor(module):
     config = _Config(
         use_remove_padding=False,
@@ -81,6 +91,19 @@ def test_policy_projection_rejects_an_empty_policy_mask():
         )
 
 
+@pytest.mark.parametrize('model_type', ['qwen3_5', 'qwen3_5_text'])
+def test_qwen35_config_is_detected_through_fsdp_wrapper(model_type):
+    module = _FakeCausalLM(
+        torch.randn(5, 3),
+        torch.randn(7, 3),
+        model_type,
+    )
+
+    actor = _make_actor(_FakeFSDP(module))
+
+    assert actor.use_qwen35_policy_logits is True
+
+
 def test_qwen35_projection_preserves_masked_values_and_gradients():
     torch.manual_seed(7)
     sequence_length = 9
@@ -93,9 +116,10 @@ def test_qwen35_projection_preserves_masked_values_and_gradients():
     lm_head_weight = torch.randn(vocab_size,
                                  hidden_size,
                                  dtype=torch.float64)
-    qwen_module = _FakeCausalLM(hidden_states, lm_head_weight, 'qwen3_5')
+    qwen_module = _FakeCausalLM(hidden_states, lm_head_weight,
+                                'qwen3_5_text')
     generic_module = _FakeCausalLM(hidden_states, lm_head_weight, 'generic')
-    qwen_actor = _make_actor(qwen_module)
+    qwen_actor = _make_actor(_FakeFSDP(qwen_module))
     generic_actor = _make_actor(generic_module)
 
     responses = torch.tensor([
