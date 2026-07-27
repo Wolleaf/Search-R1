@@ -566,9 +566,12 @@ def run_environment_replay(tokenizer: Any, batch: Any, raw_messages: list[Any],
     action_ids = tokenizer(action_text, add_special_tokens=False,
                            return_tensors="pt")["input_ids"].to(
                                batch.batch["input_ids"].device)
-    suffix_ids, visible = manager._process_native_followups(
+    suffix_ids, visible, followup_metadata = manager._process_native_followups(
         conversations, action_ids, [action_text], [parsed], observations,
         torch.tensor([True], device=action_ids.device), device=action_ids.device)
+    if followup_metadata != [None]:
+        raise ValueError(
+            "E0 normal search replay unexpectedly applied terminal instruction")
     empty = action_ids[:, :0]
     right = manager._update_right_side(
         {"responses": empty, "responses_with_info_mask": empty},

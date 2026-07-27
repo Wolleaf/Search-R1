@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 import torch
 
+from scripts.autodl import qwen_native_protocol_probe
 from search_r1.llm_agent.generation import (
     LLMGenerationManager, slice_first_complete_native_action)
 from search_r1.llm_agent.tool_protocol import (
@@ -327,6 +328,33 @@ def _native_manager(tokenizer, worker, **config_overrides):
 
     manager.batch_search = batch_search
     return manager
+
+
+def test_g0_environment_replay_accepts_nonterminal_followup_metadata(
+        monkeypatch):
+    tokenizer = _CharTokenizer()
+    raw_messages = [qwen35_messages("Who was Barack Obama?")]
+    batch, _ = _generation_batch(tokenizer, raw_messages)
+    documents = [{
+        "document_id": "obama",
+        "document": {"contents": "Barack Obama\n44th U.S. president."},
+    }]
+
+    def batch_search(manager, queries):
+        assert queries == ["Barack Obama"]
+        manager._last_batch_search_metadata = [documents]
+        return ["Barack Obama was the 44th president of the United States."]
+
+    monkeypatch.setattr(LLMGenerationManager, "batch_search", batch_search)
+
+    replay = qwen_native_protocol_probe.run_environment_replay(
+        tokenizer, batch, raw_messages, "sample-0", "unused")
+
+    assert replay["executed_search_count"] == 1
+    assert replay["nonempty_tool_response_count"] == 1
+    assert replay["retrieved_document_count"] == 1
+    assert replay["tool_role_rendered"] is True
+    assert replay["info_mask_consistent"] is True
 
 
 def test_native_postprocess_slices_original_tokens_at_first_action_close():
