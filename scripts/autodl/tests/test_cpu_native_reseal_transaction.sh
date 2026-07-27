@@ -19,6 +19,7 @@ required = (
     '--max-action-budget 4',
     '--selection-observation-length 384',
     '--rollout-observation-length 500',
+    'run_pytest_file_shards "$train_python" "$CHECKOUT_DIR/tests"',
 )
 missing = [value for value in required if value not in text]
 if missing:

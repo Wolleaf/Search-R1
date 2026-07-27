@@ -54,6 +54,23 @@ if torch.version.cuda != "12.8":
 PY
 }
 
+run_pytest_file_shards() {
+    local python_bin="$1" test_root="$2" test_file
+    local -a test_files=()
+    while IFS= read -r -d '' test_file; do
+        test_files+=("$test_file")
+    done < <(find "$test_root" -type f -name 'test_*.py' -print0 |
+        LC_ALL=C sort -z)
+    ((${#test_files[@]} > 0)) || {
+        printf 'No pytest files found under %s.\n' "$test_root" >&2
+        return 1
+    }
+    for test_file in "${test_files[@]}"; do
+        printf 'Running pytest shard: %s\n' "${test_file#"$CHECKOUT_DIR/"}"
+        "$python_bin" -m pytest -q -p no:cacheprovider "$test_file"
+    done
+}
+
 resolve_llmdevelop_python() {
     local conda_bin output
     if [[ -n "${AUTODL_PYTHON:-}" ]]; then
@@ -950,7 +967,7 @@ if not hits or not hits[0]["document"]["contents"]:
 PY
     fi
 
-    "$train_python" -m pytest -q -p no:cacheprovider "$CHECKOUT_DIR/tests"
+    run_pytest_file_shards "$train_python" "$CHECKOUT_DIR/tests"
     PYTHON_BIN="$train_python" bash "$CHECKOUT_DIR/scripts/autodl/tests/test_runtime.sh"
     bash "$CHECKOUT_DIR/scripts/autodl/tests/test_gated_config.sh"
     bash "$CHECKOUT_DIR/scripts/autodl/tests/test_gated_followup.sh"
