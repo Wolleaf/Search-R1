@@ -764,6 +764,65 @@ def test_native_user_retry_does_not_rewrite_prior_search_tokens():
         tokenizer.decode(conversation.prompt_token_ids))
 
 
+def test_native_terminal_prompt_materializes_search_reasoning_history():
+    tokenizer = _LastQueryAwareCharacterTokenizer()
+    messages = qwen35_messages("Capital of France?")
+    initial = render_qwen35_prompt(tokenizer, messages)
+    initial_ids = tokenizer(initial, add_special_tokens=False)["input_ids"]
+    conversation = Qwen35Conversation(tokenizer, messages, initial_ids)
+    first_search = (
+        "I should identify the country.\n</think>\n\n"
+        "<tool_call><function=search><parameter=query>France country"
+        "</parameter></function></tool_call>")
+    first_ids = tokenizer(first_search,
+                          add_special_tokens=False)["input_ids"]
+    conversation.append_followup(
+        first_search,
+        parse_action(
+            first_search,
+            QWEN35_NATIVE,
+            qwen35_reasoning_mode=QWEN35_REASONING_CONTINUATION,
+        ),
+        "France is a country in Europe.",
+        max_obs_length=300,
+        response_token_ids=first_ids,
+    )
+    before_terminal = list(conversation.prompt_token_ids)
+    terminal_search = (
+        "I still need its capital.\n</think>\n\n"
+        "<tool_call><function=search><parameter=query>capital of France"
+        "</parameter></function></tool_call>")
+    terminal_ids = tokenizer(terminal_search,
+                             add_special_tokens=False)["input_ids"]
+
+    followup = conversation.append_followup(
+        terminal_search,
+        parse_action(
+            terminal_search,
+            QWEN35_NATIVE,
+            qwen35_reasoning_mode=QWEN35_REASONING_CONTINUATION,
+        ),
+        "Paris is the capital of France.",
+        max_obs_length=500,
+        response_token_ids=terminal_ids,
+        terminal_answer_only=True,
+    )
+
+    assert conversation.prompt_token_ids == (
+        before_terminal + terminal_ids + list(followup.token_ids))
+    assert [message["role"] for message in conversation.messages[-3:]] == [
+        "assistant", "tool", "user"
+    ]
+    assert conversation.messages[-3] == {
+        "role": "assistant",
+        "content": "<think>\n" + terminal_search,
+        "reasoning_content": "",
+    }
+    assert QWEN35_TERMINAL_PROMPT in tokenizer.decode(followup.token_ids)
+    assert render_qwen35_prompt(tokenizer, conversation.messages) == (
+        tokenizer.decode(conversation.prompt_token_ids))
+
+
 @pytest.mark.parametrize("sampled_eos", [True, False])
 def test_native_conversation_preserves_trimmed_noncanonical_sample(
         sampled_eos):

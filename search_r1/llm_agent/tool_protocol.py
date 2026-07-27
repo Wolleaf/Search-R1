@@ -531,11 +531,11 @@ class Qwen35Conversation:
         terminal_answer_only: bool = False,
     ) -> tuple[list[dict[str, Any]], list[int], str]:
         messages = deepcopy(self.messages)
-        if not action.valid:
+        if not action.valid or terminal_answer_only:
             # Qwen suppresses ``reasoning_content`` for every assistant turn
             # before the latest ordinary user message. Materialize those
-            # wrappers before adding the user-role retry so rerendering cannot
-            # rewrite any already sampled token.
+            # wrappers before adding an ordinary user follow-up so rerendering
+            # cannot rewrite any already sampled token.
             for message in reversed(messages):
                 if message.get("role") == "user":
                     break
@@ -562,11 +562,18 @@ class Qwen35Conversation:
             marker_index = candidate.find(marker, located.action_start)
             if marker_index < 0:
                 raise ProtocolError("parsed native action marker is missing")
-            messages.append({
-                "role": "assistant",
-                "content": candidate[marker_index:].strip(),
-                "reasoning_content": action.prefix,
-            })
+            if terminal_answer_only:
+                messages.append({
+                    "role": "assistant",
+                    "content": "<think>\n" + response_text,
+                    "reasoning_content": "",
+                })
+            else:
+                messages.append({
+                    "role": "assistant",
+                    "content": candidate[marker_index:].strip(),
+                    "reasoning_content": action.prefix,
+                })
         else:
             # A later user retry makes Qwen stop adding the historical think
             # wrapper, so retain the opening tag that was already in the
