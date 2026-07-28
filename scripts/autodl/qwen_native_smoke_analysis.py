@@ -38,7 +38,7 @@ from wandb_history import scan_offline_run  # noqa: E402
 
 
 SCHEMA = "search-r1.qwen-native-smoke-decision"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 WANDB_METRIC_REL_TOL = 1e-6
 WANDB_METRIC_ABS_TOL = 1e-6
@@ -564,16 +564,6 @@ def analyze(args: argparse.Namespace) -> dict[str, Any]:
         "terminal_executed_search_count",
         terminal_metrics["terminal_executed_search_count"] == 0,
         terminal_metrics["terminal_executed_search_count"],
-    )
-    add(
-        "terminal_answer_rate",
-        terminal_answer_rate >= 0.90,
-        terminal_answer_rate,
-    )
-    add(
-        "terminal_requested_search_rate",
-        terminal_requested_search_rate <= 0.05,
-        terminal_requested_search_rate,
     )
     for key in ACTOR_METRICS:
         add(

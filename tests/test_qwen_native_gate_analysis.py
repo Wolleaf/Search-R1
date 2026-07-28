@@ -110,8 +110,11 @@ def _terminal_record(requested_action: str = "answer") -> dict[str, object]:
         "terminal_instruction_applied": True,
         "terminal_prompt_version": ANALYSIS.TERMINAL_PROMPT_VERSION,
         "terminal_prompt_sha256": ANALYSIS.TERMINAL_PROMPT_SHA256,
+        "terminal_prompt_text": ANALYSIS.TERMINAL_PROMPT_TEXT,
         "terminal_prompt_policy_token_count": 0,
+        "terminal_followup_token_count": 8,
         "generation_context": "terminal_answer",
+        "done": True,
         **result,
     })
     record.update({
@@ -448,10 +451,12 @@ def test_v4_terminal_answer_contract_and_metrics(
     assert overall["terminal_instruction_applied_count"] == 1
     assert overall["terminal_answer_rate"] == 1.0
     assert overall["terminal_requested_search_rate"] == 0.0
+    assert "terminal_answer_rate" not in overall["criteria"]
+    assert "terminal_requested_search_rate" not in overall["criteria"]
     assert all(item["passed"] for item in overall["criteria"].values())
 
 
-def test_v4_terminal_search_is_rejected_but_fails_behavior_target(
+def test_v4_terminal_search_is_rejected_but_behavior_rates_are_diagnostic(
         monkeypatch: pytest.MonkeyPatch) -> None:
     record = _terminal_record("search")
     record["checkpoint_digest"] = "a" * 64
@@ -467,11 +472,16 @@ def test_v4_terminal_search_is_rejected_but_fails_behavior_target(
     assert overall["terminal_search_request_count"] == 1
     assert overall["terminal_accepted_search_count"] == 0
     assert overall["terminal_executed_search_count"] == 0
-    assert overall["criteria"]["terminal_answer_rate"]["passed"] is False
-    assert overall["criteria"]["terminal_requested_search_rate"]["passed"] is False
+    assert overall["terminal_answer_rate"] == 0.0
+    assert overall["terminal_requested_search_rate"] == 1.0
+    assert "terminal_answer_rate" not in overall["criteria"]
+    assert "terminal_requested_search_rate" not in overall["criteria"]
+    assert overall["criteria"]["terminal_accepted_search_count"]["passed"] is True
+    assert overall["criteria"]["terminal_executed_search_count"]["passed"] is True
+    assert all(item["passed"] for item in overall["criteria"].values())
 
 
-def test_v4_invalid_terminal_answer_is_audited_as_behavior_no_go(
+def test_v4_invalid_terminal_answer_is_audited_as_diagnostic_behavior(
         monkeypatch: pytest.MonkeyPatch) -> None:
     record = _terminal_record("answer")
     record["checkpoint_digest"] = "a" * 64
@@ -493,7 +503,56 @@ def test_v4_invalid_terminal_answer_is_audited_as_behavior_no_go(
     assert overall["terminal_answer_count"] == 0
     assert overall["terminal_invalid_count"] == 1
     assert overall["terminal_answer_rate"] == 0.0
-    assert overall["criteria"]["terminal_answer_rate"]["passed"] is False
+    assert "terminal_answer_rate" not in overall["criteria"]
+    assert "terminal_requested_search_rate" not in overall["criteria"]
+    assert all(item["passed"] for item in overall["criteria"].values())
+
+
+def test_v5_gate_reports_terminal_behavior_without_blocking_admission(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    record = _terminal_record("search")
+    record["checkpoint_digest"] = "a" * 64
+    trace = tmp_path / "trace.jsonl"
+    trace.write_text(json.dumps(record) + "\n", encoding="utf-8")
+    args = SimpleNamespace(
+        stage="g0_g1",
+        trace=trace,
+        catalog=tmp_path / "catalog.jsonl",
+        data_manifest=tmp_path / "manifest.json",
+        expected_checkpoint_digest="a" * 64,
+        protocol_probe_dir=tmp_path / "protocol",
+        output_dir=tmp_path / "output",
+    )
+    monkeypatch.setitem(ANALYSIS.STAGE_SHAPES, "g0_g1", (1, 1))
+    monkeypatch.setattr(
+        ANALYSIS, "analyze_protocol_probe",
+        lambda *_args, **_kwargs: ({
+            "criteria": {
+                "protocol_integrity_count": ANALYSIS.criterion(1, "==", 1),
+            },
+        }, []),
+    )
+
+    decision = ANALYSIS.write_outputs(
+        args, ["hotpotqa:train:0"],
+        {"hotpotqa:train:0": "What is the capital city?"},
+        {"hotpotqa:train:0": ["Paris"]}, [], active_v4=True)
+
+    summary = json.loads((args.output_dir / "summary.json").read_text())
+    markdown = (args.output_dir / "summary.md").read_text(encoding="utf-8")
+    assert decision["schema_version"] == 5
+    assert summary["schema_version"] == 5
+    assert decision["decision"] == "GO"
+    assert decision["failed_criteria"] == []
+    assert summary["overall"]["terminal_answer_rate"] == 0.0
+    assert summary["overall"]["terminal_requested_search_rate"] == 1.0
+    assert "g1_terminal_answer_rate" not in decision["criteria"]
+    assert "g1_terminal_requested_search_rate" not in decision["criteria"]
+    assert decision["criteria"]["g1_terminal_accepted_search_count"]["passed"] is True
+    assert decision["criteria"]["g1_terminal_executed_search_count"]["passed"] is True
+    assert "## Diagnostics" in markdown
+    assert "terminal_answer_rate: 0.000 (diagnostic only; does not affect GO/NO-GO)" in markdown
+    assert "terminal_requested_search_rate: 1.000 (diagnostic only; does not affect GO/NO-GO)" in markdown
 
 
 @pytest.mark.parametrize(
@@ -525,6 +584,29 @@ def test_v4_invalid_terminal_answer_still_fails_closed_when_inconsistent(
             active_v4=True)
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("action", "search"),
+        ("parse_error", None),
+        ("terminal_rejection_reason", None),
+        ("valid_action", True),
+    ],
+)
+def test_v5_diagnostic_search_rate_does_not_relax_terminal_field_validation(
+        monkeypatch: pytest.MonkeyPatch, field: str, value: object) -> None:
+    record = _terminal_record("search")
+    record["checkpoint_digest"] = "a" * 64
+    record["generation_events"][-1][field] = value
+    monkeypatch.setitem(ANALYSIS.STAGE_SHAPES, "g0_g1", (1, 1))
+
+    with pytest.raises(ValueError, match="terminal allowlist result mismatch"):
+        ANALYSIS.validate_traces(
+            [record], "g0_g1", "a" * 64, ["hotpotqa:train:0"],
+            {"hotpotqa:train:0": "What is the capital city?"},
+            active_v4=True)
+
+
 def test_v4_terminal_generation_requires_answer_only_instruction(
         monkeypatch: pytest.MonkeyPatch) -> None:
     record = _terminal_record("answer")
@@ -533,6 +615,69 @@ def test_v4_terminal_generation_requires_answer_only_instruction(
     monkeypatch.setitem(ANALYSIS.STAGE_SHAPES, "g0_g1", (1, 1))
 
     with pytest.raises(ValueError, match="terminal answer-only contract"):
+        ANALYSIS.validate_traces(
+            [record], "g0_g1", "a" * 64, ["hotpotqa:train:0"],
+            {"hotpotqa:train:0": "What is the capital city?"},
+            active_v4=True)
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["terminal_prompt_text", "done", "terminal_followup_token_count"],
+)
+def test_v5_terminal_generation_requires_complete_prompt_evidence(
+        monkeypatch: pytest.MonkeyPatch, field: str) -> None:
+    record = _terminal_record("answer")
+    record["checkpoint_digest"] = "a" * 64
+    record["generation_events"][-1].pop(field)
+    monkeypatch.setitem(ANALYSIS.STAGE_SHAPES, "g0_g1", (1, 1))
+
+    with pytest.raises(ValueError, match="terminal answer-only contract"):
+        ANALYSIS.validate_traces(
+            [record], "g0_g1", "a" * 64, ["hotpotqa:train:0"],
+            {"hotpotqa:train:0": "What is the capital city?"},
+            active_v4=True)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("terminal_prompt_text", "tampered terminal prompt"),
+        ("generation_context", "tool_response"),
+        ("done", False),
+        ("executed_search", 0),
+        ("executed_search", True),
+        ("terminal_prompt_policy_token_count", False),
+        ("terminal_prompt_policy_token_count", True),
+        ("terminal_prompt_policy_token_count", 1),
+        ("terminal_followup_token_count", True),
+        ("terminal_followup_token_count", 0),
+    ],
+)
+def test_v5_terminal_generation_rejects_invalid_prompt_evidence(
+        monkeypatch: pytest.MonkeyPatch, field: str, value: object) -> None:
+    record = _terminal_record("answer")
+    record["checkpoint_digest"] = "a" * 64
+    record["generation_events"][-1][field] = value
+    monkeypatch.setitem(ANALYSIS.STAGE_SHAPES, "g0_g1", (1, 1))
+
+    with pytest.raises(ValueError, match="terminal answer-only contract"):
+        ANALYSIS.validate_traces(
+            [record], "g0_g1", "a" * 64, ["hotpotqa:train:0"],
+            {"hotpotqa:train:0": "What is the capital city?"},
+            active_v4=True)
+
+
+def test_v5_terminal_prompt_digest_is_replayed_from_recorded_text(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    record = _terminal_record("answer")
+    record["checkpoint_digest"] = "a" * 64
+    forged_digest = "0" * 64
+    record["generation_events"][-1]["terminal_prompt_sha256"] = forged_digest
+    monkeypatch.setattr(ANALYSIS, "TERMINAL_PROMPT_SHA256", forged_digest)
+    monkeypatch.setitem(ANALYSIS.STAGE_SHAPES, "g0_g1", (1, 1))
+
+    with pytest.raises(ValueError, match="terminal prompt digest mismatch"):
         ANALYSIS.validate_traces(
             [record], "g0_g1", "a" * 64, ["hotpotqa:train:0"],
             {"hotpotqa:train:0": "What is the capital city?"},

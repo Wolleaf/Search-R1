@@ -27,9 +27,9 @@ readonly NATIVE_TRAIN_CATALOG="$NATIVE_TRAIN_DATA_DIR/catalog.jsonl"
 readonly NATIVE_TRAIN_G3_DATA="$NATIVE_TRAIN_DATA_DIR/probe_multi_64.parquet"
 readonly NATIVE_TRAIN_SOURCE_DIR="$PROJECT_ROOT/data/search_mix"
 readonly NATIVE_TRAIN_PROMPT_VERSION=qwen35-native-search-v4-terminal-answer-only
-readonly NATIVE_TRAIN_SMOKE_CONTRACT=qwen-native-training-smoke-v4
-readonly NATIVE_TRAIN_MAIN_CONTRACT=qwen-native-training-main-v4
-readonly NATIVE_TRAIN_GATE_CONTRACT=qwen-native-gate-v4
+readonly NATIVE_TRAIN_SMOKE_CONTRACT=qwen-native-training-smoke-v5
+readonly NATIVE_TRAIN_MAIN_CONTRACT=qwen-native-training-main-v5
+readonly NATIVE_TRAIN_GATE_CONTRACT=qwen-native-gate-v5
 readonly NATIVE_TRAIN_GATE_CLI="$CHECKOUT_DIR/scripts/autodl/qwen_native_gate_analysis.py"
 readonly NATIVE_TRAIN_PAIRED_CLI="$CHECKOUT_DIR/scripts/autodl/paired_eval.py"
 readonly NATIVE_TRAIN_SMOKE_CLI="$CHECKOUT_DIR/scripts/autodl/qwen_native_smoke_analysis.py"
@@ -179,22 +179,122 @@ verify_complete_training_attempt() {
     VERIFIED_ATTEMPT_DIGEST="$marker_digest"
 }
 
+native_replay_temp_root() {
+    local root="${TMPDIR:-/tmp}"
+    [[ -d "$root" && ! -L "$root" ]] || {
+        printf 'Native evidence replay temp root is missing or symlinked: %s\n' \
+            "$root" >&2
+        return 1
+    }
+    readlink -f -- "$root"
+}
+
+cleanup_native_replay_dir() {
+    local directory="$1" expected_prefix="$2" temp_root canonical
+    temp_root="$(native_replay_temp_root)" || return 1
+    [[ -n "$directory" && -d "$directory" && ! -L "$directory" ]] || return 1
+    canonical="$(readlink -f -- "$directory")" || return 1
+    [[ "$directory" == "$canonical" && "$(dirname -- "$canonical")" == "$temp_root" &&
+        "$(basename -- "$canonical")" =~ ^${expected_prefix}[.][A-Za-z0-9]{6}$ ]] || {
+        printf 'Refusing unsafe native replay cleanup: %s\n' "$directory" >&2
+        return 1
+    }
+    rm -r -- "$canonical"
+}
+
+verify_protocol_gate_replay() {
+    local eval_trace="$1" protocol_probe_dir="$2" expected_digest="$3"
+    local sealed_results="$4" temp_root replay_root replay_output replay_decision
+    local replay_rc=0 file
+    temp_root="$(native_replay_temp_root)" || return 1
+    replay_root="$(mktemp -d "$temp_root/search-r1-gate-replay.XXXXXX")" || return 1
+    replay_output="$replay_root/output"
+    if replay_decision="$("$TRAIN_ENV/bin/python" "$NATIVE_TRAIN_GATE_CLI" \
+            --stage g0_g1 --trace "$eval_trace" \
+            --catalog "$NATIVE_TRAIN_CATALOG" \
+            --data-manifest "$NATIVE_TRAIN_MANIFEST" \
+            --expected-checkpoint-digest "$expected_digest" \
+            --protocol-probe-dir "$protocol_probe_dir" \
+            --output-dir "$replay_output")"; then
+        if [[ "$replay_decision" != 'Qwen native g0_g1 decision: GO' ]]; then
+            printf 'Structural G0/G1 analyzer replay is not GO.\n' >&2
+            replay_rc=1
+        fi
+    else
+        replay_rc=$?
+        printf 'Structural G0/G1 analyzer replay failed with exit code %s.\n' \
+            "$replay_rc" >&2
+    fi
+    if ((replay_rc == 0)); then
+        for file in summary.json summary.md go_no_go.json per_trajectory.jsonl \
+                per_question.jsonl protocol_records.jsonl; do
+            if ! cmp -s -- "$replay_output/$file" "$sealed_results/$file"; then
+                printf 'Structural G0/G1 replay disagrees with sealed evidence: %s\n' \
+                    "$file" >&2
+                replay_rc=1
+                break
+            fi
+        done
+    fi
+    if ! cleanup_native_replay_dir "$replay_root" search-r1-gate-replay; then
+        printf 'Failed to clean the structural G0/G1 replay directory.\n' >&2
+        replay_rc=1
+    fi
+    return "$replay_rc"
+}
+
+verify_smoke_analysis_replay() {
+    local run_dir="$1" sealed_decision="$2"
+    local temp_root replay_root replay_output replay_decision replay_rc=0
+    temp_root="$(native_replay_temp_root)" || return 1
+    replay_root="$(mktemp -d "$temp_root/search-r1-smoke-replay.XXXXXX")" || return 1
+    replay_output="$replay_root/smoke-decision.json"
+    if replay_decision="$("$TRAIN_ENV/bin/python" "$NATIVE_TRAIN_SMOKE_CLI" \
+            --trace "$run_dir/traces/train_trajectories.jsonl" \
+            --log "$run_dir/train.log" --catalog "$NATIVE_TRAIN_CATALOG" \
+            --wandb-dir "$run_dir/wandb" --output "$replay_output" \
+            --expected-steps "$BASE_GATE_STEPS" --batch-size "$TRAIN_BATCH_SIZE" \
+            --group-size 5)"; then
+        if [[ "$replay_decision" != GO ]]; then
+            printf 'Smoke analyzer replay is not GO.\n' >&2
+            replay_rc=1
+        elif ! cmp -s -- "$replay_output" "$sealed_decision"; then
+            printf 'Smoke analyzer replay disagrees with sealed smoke-decision.json.\n' >&2
+            replay_rc=1
+        fi
+    else
+        replay_rc=$?
+        printf 'Smoke analyzer replay failed with exit code %s.\n' "$replay_rc" >&2
+    fi
+    if ! cleanup_native_replay_dir "$replay_root" search-r1-smoke-replay; then
+        printf 'Failed to clean the smoke analyzer replay directory.\n' >&2
+        replay_rc=1
+    fi
+    return "$replay_rc"
+}
+
 verify_protocol_gate_evidence() {
     local marker="$1" expected_checkpoint="$2" expected_digest="$3"
     local expected_commit="$4" expected_handoff="$5" expected_data="$6"
+    local metadata eval_trace protocol_probe_dir
     verify_complete_training_attempt "$marker" qwen-native-gate \
         "$RUNS_ROOT/qwen-native-gate/attempts" "$NATIVE_TRAIN_GATE_CONTRACT" || return $?
-    "$TRAIN_ENV/bin/python" - \
+    metadata="$("$TRAIN_ENV/bin/python" - \
         "$VERIFIED_ATTEMPT_RESULTS" "$expected_checkpoint" "$expected_digest" \
-        "$expected_commit" "$expected_handoff" "$expected_data" <<'PY'
+        "$expected_commit" "$expected_handoff" "$expected_data" \
+        "$PROJECT_ROOT" <<'PY'
 import csv
 import json
 from pathlib import Path
 import sys
 
 results = Path(sys.argv[1])
-expected = sys.argv[2:]
-for name in ("stage.txt", "go_no_go.json", "summary.json", "lineage.tsv"):
+expected = sys.argv[2:7]
+project = Path(sys.argv[7])
+for name in (
+        "stage.txt", "go_no_go.json", "summary.json", "summary.md",
+        "per_trajectory.jsonl", "per_question.jsonl", "protocol_records.jsonl",
+        "lineage.tsv", "run-index.tsv"):
     path = results / name
     if not path.is_file() or path.is_symlink():
         raise SystemExit(f"structural protocol-gate evidence is missing or symlinked: {path}")
@@ -203,10 +303,10 @@ if (results / "stage.txt").read_text(encoding="utf-8").strip() != "g0_g1":
 decision = json.loads((results / "go_no_go.json").read_bytes())
 summary = json.loads((results / "summary.json").read_bytes())
 if (decision.get("schema") != "search-r1.qwen-native-gate" or
-        decision.get("schema_version") != 4 or
+        decision.get("schema_version") != 5 or
         decision.get("stage") != "g0_g1" or
         decision.get("decision") != "GO"):
-    raise SystemExit("structural G0/G1 decision is not a v4 GO")
+    raise SystemExit("structural G0/G1 decision is not a v5 GO")
 criteria = decision.get("criteria")
 required_criteria = {
     "g0_prompt_token_match_count",
@@ -226,17 +326,15 @@ required_criteria = {
     "g1_terminal_prompt_policy_token_count",
     "g1_terminal_accepted_search_count",
     "g1_terminal_executed_search_count",
-    "g1_terminal_answer_rate",
-    "g1_terminal_requested_search_rate",
 }
 if (not isinstance(criteria, dict) or set(criteria) != required_criteria or
         any(not isinstance(item, dict) or item.get("passed") is not True
             for item in criteria.values())):
     raise SystemExit("structural G0/G1 criteria are incomplete or failed")
 if (summary.get("schema") != "search-r1.qwen-native-gate" or
-        summary.get("schema_version") != 4 or
+        summary.get("schema_version") != 5 or
         summary.get("stage") != "g0_g1" or summary.get("decision") != "GO"):
-    raise SystemExit("structural G0/G1 summary is not a v4 GO")
+    raise SystemExit("structural G0/G1 summary is not a v5 GO")
 with (results / "lineage.tsv").open(newline="", encoding="utf-8") as handle:
     rows = list(csv.DictReader(handle, delimiter="\t"))
 if len(rows) != 1:
@@ -253,7 +351,37 @@ checks = {
 failed = sorted(key for key, passed in checks.items() if not passed)
 if failed:
     raise SystemExit("structural G0/G1 lineage mismatch: " + ", ".join(failed))
+with (results / "run-index.tsv").open(newline="", encoding="utf-8") as handle:
+    reader = csv.DictReader(handle, delimiter="\t")
+    index = list(reader)
+if (reader.fieldnames != ["stage", "mode", "run_dir", "trace"] or
+        len(index) != 2):
+    raise SystemExit("structural G0/G1 run index has the wrong shape")
+eval_row, probe_row = index
+eval_run = Path(eval_row.get("run_dir", ""))
+eval_trace = Path(eval_row.get("trace", ""))
+probe_run = Path(probe_row.get("run_dir", ""))
+probe_trace = Path(probe_row.get("trace", ""))
+protocol_probe_dir = probe_run / "output"
+if (eval_row.get("stage") != "g0_g1" or eval_row.get("mode") != "eval" or
+        probe_row.get("stage") != "g0" or
+        probe_row.get("mode") != "protocol_probe" or
+        eval_run.parent != project / "runs/eval/qwen_native_g1/attempts" or
+        probe_run.parent != project / "runs/eval/qwen_native_g0/attempts" or
+        eval_run.resolve(strict=True) != eval_run or
+        probe_run.resolve(strict=True) != probe_run or
+        eval_trace != eval_run / "traces/eval_predictions.jsonl" or
+        probe_trace != protocol_probe_dir / "records.jsonl" or
+        not eval_trace.is_file() or eval_trace.is_symlink() or
+        not protocol_probe_dir.is_dir() or protocol_probe_dir.is_symlink() or
+        not probe_trace.is_file() or probe_trace.is_symlink()):
+    raise SystemExit("structural G0/G1 run index is not bound to its raw evidence")
+print(eval_trace, protocol_probe_dir, sep="\t")
 PY
+    )" || return 1
+    IFS=$'\t' read -r eval_trace protocol_probe_dir <<<"$metadata"
+    verify_protocol_gate_replay "$eval_trace" "$protocol_probe_dir" \
+        "$expected_digest" "$VERIFIED_ATTEMPT_RESULTS" || return $?
     NATIVE_TRAIN_PROTOCOL_GATE_DIGEST="$VERIFIED_ATTEMPT_DIGEST"
     NATIVE_TRAIN_PROTOCOL_GATE_RESULTS="$VERIFIED_ATTEMPT_RESULTS"
     NATIVE_TRAIN_PROTOCOL_GATE_OUTER="$VERIFIED_ATTEMPT_OUTER"
@@ -268,7 +396,8 @@ verify_smoke_evidence() {
     verify_complete_training_attempt "$marker" qwen-native-training-smoke \
         "$NATIVE_TRAIN_RESULTS_ROOT/attempts" "$NATIVE_TRAIN_SMOKE_CONTRACT" || return $?
     metadata="$("$TRAIN_ENV/bin/python" - \
-        "$VERIFIED_ATTEMPT_RESULTS" "$NATIVE_TRAIN_CATALOG" <<'PY'
+        "$VERIFIED_ATTEMPT_RESULTS" "$NATIVE_TRAIN_CATALOG" \
+        "$PROJECT_ROOT" <<'PY'
 import csv
 import hashlib
 import json
@@ -277,6 +406,7 @@ import sys
 
 results = Path(sys.argv[1])
 catalog = Path(sys.argv[2])
+project = Path(sys.argv[3])
 for name in ("contract.env", "lineage.tsv", "run-index.tsv", "storage.env",
              "checkpoint-tree.env", "smoke-decision.json"):
     path = results / name
@@ -297,12 +427,12 @@ def read_env(path):
 contract = read_env(results / "contract.env")
 storage = read_env(results / "storage.env")
 checkpoint_tree = read_env(results / "checkpoint-tree.env")
-if contract.get("schema") != "qwen-native-training-smoke-v4" or contract.get("stage") != "smoke":
+if contract.get("schema") != "qwen-native-training-smoke-v5" or contract.get("stage") != "smoke":
     raise SystemExit("smoke contract identity mismatch")
 decision = json.loads((results / "smoke-decision.json").read_bytes())
 if (contract.get("decision") != "GO" or
         decision.get("schema") != "search-r1.qwen-native-smoke-decision" or
-        decision.get("schema_version") != 2 or decision.get("decision") != "GO"):
+        decision.get("schema_version") != 3 or decision.get("decision") != "GO"):
     raise SystemExit("smoke decision is not GO")
 for key in ("checkpoint_bytes", "filesystem_available_bytes"):
     try:
@@ -320,6 +450,16 @@ row = rows[0]
 if not row.get("run_dir"):
     raise SystemExit("smoke lineage has no run directory")
 run_dir = Path(row["run_dir"])
+if (run_dir.parent != project / "runs/smoke/attempts" or
+        not run_dir.is_dir() or run_dir.is_symlink() or
+        run_dir.resolve(strict=True) != run_dir):
+    raise SystemExit("smoke run directory is outside the registered attempt root")
+with (results / "run-index.tsv").open(newline="", encoding="utf-8") as handle:
+    reader = csv.DictReader(handle, delimiter="\t")
+    index = list(reader)
+if (reader.fieldnames != ["stage", "role", "run_dir"] or len(index) != 1 or
+        index[0] != {"stage": "S", "role": "smoke", "run_dir": str(run_dir)}):
+    raise SystemExit("smoke run index does not match lineage")
 keys = (
     "checkpoint", "checkpoint_digest", "parent_checkpoint",
     "parent_checkpoint_digest", "checkout_commit", "cpu_handoff_digest",
@@ -367,6 +507,8 @@ PY
         printf 'Smoke checkpoint path is not the fixed two-step endpoint.\n' >&2
         return 1
     }
+    verify_smoke_analysis_replay "$run_dir" \
+        "$VERIFIED_ATTEMPT_RESULTS/smoke-decision.json" || return $?
     verify_native_checkpoint_digest "$checkpoint" "$checkpoint_digest" || return $?
     verify_wandb_receipt "$run_dir" "$BASE_GATE_STEPS" || return $?
     NATIVE_TRAIN_SMOKE_DIGEST="$VERIFIED_ATTEMPT_DIGEST"

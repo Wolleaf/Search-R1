@@ -15,7 +15,7 @@
 ## 1. 决策与非目标
 
 1. **非法动作保持原样。** 当前 parser 未发现误杀合法 Qwen 调用的证据；不放宽格式、不加 format reward、不做约束解码。
-2. **新增 terminal answer-only 改进。** 四个常规 action 耗尽后，仅对仍 active 的轨迹注入 user message，并规定 terminal 轮唯一可接受动作是 `<answer>...</answer>`。
+2. **新增 terminal answer-only 改进。** 四个常规 action 耗尽后，仅对仍 active 的轨迹注入 user message；它是模型可见但不参与 policy loss 的软提醒，环境仍只接受 `<answer>...</answer>`，不会接受或执行新的 search。
 3. **保留论文 strict EM。** 只剔除明确错标或 gold 语义含混样本；不全局改成 substring、LLM judge 或顺序无关奖励。
 4. **修复 WandB 日志与门禁。** 每步必须真正写入 offline history，正常或异常结束必须显式 finish；文件存在不再等价于 history 存在。
 5. 在新证据通过前不启动 R60，不改变 group 5、batch 8、response/observation 500、action budget 4、采样参数、学习率或奖励系数。
@@ -62,7 +62,7 @@ terminal 轮采用 answer-only allowlist：
 - 其他非法格式：保留原始输出和错误原因、结束轨迹、奖励 0；
 - 不从 thinking、search query 或自由文本中事后拼造答案。
 
-这能保证 terminal search 永远不会被接受或执行，但文本提示不能数学保证生成模型 100% 输出合法答案。若要硬性保证标签，只能引入 constrained decoding 或无限重试；前者会使 rollout 采样分布与当前 actor/ref log-prob 不一致，后者改变 action budget，均超出最小实现。因此新门禁必须如实报告 terminal answer、search violation 和 invalid rate。
+这能保证 terminal search 永远不会被接受或执行，但文本提示不能数学保证生成模型 100% 输出合法答案。若要硬性保证标签，只能引入 constrained decoding 或无限重试；前者会使 rollout 采样分布与当前 actor/ref log-prob 不一致，后者改变 action budget，均超出最小实现。因此 terminal answer、requested-search 和 invalid count/rate 必须如实报告，但只作为模型行为诊断，不作为训练前 GO/NO-GO 的硬门槛。
 
 不在末轮临时移除 search schema。工具定义已经出现在初始 token context 中，使用另一套 `tools=[]` 重渲染可能改写历史前缀并破坏 PPO token/log-prob 对齐。
 
@@ -175,17 +175,20 @@ CPU 阶段复用现有模型、Wiki、BM25 和检索 evidence，只重物化受 
   -> 再决定是否启动 R60
 ```
 
-除原有 finite loss、mixed group、advantage、checkpoint 和 trace 条件外，新增：
+除原有 finite loss、mixed group、advantage、checkpoint、trace 和结构一致性条件外，terminal 硬门只检查可由实现保证的事实：
 
 - terminal instruction applied count 与第 4 轮后 active count 完全一致；
 - terminal prompt policy-token count 为 0；
 - terminal accepted/executed search 均为 0；
 - terminal `final_answer` 只来自严格 parser；
-- G0/G1 与 smoke 单独报告 terminal answer/requested-search/invalid rate；相较当前 `8/55` answer、`43/55` requested search，R60 前目标为 terminal answer rate 至少 90%、requested-search rate 至多 5%；
 - WandB binary 满足第 4.2 节全部条件；
 - evidence 持久化后再由 watchdog 关机。
 
-任何结构、数值、日志或行为门禁不通过都归档并停止，不自动降 batch、缩 response、放宽 EM 或启动 R60。
+G0/G1 与 smoke 仍单独报告 terminal answer、requested-search 和 invalid count/rate，用来衡量 parent 是否听从软提醒以及后续 RL 是否改善该行为；这些比率不再有 `90%/5%` 的训练准入阈值。任何上述结构、数值、日志硬门不通过都归档并停止，不自动降 batch、缩 response、放宽 EM 或启动 R60。
+
+旧合同下已经封存的 G0/G1 `NO-GO` 及其原始轨迹保持不可变，不能用新语义追溯改写为 `GO`。门禁合同更新后必须从同一 sealed parent 重新运行一次 G0/G1，生成绑定新 commit、配置和合同版本的独立证据；该重跑用于建立有效 lineage，不是反复采样直到出现有利结果。
+
+这次门禁语义修正不修改初始 prompt、terminal reminder 文本、parser、tool protocol、reward、数据、BM25 后端、采样设置或训练参数，也不引入 constrained decoding。
 
 ## 6. 实验解释与后续分支
 

@@ -305,10 +305,17 @@ with trace_path.open("w", encoding="utf-8", newline="\n") as handle:
                     "terminal_instruction_applied": True,
                     "terminal_prompt_version": "qwen35-terminal-answer-v1",
                     "terminal_prompt_sha256": "afc18b79afaafccece6927aec5ccd7898ef2ae17766bce7ffda244eef388d7f2",
+                    "terminal_prompt_text": (
+                        "The search budget is exhausted. You must not call the search tool again. "
+                        "Using only the question and information already available, give your best "
+                        "answer even if uncertain. After reasoning, output exactly one concise "
+                        "final answer inside <answer> and </answer>, with no text after </answer>."
+                    ),
                     "terminal_prompt_policy_token_count": 0,
+                    "terminal_followup_token_count": 2,
                     "requested_action": "answer", "action": "answer",
                     "parse_error": None, "terminal_rejection_reason": None,
-                    "valid_action": True, "executed_search": False,
+                    "valid_action": True, "done": True, "executed_search": False,
                     "clipped": False,
                 })
                 executed_search_count = 4
@@ -353,14 +360,15 @@ import sys
 summary = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 overall = summary["overall"]
 criteria = summary["criteria"]
+assert summary["schema_version"] == 5
 assert overall["terminal_generation_count"] == 1
 assert overall["terminal_instruction_applied_count"] == 1
 assert overall["terminal_answer_count"] == 1
 assert overall["terminal_answer_rate"] == 1.0
 assert overall["terminal_requested_search_rate"] == 0.0
 assert criteria["g1_terminal_instruction_applied_count"]["observed"] == 1
-assert criteria["g1_terminal_answer_rate"]["observed"] == 1.0
-assert criteria["g1_terminal_requested_search_rate"]["observed"] == 0.0
+assert "g1_terminal_answer_rate" not in criteria
+assert "g1_terminal_requested_search_rate" not in criteria
 PY
 
 RAW_MISMATCH_FIXTURE="$ROOT/protocol-raw-mismatch-fixture.json"
@@ -890,6 +898,7 @@ eval "$ORIGINAL_FILE_SHA256"
 publish_native_gate_evidence "$OUTER" "$RESULTS" "$EVAL_RUN"
 MARKER="$ROOT/manifests/qwen-native-gate/$OUTER_NAME.ok"
 [[ -s "$RESULTS/evidence.sha256" && -s "$MARKER" ]]
+grep -Fxq 'qwen-native-gate-v5' "$OUTER/result-contract"
 if publish_native_gate_evidence "$OUTER" "$RESULTS" "$EVAL_RUN" >/dev/null 2>&1; then
     printf 'Qwen native evidence publisher overwrote an immutable marker.\n' >&2
     exit 1

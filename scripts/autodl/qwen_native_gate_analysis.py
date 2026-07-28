@@ -25,12 +25,18 @@ import qa_em  # noqa: E402
 
 
 SCHEMA = "search-r1.qwen-native-gate"
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 ACTIVE_PROMPT_VERSION = "qwen35-native-search-v4-terminal-answer-only"
 ACTIVE_DATA_SCHEMA_VERSION = 5
 LEGACY_DATA_SCHEMA_VERSION = 3
 ACTIVE_PROTOCOL_PROBE_SCHEMA_VERSION = 4
 TERMINAL_PROMPT_VERSION = "qwen35-terminal-answer-v1"
+TERMINAL_PROMPT_TEXT = (
+    "The search budget is exhausted. You must not call the search tool again. "
+    "Using only the question and information already available, give your best "
+    "answer even if uncertain. After reasoning, output exactly one concise "
+    "final answer inside <answer> and </answer>, with no text after </answer>."
+)
 TERMINAL_PROMPT_SHA256 = (
     "afc18b79afaafccece6927aec5ccd7898ef2ae17766bce7ffda244eef388d7f2"
 )
@@ -267,20 +273,38 @@ def validate_traces(records: list[dict[str, Any]], stage: str,
                 if event.get("terminal_generation") is True
             ]
             if action_count == 5:
-                if (terminal_indices != [4]
-                        or events[-1].get("executed_search") is not False):
+                if terminal_indices != [4]:
                     raise ValueError(
                         f"active v4 terminal generation contract mismatch for {key}")
                 terminal = events[-1]
+                terminal_prompt_text = terminal.get("terminal_prompt_text")
+                prompt_policy_tokens = terminal.get(
+                    "terminal_prompt_policy_token_count")
+                followup_tokens = terminal.get("terminal_followup_token_count")
+                executed_search = terminal.get("executed_search")
                 if (terminal.get("terminal_instruction_applied") is not True
                         or terminal.get("terminal_prompt_version") !=
                         TERMINAL_PROMPT_VERSION
                         or terminal.get("terminal_prompt_sha256") !=
                         TERMINAL_PROMPT_SHA256
-                        or terminal.get("terminal_prompt_policy_token_count") != 0
-                        or terminal.get("generation_context") != "terminal_answer"):
+                        or terminal_prompt_text != TERMINAL_PROMPT_TEXT
+                        or terminal.get("generation_context") != "terminal_answer"
+                        or terminal.get("done") is not True
+                        or not isinstance(executed_search, bool)
+                        or executed_search is not False
+                        or isinstance(prompt_policy_tokens, bool)
+                        or not isinstance(prompt_policy_tokens, int)
+                        or prompt_policy_tokens != 0
+                        or isinstance(followup_tokens, bool)
+                        or not isinstance(followup_tokens, int)
+                        or followup_tokens < 1):
                     raise ValueError(
                         f"active v4 terminal answer-only contract mismatch for {key}")
+                if (hashlib.sha256(
+                        terminal_prompt_text.encode("utf-8")).hexdigest()
+                        != terminal.get("terminal_prompt_sha256")):
+                    raise ValueError(
+                        f"active v4 terminal prompt digest mismatch for {key}")
                 requested_action = terminal.get("requested_action")
                 if requested_action == "answer":
                     parse_error = terminal.get("parse_error")
@@ -888,10 +912,6 @@ def analyze_trace_stage(
                 terminal_accepted_searches, "==", 0),
             "terminal_executed_search_count": criterion(
                 terminal_executed_searches, "==", 0),
-            "terminal_answer_rate": criterion(
-                terminal_answer_rate, ">=", 0.90),
-            "terminal_requested_search_rate": criterion(
-                terminal_requested_search_rate, "<=", 0.05),
         }
         overall = {
             "legal_first_action_count": sum(
@@ -1148,15 +1168,28 @@ def write_outputs(args: argparse.Namespace, expected_ids: Sequence[str],
         f"- Searches: {overall['search_turn_count']}",
         f"- Repeated queries: {overall['repeated_query_count']}",
         f"- Non-ASCII queries: {overall['non_ascii_query_count']}",
-        "",
-        "## Criteria",
-        "",
     ]
     if args.stage == "g2":
         lines.insert(
             7,
             f"- SubEM (diagnostic only): {overall['subem_positive_count']}/{len(records)}",
         )
+    if args.stage == "g0_g1" and active_v4:
+        lines.extend([
+            "",
+            "## Diagnostics",
+            "",
+            f"- terminal_answer_rate: {overall['terminal_answer_rate']:.3f} "
+            "(diagnostic only; does not affect GO/NO-GO)",
+            "- terminal_requested_search_rate: "
+            f"{overall['terminal_requested_search_rate']:.3f} "
+            "(diagnostic only; does not affect GO/NO-GO)",
+        ])
+    lines.extend([
+        "",
+        "## Criteria",
+        "",
+    ])
     for name, item in all_criteria.items():
         lines.append(
             f"- {name}: {item['observed']} {item['comparison']} {item['threshold']} "

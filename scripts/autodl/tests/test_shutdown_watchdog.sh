@@ -181,7 +181,7 @@ replace_with_qwen_native_gate_results() {
     mkdir -p "$result_dir" "$(dirname -- "$marker")"
     for relative in "${files[@]}"; do printf 'evidence:%s\n' "$relative" >"$result_dir/$relative"; done
     printf '%s\n' \
-        '{"decision":"NO-GO","schema":"search-r1.qwen-native-gate","schema_version":4,"stage":"g0_g1"}' \
+        '{"decision":"NO-GO","schema":"search-r1.qwen-native-gate","schema_version":5,"stage":"g0_g1"}' \
         >"$result_dir/go_no_go.json"
     printf 'g0_g1\n' >"$result_dir/stage.txt"
     (
@@ -193,7 +193,7 @@ replace_with_qwen_native_gate_results() {
     ) >"$result_dir/evidence.sha256"
     digest="$(sha256sum "$result_dir/evidence.sha256" | cut -d' ' -f1)"
     printf '%s\n' "$digest" >"$marker"
-    printf 'qwen-native-gate-v4\n' >"$ATTEMPT/result-contract"
+    printf 'qwen-native-gate-v5\n' >"$ATTEMPT/result-contract"
     printf '%s\n' "$result_dir" >"$ATTEMPT/result-root"
     printf '%s\n' "$marker" >"$ATTEMPT/evidence-marker"
     printf '%s\n' "$digest" >"$ATTEMPT/evidence-digest"
@@ -336,8 +336,6 @@ check_names = (
     "terminal_prompt_policy_token_count",
     "terminal_accepted_search_count",
     "terminal_executed_search_count",
-    "terminal_answer_rate",
-    "terminal_requested_search_rate",
     "wandb_offline_history",
     "wandb_history_steps",
     "wandb_actor_metrics_match_log",
@@ -393,8 +391,6 @@ observed = {
         metrics["terminal_prompt_policy_token_count"],
     "terminal_accepted_search_count": metrics["terminal_accepted_search_count"],
     "terminal_executed_search_count": metrics["terminal_executed_search_count"],
-    "terminal_answer_rate": metrics["terminal_answer_rate"],
-    "terminal_requested_search_rate": metrics["terminal_requested_search_rate"],
     "wandb_offline_history": metrics["wandb"]["history_records"],
     "wandb_history_steps": [1, 2],
     "wandb_actor_metrics_match_log": actor_metrics,
@@ -422,7 +418,7 @@ payload = {
     },
     "metrics": metrics,
     "schema": "search-r1.qwen-native-smoke-decision",
-    "schema_version": 2,
+    "schema_version": 3,
 }
 Path(output).write_text(
     json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
@@ -440,14 +436,14 @@ create_native_protocol_gate_evidence() {
     mkdir -p "$result_dir" "$(dirname -- "$NATIVE_PROTOCOL_GATE_MARKER")"
     printf 'g0_g1\n' >"$result_dir/stage.txt"
     printf '%s\n' \
-        '{"decision":"GO","schema":"search-r1.qwen-native-gate","schema_version":4,"stage":"g0_g1"}' \
+        '{"decision":"GO","schema":"search-r1.qwen-native-gate","schema_version":5,"stage":"g0_g1"}' \
         >"$result_dir/go_no_go.json"
     write_native_manifest "$result_dir/evidence.sha256" \
         "$result_dir/go_no_go.json" "$result_dir/stage.txt"
     NATIVE_PROTOCOL_GATE_DIGEST="$(sha256sum "$result_dir/evidence.sha256" | cut -d' ' -f1)"
     printf '%s\n' "$NATIVE_PROTOCOL_GATE_DIGEST" >"$NATIVE_PROTOCOL_GATE_MARKER"
     NATIVE_PROTOCOL_GATE_OUTER="$(create_native_outer_attempt "$attempt_name" \
-        qwen-native-gate-v4 "$result_dir" "$NATIVE_PROTOCOL_GATE_MARKER" \
+        qwen-native-gate-v5 "$result_dir" "$NATIVE_PROTOCOL_GATE_MARKER" \
         "$NATIVE_PROTOCOL_GATE_DIGEST")"
     add_native_evidence_path "$NATIVE_PROTOCOL_GATE_MARKER"
     add_native_evidence_path "$result_dir/evidence.sha256"
@@ -460,7 +456,7 @@ create_native_smoke_predecessor() {
     NATIVE_SMOKE_MARKER="$PROJECT_ROOT/manifests/qwen-native-training-smoke/$attempt_name.ok"
     mkdir -p "$result_dir" "$(dirname -- "$NATIVE_SMOKE_MARKER")"
     printf '%s\n' \
-        'schema=qwen-native-training-smoke-v4' \
+        'schema=qwen-native-training-smoke-v5' \
         'stage=smoke' \
         'stage_order=S2' \
         'decision=GO' \
@@ -481,7 +477,7 @@ create_native_smoke_predecessor() {
     NATIVE_SMOKE_DIGEST="$digest"
     printf '%s\n' "$digest" >"$NATIVE_SMOKE_MARKER"
     NATIVE_SMOKE_OUTER="$(create_native_outer_attempt "$attempt_name" \
-        qwen-native-training-smoke-v4 "$result_dir" "$NATIVE_SMOKE_MARKER" \
+        qwen-native-training-smoke-v5 "$result_dir" "$NATIVE_SMOKE_MARKER" \
         "$digest")"
     add_native_evidence_path "$NATIVE_SMOKE_MARKER"
     add_native_evidence_path "$result_dir/evidence.sha256"
@@ -822,7 +818,7 @@ replace_with_native_training_smoke_results() {
         | cut -d' ' -f1)"
     commit="$(git -C "$PROJECT_ROOT/checkout" rev-parse HEAD)"
     printf '%s\n' \
-        'schema=qwen-native-training-smoke-v4' \
+        'schema=qwen-native-training-smoke-v5' \
         'stage=smoke' \
         'stage_order=S2' \
         "decision=$decision" \
@@ -853,7 +849,7 @@ replace_with_native_training_smoke_results() {
     add_native_evidence_path "$NATIVE_RESULT_DIR/storage.env"
     add_native_evidence_path "$NATIVE_RESULT_DIR/checkpoint-tree.env"
     add_native_evidence_path "$NATIVE_RESULT_DIR/smoke-decision.json"
-    seal_native_training_results qwen-native-training-smoke-v4 qwen-native-training-smoke
+    seal_native_training_results qwen-native-training-smoke-v5 qwen-native-training-smoke
 }
 
 replace_with_native_training_main_results() {
@@ -900,7 +896,7 @@ replace_with_native_training_main_results() {
         count=2
     fi
     printf '%s\n' \
-        'schema=qwen-native-training-main-v4' \
+        'schema=qwen-native-training-main-v5' \
         'stage=main' \
         "stage_order=$stage_order" \
         "analysis_decision=$decision" \
@@ -1008,7 +1004,7 @@ replace_with_native_training_main_results() {
     for file in summary.json summary.md go_no_go.json per_trajectory.jsonl per_question.jsonl; do
         add_native_evidence_path "$NATIVE_RESULT_DIR/r-g3-analysis/$file"
     done
-    seal_native_training_results qwen-native-training-main-v4 qwen-native-training-main
+    seal_native_training_results qwen-native-training-main-v5 qwen-native-training-main
 }
 
 run_watchdog() {
@@ -1181,6 +1177,28 @@ run_watchdog 0 --test-foreground
 [[ -f "$ATTEMPT/shutdown-safe" && -f "$ATTEMPT/shutdown-dispatched" ]]
 assert_order
 
+# Terminal answer/search rates remain replayable diagnostics, not GO thresholds.
+new_case qwen-native-training-smoke-diagnostic-terminal-rates 0 success
+replace_with_native_training_smoke_results
+"$PYTHON_BIN" - "$NATIVE_RESULT_DIR/smoke-decision.json" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+payload = json.loads(path.read_bytes())
+metrics = payload["metrics"]
+metrics["terminal_answer_count"] = 0
+metrics["terminal_requested_search_count"] = metrics["terminal_generation_count"]
+metrics["terminal_answer_rate"] = 0.0
+metrics["terminal_requested_search_rate"] = 1.0
+path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+PY
+seal_native_training_results qwen-native-training-smoke-v5 qwen-native-training-smoke
+run_watchdog 0 --test-foreground
+[[ -f "$ATTEMPT/shutdown-safe" && -f "$ATTEMPT/shutdown-dispatched" ]]
+assert_order
+
 new_case qwen-native-training-smoke-tampered 0 success
 replace_with_native_training_smoke_results
 printf 'checkpoint_tree_sha256=%s\n' "$(printf '9%.0s' {1..64})" \
@@ -1203,7 +1221,26 @@ payload = json.loads(path.read_bytes())
 del payload["checks"]["wandb_offline_history"]
 path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
 PY
-    seal_native_training_results qwen-native-training-smoke-v4 qwen-native-training-smoke
+    seal_native_training_results qwen-native-training-smoke-v5 qwen-native-training-smoke
+run_watchdog 0 --test-foreground
+[[ -f "$ATTEMPT/shutdown-skipped" && ! -e "$ATTEMPT/shutdown-safe" ]]
+grep -Fq 'reason=authorization-revalidation-failed' "$ATTEMPT/shutdown-skipped"
+assert_no_backend_event
+
+# Re-sealing cannot hide diagnostic rates that disagree with their counts.
+new_case qwen-native-training-smoke-rate-replay-forged 0 success
+replace_with_native_training_smoke_results
+"$PYTHON_BIN" - "$NATIVE_RESULT_DIR/smoke-decision.json" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+payload = json.loads(path.read_bytes())
+payload["metrics"]["terminal_answer_rate"] = 0.5
+path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+PY
+seal_native_training_results qwen-native-training-smoke-v5 qwen-native-training-smoke
 run_watchdog 0 --test-foreground
 [[ -f "$ATTEMPT/shutdown-skipped" && ! -e "$ATTEMPT/shutdown-safe" ]]
 grep -Fq 'reason=authorization-revalidation-failed' "$ATTEMPT/shutdown-skipped"
@@ -1223,7 +1260,7 @@ payload["metrics"]["terminal_accepted_search_count"] = 1
 payload["checks"]["terminal_accepted_search_count"]["observed"] = 1
 path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
 PY
-seal_native_training_results qwen-native-training-smoke-v4 qwen-native-training-smoke
+seal_native_training_results qwen-native-training-smoke-v5 qwen-native-training-smoke
 run_watchdog 0 --test-foreground
 [[ -f "$ATTEMPT/shutdown-skipped" && ! -e "$ATTEMPT/shutdown-safe" ]]
 grep -Fq 'reason=authorization-revalidation-failed' "$ATTEMPT/shutdown-skipped"
@@ -1239,7 +1276,7 @@ assert_order
 # A predecessor marker cannot borrow a same-named result from a mismatched outer attempt.
 new_case qwen-native-training-main-predecessor-outer-tampered 0 success
 replace_with_native_training_main_results false
-printf 'qwen-native-training-main-v4\n' >"$NATIVE_SMOKE_OUTER/result-contract"
+printf 'qwen-native-training-main-v5\n' >"$NATIVE_SMOKE_OUTER/result-contract"
 run_watchdog 0 --test-foreground
 [[ -f "$ATTEMPT/shutdown-skipped" && ! -e "$ATTEMPT/shutdown-safe" ]]
 grep -Fq 'reason=authorization-revalidation-failed' "$ATTEMPT/shutdown-skipped"
@@ -1258,7 +1295,7 @@ payload = json.loads(path.read_bytes())
 payload["input"]["trace_sha256"] = "0" * 64
 path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
 PY
-seal_native_training_results qwen-native-training-main-v4 qwen-native-training-main
+seal_native_training_results qwen-native-training-main-v5 qwen-native-training-main
 run_watchdog 0 --test-foreground
 [[ -f "$ATTEMPT/shutdown-skipped" && ! -e "$ATTEMPT/shutdown-safe" ]]
 grep -Fq 'reason=authorization-revalidation-failed' "$ATTEMPT/shutdown-skipped"
@@ -1277,7 +1314,7 @@ payload = json.loads(path.read_bytes())
 payload["formal_contract"]["endpoints"]["parent"]["checkpoint_digest"] = "0" * 64
 path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
 PY
-seal_native_training_results qwen-native-training-main-v4 qwen-native-training-main
+seal_native_training_results qwen-native-training-main-v5 qwen-native-training-main
 run_watchdog 0 --test-foreground
 [[ -f "$ATTEMPT/shutdown-skipped" && ! -e "$ATTEMPT/shutdown-safe" ]]
 grep -Fq 'reason=authorization-revalidation-failed' "$ATTEMPT/shutdown-skipped"
@@ -1310,7 +1347,7 @@ with path.open("w", newline="", encoding="utf-8") as handle:
     writer.writeheader()
     writer.writerows(rows)
 PY
-seal_native_training_results qwen-native-training-main-v4 qwen-native-training-main
+seal_native_training_results qwen-native-training-main-v5 qwen-native-training-main
 run_watchdog 0 --test-foreground
 [[ -f "$ATTEMPT/shutdown-skipped" && ! -e "$ATTEMPT/shutdown-safe" ]]
 grep -Fq 'reason=authorization-revalidation-failed' "$ATTEMPT/shutdown-skipped"
@@ -1336,7 +1373,7 @@ with path.open("w", newline="", encoding="utf-8") as handle:
     writer.writeheader()
     writer.writerows(rows)
 PY
-seal_native_training_results qwen-native-training-main-v4 qwen-native-training-main
+seal_native_training_results qwen-native-training-main-v5 qwen-native-training-main
 run_watchdog 0 --test-foreground
 [[ -f "$ATTEMPT/shutdown-skipped" && ! -e "$ATTEMPT/shutdown-safe" ]]
 grep -Fq 'reason=authorization-revalidation-failed' "$ATTEMPT/shutdown-skipped"
@@ -1362,7 +1399,7 @@ payload = json.loads(path.read_bytes())
 payload["formal_contract"]["endpoints"]["control"]["checkpoint_digest"] = "0" * 64
 path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
 PY
-seal_native_training_results qwen-native-training-main-v4 qwen-native-training-main
+seal_native_training_results qwen-native-training-main-v5 qwen-native-training-main
 run_watchdog 0 --test-foreground
 [[ -f "$ATTEMPT/shutdown-skipped" && ! -e "$ATTEMPT/shutdown-safe" ]]
 grep -Fq 'reason=authorization-revalidation-failed' "$ATTEMPT/shutdown-skipped"
@@ -1374,7 +1411,7 @@ replace_with_native_training_main_results true
 printf '%s\n' \
     '{"analysis_decision":"GO","branches_authorized":false,"cost_contrast_group_count":9,"cost_contrast_group_minimum":8,"decision":"NO-GO","schema":"qwen-native-post-r-gate-v4"}' \
     >"$NATIVE_RESULT_DIR/branch-decision.json"
-seal_native_training_results qwen-native-training-main-v4 qwen-native-training-main
+seal_native_training_results qwen-native-training-main-v5 qwen-native-training-main
 run_watchdog 0 --test-foreground
 [[ -f "$ATTEMPT/shutdown-skipped" && ! -e "$ATTEMPT/shutdown-safe" ]]
 grep -Fq 'reason=authorization-revalidation-failed' "$ATTEMPT/shutdown-skipped"

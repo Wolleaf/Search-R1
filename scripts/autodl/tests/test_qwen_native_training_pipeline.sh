@@ -124,6 +124,362 @@ if verify_complete_training_attempt "$TAMPER_DIR/$TAMPER_NAME.ok" \
     exit 1
 fi
 
+# Paid-stage admission replays analyzers instead of trusting re-sealed result JSON.
+VERIFIER_ROOT="$TEST_ROOT/verifier"
+VERIFIER_ENV="$VERIFIER_ROOT/env"
+VERIFIER_TMP="$VERIFIER_ROOT/tmp"
+VERIFIER_GATE_REPLAY="$VERIFIER_ROOT/gate-replay"
+VERIFIER_GATE_RESULTS="$VERIFIER_ROOT/gate-results"
+VERIFIER_SMOKE_REPLAY="$VERIFIER_ROOT/smoke-replay.json"
+VERIFIER_SMOKE_RESULTS="$VERIFIER_ROOT/smoke-results"
+VERIFIER_GATE_EVAL="$RUNS_ROOT/eval/qwen_native_g1/attempts/verifier"
+VERIFIER_GATE_PROBE="$RUNS_ROOT/eval/qwen_native_g0/attempts/verifier"
+VERIFIER_SMOKE_RUN="$RUNS_ROOT/smoke/attempts/verifier"
+VERIFIER_BASE_DIGEST="$(printf 'a%.0s' {1..64})"
+VERIFIER_SMOKE_DIGEST="$(printf 'b%.0s' {1..64})"
+VERIFIER_COMMIT="$(printf 'c%.0s' {1..40})"
+VERIFIER_HANDOFF="$(printf 'd%.0s' {1..64})"
+VERIFIER_DATA="$(printf 'e%.0s' {1..64})"
+VERIFIER_GATE_DIGEST="$(printf 'f%.0s' {1..64})"
+VERIFIER_GATE_MARKER="$VERIFIER_ROOT/gate.ok"
+mkdir -p "$VERIFIER_ENV/bin" "$VERIFIER_TMP" "$VERIFIER_GATE_REPLAY" \
+    "$VERIFIER_GATE_RESULTS" "$VERIFIER_SMOKE_RESULTS" \
+    "$VERIFIER_GATE_EVAL/traces" "$VERIFIER_GATE_PROBE/output" \
+    "$VERIFIER_SMOKE_RUN/checkpoints/actor/global_step_2" \
+    "$VERIFIER_SMOKE_RUN/traces" "$VERIFIER_SMOKE_RUN/wandb" \
+    "$(dirname -- "$NATIVE_TRAIN_CATALOG")"
+printf 'catalog fixture\n' >"$NATIVE_TRAIN_CATALOG"
+printf '{"schema_version":5}\n' >"$NATIVE_TRAIN_MANIFEST"
+printf 'gate trace\n' >"$VERIFIER_GATE_EVAL/traces/eval_predictions.jsonl"
+printf 'probe records\n' >"$VERIFIER_GATE_PROBE/output/records.jsonl"
+printf 'smoke trace\n' >"$VERIFIER_SMOKE_RUN/traces/train_trajectories.jsonl"
+printf 'smoke log\n' >"$VERIFIER_SMOKE_RUN/train.log"
+printf 'wandb fixture\n' >"$VERIFIER_SMOKE_RUN/wandb/run-test.wandb"
+printf 'checkpoint\n' \
+    >"$VERIFIER_SMOKE_RUN/checkpoints/actor/global_step_2/model.bin"
+printf 'gate marker\n' >"$VERIFIER_GATE_MARKER"
+
+"$PYTHON_BIN" - "$VERIFIER_GATE_REPLAY" "$VERIFIER_GATE_RESULTS" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+replay, results = map(Path, sys.argv[1:])
+criteria_names = (
+    "g0_prompt_token_match_count",
+    "g0_first_action_token_match_count",
+    "g0_direct_action_prefix_integrity_count",
+    "g0_manager_action_prefix_integrity_count",
+    "g0_e0_search_roundtrip_count",
+    "g0_e0_retrieved_document_count",
+    "g0_e0_tool_role_count",
+    "g0_e0_mask_leak_count",
+    "g1_action_token_prefix_integrity_count",
+    "g1_action_tail_leak_count",
+    "g1_info_mask_consistent_count",
+    "g1_observation_policy_token_count",
+    "g1_retrieval_alignment_error_count",
+    "g1_terminal_instruction_applied_count",
+    "g1_terminal_prompt_policy_token_count",
+    "g1_terminal_accepted_search_count",
+    "g1_terminal_executed_search_count",
+)
+criteria = {
+    name: {"comparison": "==", "observed": 0, "passed": True, "threshold": 0}
+    for name in criteria_names
+}
+decision = {
+    "criteria": criteria,
+    "decision": "GO",
+    "failed_criteria": [],
+    "schema": "search-r1.qwen-native-gate",
+    "schema_version": 5,
+    "stage": "g0_g1",
+    "trace_sha256": "0" * 64,
+}
+summary = {
+    **decision,
+    "checkpoint_digest": "a" * 64,
+    "overall": {},
+    "protocol_probe": {},
+}
+payloads = {
+    "go_no_go.json": json.dumps(decision, sort_keys=True) + "\n",
+    "summary.json": json.dumps(summary, sort_keys=True) + "\n",
+    "summary.md": "# replayed gate\n",
+    "per_trajectory.jsonl": "{}\n",
+    "per_question.jsonl": "{}\n",
+    "protocol_records.jsonl": "{}\n",
+}
+for root in (replay, results):
+    for name, payload in payloads.items():
+        (root / name).write_text(payload, encoding="utf-8")
+PY
+printf 'g0_g1\n' >"$VERIFIER_GATE_RESULTS/stage.txt"
+printf '%s\n%s\n' \
+    $'stage\tcheckpoint\tcheckpoint_digest\tevaluation_checkout_commit\tcpu_handoff_digest\tdata_manifest_sha256\tresolved_config_sha256\ttrace_sha256\ttrace_manifest_sha256\tpredecessor_evidence_sha256' \
+    "g0_g1"$'\t'"$MODEL_DIR"$'\t'"$VERIFIER_BASE_DIGEST"$'\t'"$VERIFIER_COMMIT"$'\t'"$VERIFIER_HANDOFF"$'\t'"$VERIFIER_DATA"$'\t'"$(printf '1%.0s' {1..64})"$'\t'"$(printf '2%.0s' {1..64})"$'\t'"$(printf '3%.0s' {1..64})"$'\t-' \
+    >"$VERIFIER_GATE_RESULTS/lineage.tsv"
+printf '%s\n%s\n%s\n' \
+    $'stage\tmode\trun_dir\ttrace' \
+    "g0_g1"$'\t'"eval"$'\t'"$VERIFIER_GATE_EVAL"$'\t'"$VERIFIER_GATE_EVAL/traces/eval_predictions.jsonl" \
+    "g0"$'\t'"protocol_probe"$'\t'"$VERIFIER_GATE_PROBE"$'\t'"$VERIFIER_GATE_PROBE/output/records.jsonl" \
+    >"$VERIFIER_GATE_RESULTS/run-index.tsv"
+
+"$PYTHON_BIN" - "$VERIFIER_SMOKE_REPLAY" \
+    "$VERIFIER_SMOKE_RUN/traces/train_trajectories.jsonl" \
+    "$VERIFIER_SMOKE_RUN/train.log" "$NATIVE_TRAIN_CATALOG" <<'PY'
+import hashlib
+import json
+from pathlib import Path
+import sys
+
+output, trace, log, catalog = map(Path, sys.argv[1:])
+actor_names = (
+    "actor/pg_loss", "actor/kl_loss", "actor/entropy_loss",
+    "actor/grad_norm", "actor/ppo_kl",
+)
+actor_metrics = {
+    str(step): {name: [0.1] for name in actor_names}
+    for step in (1, 2)
+}
+check_names = (
+    "strict_em_positive", "mixed_reward_group", "nonzero_trace_advantage",
+    "finite_actor_pg_loss", "finite_actor_kl_loss",
+    "finite_actor_entropy_loss", "finite_actor_grad_norm",
+    "finite_actor_ppo_kl", "native_batch_contract_valid",
+    "native_batch_info_loss_mask_match", "native_batch_policy_mask_subset",
+    "native_batch_old_log_prob_finite_ratio",
+    "native_batch_advantage_finite_ratio", "native_batch_reward_finite_ratio",
+    "native_batch_policy_tokens", "native_batch_policy_tokens_min_per_trajectory",
+    "native_batch_policy_coverage", "native_batch_nonzero_advantage_tokens",
+    "native_batch_advantage_abs_max", "terminal_instruction_applied_count",
+    "terminal_prompt_policy_token_count", "terminal_accepted_search_count",
+    "terminal_executed_search_count", "wandb_offline_history",
+    "wandb_history_steps", "wandb_actor_metrics_match_log",
+    "wandb_summary_present", "wandb_exit_zero",
+)
+checks = {name: {"observed": 1, "passed": True} for name in check_names}
+checks.update({
+    "terminal_instruction_applied_count": {"observed": 80, "passed": True},
+    "terminal_prompt_policy_token_count": {"observed": 0, "passed": True},
+    "terminal_accepted_search_count": {"observed": 0, "passed": True},
+    "terminal_executed_search_count": {"observed": 0, "passed": True},
+    "wandb_history_steps": {"observed": [1, 2], "passed": True},
+    "wandb_actor_metrics_match_log": {"observed": actor_metrics, "passed": True},
+    "wandb_exit_zero": {
+        "observed": {"codes": [0], "last_record_type": "exit"},
+        "passed": True,
+    },
+})
+metrics = {
+    "groups": 16,
+    "mixed_groups": 1,
+    "nonzero_trace_advantages": 1,
+    "strict_em_positive_count": 1,
+    "terminal_generation_count": 80,
+    "terminal_instruction_applied_count": 80,
+    "terminal_answer_count": 0,
+    "terminal_requested_search_count": 80,
+    "terminal_invalid_count": 0,
+    "terminal_accepted_search_count": 0,
+    "terminal_executed_search_count": 0,
+    "terminal_prompt_policy_token_count": 0,
+    "terminal_answer_rate": 0.0,
+    "terminal_requested_search_rate": 1.0,
+    "trajectories": 80,
+    "wandb": {
+        "actor_metrics": actor_metrics,
+        "exit_codes": [0],
+        "files": 1,
+        "history_records": 2,
+        "history_steps": [1, 2],
+        "last_record_type": "exit",
+        "record_counts": {"exit": 1, "history": 2, "summary": 1},
+        "run_file": "run-test.wandb",
+        "run_file_sha256": "0" * 64,
+        "summary": {"actor/pg_loss": 0.1},
+        "summary_records": 1,
+        "wandb_version": "0.21.1",
+    },
+}
+payload = {
+    "checks": checks,
+    "decision": "GO",
+    "inputs": {
+        "catalog_sha256": hashlib.sha256(catalog.read_bytes()).hexdigest(),
+        "log_sha256": hashlib.sha256(log.read_bytes()).hexdigest(),
+        "trace_sha256": hashlib.sha256(trace.read_bytes()).hexdigest(),
+        "wandb_tree_sha256": "0" * 64,
+    },
+    "metrics": metrics,
+    "schema": "search-r1.qwen-native-smoke-decision",
+    "schema_version": 3,
+}
+output.write_text(
+    json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")) + "\n",
+    encoding="ascii",
+)
+PY
+cp "$VERIFIER_SMOKE_REPLAY" "$VERIFIER_SMOKE_RESULTS/smoke-decision.json"
+printf '%s\n' \
+    'schema=qwen-native-training-smoke-v5' 'stage=smoke' 'stage_order=S2' \
+    'decision=GO' 'manual_review_required=true' \
+    >"$VERIFIER_SMOKE_RESULTS/contract.env"
+printf 'checkpoint_bytes=1\nfilesystem_available_bytes=1\n' \
+    >"$VERIFIER_SMOKE_RESULTS/storage.env"
+printf 'checkpoint=%s\ncheckpoint_tree_sha256=%s\n' \
+    "$VERIFIER_SMOKE_RUN/checkpoints/actor/global_step_2" "$VERIFIER_SMOKE_DIGEST" \
+    >"$VERIFIER_SMOKE_RESULTS/checkpoint-tree.env"
+printf '%s\n%s\n' \
+    $'stage\trole\trun_dir\tcheckpoint\tcheckpoint_digest\tparent_checkpoint\tparent_checkpoint_digest\tcheckout_commit\tcpu_handoff_digest\tdata_manifest_sha256\tprotocol_gate_evidence\tprotocol_gate_evidence_sha256' \
+    "S"$'\t'"smoke"$'\t'"$VERIFIER_SMOKE_RUN"$'\t'"$VERIFIER_SMOKE_RUN/checkpoints/actor/global_step_2"$'\t'"$VERIFIER_SMOKE_DIGEST"$'\t'"$MODEL_DIR"$'\t'"$VERIFIER_BASE_DIGEST"$'\t'"$VERIFIER_COMMIT"$'\t'"$VERIFIER_HANDOFF"$'\t'"$VERIFIER_DATA"$'\t'"$VERIFIER_GATE_MARKER"$'\t'"$VERIFIER_GATE_DIGEST" \
+    >"$VERIFIER_SMOKE_RESULTS/lineage.tsv"
+printf 'stage\trole\trun_dir\nS\tsmoke\t%s\n' "$VERIFIER_SMOKE_RUN" \
+    >"$VERIFIER_SMOKE_RESULTS/run-index.tsv"
+
+cat >"$VERIFIER_ENV/bin/python" <<'SH'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+tool="${1##*/}"
+if [[ "$tool" == qwen_native_gate_analysis.py ]]; then
+    [[ "${VERIFIER_ANALYZER_OUTCOME:-GO}" != ERROR ]] || exit 23
+    output=''
+    while (($#)); do
+        if [[ "$1" == --output-dir ]]; then output="$2"; break; fi
+        shift
+    done
+    [[ -n "$output" && ! -e "$output" ]]
+    mkdir "$output"
+    cp "$VERIFIER_GATE_REPLAY"/* "$output/"
+    printf 'Qwen native g0_g1 decision: GO\n'
+elif [[ "$tool" == qwen_native_smoke_analysis.py ]]; then
+    [[ "${VERIFIER_ANALYZER_OUTCOME:-GO}" != ERROR ]] || exit 23
+    output=''
+    while (($#)); do
+        if [[ "$1" == --output ]]; then output="$2"; break; fi
+        shift
+    done
+    [[ -n "$output" && ! -e "$output" ]]
+    cp "$VERIFIER_SMOKE_REPLAY" "$output"
+    printf 'GO\n'
+else
+    exec "${PYTHON_BIN:-python3}" "$@"
+fi
+SH
+chmod +x "$VERIFIER_ENV/bin/python"
+export VERIFIER_GATE_REPLAY VERIFIER_SMOKE_REPLAY
+
+(
+    TRAIN_ENV="$VERIFIER_ENV"
+    TMPDIR="$VERIFIER_TMP"
+    verify_complete_training_attempt() {
+        VERIFIED_ATTEMPT_RESULTS="$VERIFIER_GATE_RESULTS"
+        VERIFIED_ATTEMPT_OUTER="$VERIFIER_ROOT/gate-outer"
+        VERIFIED_ATTEMPT_MANIFEST="$VERIFIER_ROOT/gate-evidence.sha256"
+        VERIFIED_ATTEMPT_DIGEST="$VERIFIER_GATE_DIGEST"
+    }
+    verify_protocol_gate_evidence "$VERIFIER_GATE_MARKER" "$MODEL_DIR" \
+        "$VERIFIER_BASE_DIGEST" "$VERIFIER_COMMIT" "$VERIFIER_HANDOFF" \
+        "$VERIFIER_DATA"
+    [[ -z "$(find "$TMPDIR" -mindepth 1 -print -quit)" ]]
+    if cleanup_native_replay_dir "$TMPDIR" search-r1-gate-replay \
+            >/dev/null 2>&1; then
+        printf 'Unsafe replay cleanup path was accepted.\n' >&2
+        exit 1
+    fi
+)
+"$PYTHON_BIN" - "$VERIFIER_GATE_RESULTS/go_no_go.json" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+payload = json.loads(path.read_bytes())
+payload["criteria"]["g1_terminal_accepted_search_count"]["observed"] = 1
+path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+PY
+if (
+    TRAIN_ENV="$VERIFIER_ENV"
+    TMPDIR="$VERIFIER_TMP"
+    verify_complete_training_attempt() {
+        VERIFIED_ATTEMPT_RESULTS="$VERIFIER_GATE_RESULTS"
+        VERIFIED_ATTEMPT_OUTER="$VERIFIER_ROOT/gate-outer"
+        VERIFIED_ATTEMPT_MANIFEST="$VERIFIER_ROOT/gate-evidence.sha256"
+        VERIFIED_ATTEMPT_DIGEST="$VERIFIER_GATE_DIGEST"
+    }
+    verify_protocol_gate_evidence "$VERIFIER_GATE_MARKER" "$MODEL_DIR" \
+        "$VERIFIER_BASE_DIGEST" "$VERIFIER_COMMIT" "$VERIFIER_HANDOFF" \
+        "$VERIFIER_DATA"
+) >/dev/null 2>&1; then
+    printf 'Re-sealed forged structural gate evidence was accepted.\n' >&2
+    exit 1
+fi
+[[ -z "$(find "$VERIFIER_TMP" -mindepth 1 -print -quit)" ]]
+
+(
+    TRAIN_ENV="$VERIFIER_ENV"
+    TMPDIR="$VERIFIER_TMP"
+    NATIVE_PROTOCOL_GATE_EVIDENCE="$VERIFIER_GATE_MARKER"
+    verify_complete_training_attempt() {
+        VERIFIED_ATTEMPT_RESULTS="$VERIFIER_SMOKE_RESULTS"
+        VERIFIED_ATTEMPT_OUTER="$VERIFIER_ROOT/smoke-outer"
+        VERIFIED_ATTEMPT_MANIFEST="$VERIFIER_ROOT/smoke-evidence.sha256"
+        VERIFIED_ATTEMPT_DIGEST="$VERIFIER_SMOKE_DIGEST"
+    }
+    verify_native_checkpoint_digest() { return 0; }
+    verify_wandb_receipt() { return 0; }
+    verify_smoke_evidence "$VERIFIER_SMOKE_RESULTS/smoke.ok" "$MODEL_DIR" \
+        "$VERIFIER_BASE_DIGEST" "$VERIFIER_COMMIT" "$VERIFIER_HANDOFF" \
+        "$VERIFIER_DATA" "$VERIFIER_GATE_DIGEST"
+    [[ -z "$(find "$TMPDIR" -mindepth 1 -print -quit)" ]]
+)
+if (
+    TRAIN_ENV="$VERIFIER_ENV"
+    TMPDIR="$VERIFIER_TMP"
+    export VERIFIER_ANALYZER_OUTCOME=ERROR
+    verify_smoke_analysis_replay "$VERIFIER_SMOKE_RUN" \
+        "$VERIFIER_SMOKE_RESULTS/smoke-decision.json"
+) >/dev/null 2>&1; then
+    printf 'A nonzero smoke analyzer replay was accepted.\n' >&2
+    exit 1
+fi
+[[ -z "$(find "$VERIFIER_TMP" -mindepth 1 -print -quit)" ]]
+"$PYTHON_BIN" - "$VERIFIER_SMOKE_RESULTS/smoke-decision.json" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+payload = json.loads(path.read_bytes())
+payload["metrics"]["terminal_accepted_search_count"] = 1
+payload["checks"]["terminal_accepted_search_count"]["observed"] = 1
+path.write_text(
+    json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")) + "\n",
+    encoding="ascii",
+)
+PY
+if (
+    TRAIN_ENV="$VERIFIER_ENV"
+    TMPDIR="$VERIFIER_TMP"
+    NATIVE_PROTOCOL_GATE_EVIDENCE="$VERIFIER_GATE_MARKER"
+    verify_complete_training_attempt() {
+        VERIFIED_ATTEMPT_RESULTS="$VERIFIER_SMOKE_RESULTS"
+        VERIFIED_ATTEMPT_OUTER="$VERIFIER_ROOT/smoke-outer"
+        VERIFIED_ATTEMPT_MANIFEST="$VERIFIER_ROOT/smoke-evidence.sha256"
+        VERIFIED_ATTEMPT_DIGEST="$VERIFIER_SMOKE_DIGEST"
+    }
+    verify_native_checkpoint_digest() { return 0; }
+    verify_wandb_receipt() { return 0; }
+    verify_smoke_evidence "$VERIFIER_SMOKE_RESULTS/smoke.ok" "$MODEL_DIR" \
+        "$VERIFIER_BASE_DIGEST" "$VERIFIER_COMMIT" "$VERIFIER_HANDOFF" \
+        "$VERIFIER_DATA" "$VERIFIER_GATE_DIGEST"
+) >/dev/null 2>&1; then
+    printf 'Re-sealed self-inconsistent smoke hard gate was accepted.\n' >&2
+    exit 1
+fi
+[[ -z "$(find "$VERIFIER_TMP" -mindepth 1 -print -quit)" ]]
+
 CALLS="$TEST_ROOT/calls.log"
 export CALLS
 BASE_DIGEST="$(printf 'a%.0s' {1..64})"
@@ -181,7 +537,7 @@ elif [[ "$tool" == qwen_native_smoke_analysis.py ]]; then
     decision="${SMOKE_ANALYSIS_OUTCOME:-GO}"
     [[ -n "$output" ]]
     mkdir -p "$(dirname -- "$output")"
-    printf '{"decision":"%s","schema":"search-r1.qwen-native-smoke-decision","schema_version":2}\n' \
+    printf '{"decision":"%s","schema":"search-r1.qwen-native-smoke-decision","schema_version":3}\n' \
         "$decision" >"$output"
     printf '%s\n' "$decision"
 elif [[ "$tool" == paired_eval.py ]]; then
@@ -324,7 +680,7 @@ mapfile -t smoke_jobs < <(grep '^run_job|' "$CALLS")
 [[ "${#smoke_jobs[@]}" == 1 ]]
 [[ "${smoke_jobs[0]}" == "run_job|train|smoke|2||$BASE_DIGEST|eval=|rows=128|group=1" ]]
 ! grep -Eq 'run_job\|train\|(reproduce|control|cost_aware_gated)' "$CALLS"
-grep -q '^publish|.*|qwen-native-training-smoke|qwen-native-training-smoke-v4$' "$CALLS"
+grep -q '^publish|.*|qwen-native-training-smoke|qwen-native-training-smoke-v5$' "$CALLS"
 smoke_results="$NATIVE_TRAIN_RESULTS_ROOT/attempts/$(basename -- "$smoke_outer")"
 grep -Fxq 'stage_order=S2' "$smoke_results/contract.env"
 grep -Fxq 'decision=GO' "$smoke_results/contract.env"
@@ -471,7 +827,7 @@ for eval_key in val nq_test multihop; do
     [[ -s "$no_go_results/paired-ar-$eval_key/summary.json" ]]
     [[ ! -e "$no_go_results/paired-$eval_key" ]]
 done
-grep -q '^publish|.*|qwen-native-training-main|qwen-native-training-main-v4$' "$CALLS"
+grep -q '^publish|.*|qwen-native-training-main|qwen-native-training-main-v5$' "$CALLS"
 
 # GO alone is insufficient when fewer than eight groups provide cost contrast.
 : >"$CALLS"

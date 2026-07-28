@@ -66,7 +66,7 @@ AUTODL_QWEN_NATIVE_INCREMENTAL=1 \
 bash /root/autodl-tmp/search-r1/checkout/scripts/autodl/02_cpu_prepare.sh
 ```
 
-该模式不联网、不重装环境、不下载资产，也不重放整套 BM25 查询。它要求上一次成功 handoff 已封存语义校验通过的 `retrieval_replay.json` 及 sidecar，只从该 source、既有 retrieval evidence、selection funnel 和固定 tokenizer 物化独立的 `data/search_mix_qwen35_native_v4/`；旧 v2/v3 与原 `data/search_mix/` 均不覆盖。v4 保留论文原版单 user prompt，只把 `<search>/<information>` 映射为 Qwen3.5 原生 tool call/tool response，并开启 native thinking。版本化清单逐条封存 52 个 multi-gold 样本：仅保留 2 个已核实 alias，剔除其余 50 个以及 bit/nibble 错标，并在同 source/category/split 确定性补齐 51 个单 gold；任何未经审计的 multi-gold 都不能入选或作为补位。四个常规 action 耗尽后，仍 active 的轨迹收到固定 terminal answer-only user 提示；terminal search 只记录、不执行。
+该模式不联网、不重装环境、不下载资产，也不重放整套 BM25 查询。它要求上一次成功 handoff 已封存语义校验通过的 `retrieval_replay.json` 及 sidecar，只从该 source、既有 retrieval evidence、selection funnel 和固定 tokenizer 物化独立的 `data/search_mix_qwen35_native_v4/`；旧 v2/v3 与原 `data/search_mix/` 均不覆盖。v4 保留论文原版单 user prompt，只把 `<search>/<information>` 映射为 Qwen3.5 原生 tool call/tool response，并开启 native thinking。版本化清单逐条封存 52 个 multi-gold 样本：仅保留 2 个已核实 alias，剔除其余 50 个以及 bit/nibble 错标，并在同 source/category/split 确定性补齐 51 个单 gold；任何未经审计的 multi-gold 都不能入选或作为补位。四个常规 action 耗尽后，仍 active 的轨迹收到固定 terminal answer-only user 提示。该提示是软约束：它作为上下文参与后续生成，但其环境 token 的 policy mask 必须为 0；模型随后生成的 terminal assistant token 仍参与 policy loss。terminal search 只记录，不被接受也不执行。
 
 CPU 使用固定 tokenizer 验证全部 640 条 train/val evidence 在 500-token observation 下仍可见，并验证 G0-8、autonomous G1-16、R 后 G3-64、NQ test-128 和 multihop-256。随后组合 smoke/R/B/C 以及 A/R/B/C 三个 endpoint 的两卡 resolved config。handoff schema 3 显式绑定 prompt version、thinking、总 action budget 4、选样 observation 384 和 rollout observation 500；候选数据、配置与 handoff 全部通过后才原子发布，失败可安全重跑同一命令。
 
@@ -79,7 +79,7 @@ QWEN_NATIVE_GATE_STAGE=g0_g1 GPU_COUNT=2 AUTODL_PRICE_PER_HOUR=5.76 \
 bash /root/autodl-tmp/search-r1/checkout/scripts/autodl/08_gpu_qwen_native_gate.sh
 ```
 
-G0 使用同一模型进程核对 direct HF、native manager 和 legacy manager 的模板/action 边界；G1 在固定 16 题上验证自主 action、真实工具回填、原始 token 和轨迹结构。这里只阻断协议、模板、数值或证据错误，不要求未训练 parent 已经具备多搜索能力。结果位于 `runs/qwen-native-gate/attempts/<gpu-attempt>/`，只有 `go_no_go.json=GO` 才能进入 smoke。该 attempt 硬上限为 2 元；超时或 schema 错误保留非零 exit code，脚本不换 seed 或自动重试。
+G0 使用同一模型进程核对 direct HF、native manager 和 legacy manager 的模板/action 边界；G1 在固定 16 题上验证自主 action、真实工具回填、原始 token 和轨迹结构。这里只阻断协议、模板、数值或证据错误，不要求未训练 parent 已经具备多搜索能力。terminal 硬门要求提醒覆盖全部待收尾轨迹、提醒 token 的 policy mask 为 0、terminal search accepted/executed 均为 0，并保留既有 token、mask、prompt、trace 与 retrieval lineage 一致性检查；terminal answer、requested-search 和 invalid count/rate 只记录为行为诊断，不决定 GO/NO-GO。结果位于 `runs/qwen-native-gate/attempts/<gpu-attempt>/`，只有 `go_no_go.json=GO` 才能进入 smoke。旧合同下的 `NO-GO` marker 和轨迹不追溯改写；合同更新后必须在新 commit 上重跑一次 G0/G1，生成新的 exact marker。该 attempt 硬上限为 2 元；超时或 schema 错误保留非零 exit code，脚本不换 seed 或自动重试。
 
 ### 4. GPU Qwen native 训练与配对评测
 
@@ -92,7 +92,7 @@ GPU_COUNT=2 AUTODL_PRICE_PER_HOUR=5.76 \
 bash /root/autodl-tmp/search-r1/checkout/scripts/autodl/09_gpu_qwen_native_train.sh
 ```
 
-smoke 自动复算 strict EM，并要求 mixed reward group、非零 policy advantage、mask/log-prob 对齐，以及两个 step 的 loss、KL、entropy、grad norm 全部存在且有限；同时封存 step-2 checkpoint、完整 trace、run-specific WandB offline history 和 `storage.env`。GO/NO-GO 都会作为完整科学终态封存并可交给 watchdog。只有 `contract.env` 与 `smoke-decision.json` 同为 `GO` 时才可继续；先人工查看 `storage.env`，确认剩余空间能容纳 R/B/C，再用传入 exact smoke marker 的动作明确批准 main：
+smoke 自动复算 strict EM，并要求 mixed reward group、非零 policy advantage、mask/log-prob 对齐，以及两个 step 的 loss、KL、entropy、grad norm 全部存在且有限；terminal 继续使用与 G0/G1 相同的硬门和诊断指标语义。同时封存 step-2 checkpoint、完整 trace、run-specific WandB offline history 和 `storage.env`。GO/NO-GO 都会作为完整科学终态封存并可交给 watchdog。只有 `contract.env` 与 `smoke-decision.json` 同为 `GO` 时才可继续；先人工查看 `storage.env`，确认剩余空间能容纳 R/B/C，再用传入 exact smoke marker 的动作明确批准 main：
 
 ```bash
 QWEN_NATIVE_TRAIN_STAGE=main \
@@ -162,7 +162,7 @@ GO 只表示值得进入下一阶段，不能直接在 NQ 上只重训一个 C�
 
 当前 native-v4 gate 与训练固定为两张 GPU、batch 8、训练 group 5、四个可检索 action 加一次 answer-only 收尾生成、retriever top-k 3、`start/observation/response/trajectory=1024/500/500/4500`，并固定 `temperature/top-p/top-k/min-p/presence/repetition=1.0/1.0/0/0.0/0.0/1.0`。其中 `4500 = 4 * (500 + 500) + 500`，最后 500 token 只用于尚未结束轨迹的 terminal generation，不执行也不计搜索成本。选样阶段保留 384-token provenance，但 rollout 使用 500；endpoint 固定 group 1、greedy、seed 42。历史 `07` 保持 XML group-5 配置，`03/05/06` 保持 response 256、prompt 3584；新实验不得复用历史入口。
 
-native-v4 exact attempt 不接受 batch 4、response 384 或关闭 thinking 的历史 fallback。两卡 2-step smoke 还必须从唯一 `run-*.wandb` 二进制重放 step 1/2 的五项 actor 指标、summary 与 `exit_code=0`，并与 `train.log` 对齐。若 smoke 失败，保留失败 attempt 并停止；任何降配都必须另立配置版本并重新执行结构门，不能在同一实验身份下静默重跑。失败不会自动重试、覆盖旧 attempt 或采用早于固定终点的 checkpoint。
+native-v4 exact attempt 不接受 batch 4、response 384 或关闭 thinking 的历史 fallback。两卡 2-step smoke 还必须从唯一 `run-*.wandb` 二进制重放 step 1/2 的五项 actor 指标、summary 与 `exit_code=0`，并与 `train.log` 对齐。当前门禁修正只区分 terminal 行为诊断与工程硬门，不修改 prompt、parser、reward、数据、BM25、采样或训练参数。若 smoke 失败，保留失败 attempt 并停止；任何降配都必须另立配置版本并重新执行结构门，不能在同一实验身份下静默重跑。失败不会自动重试、覆盖旧 attempt 或采用早于固定终点的 checkpoint。
 
 ## 预算与存储
 

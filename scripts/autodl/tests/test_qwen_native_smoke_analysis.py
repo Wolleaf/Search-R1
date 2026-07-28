@@ -242,7 +242,7 @@ class QwenNativeSmokeAnalysisTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             result = SMOKE.analyze(self._fixture(Path(temporary)))
         self.assertEqual(result["decision"], "GO")
-        self.assertEqual(result["schema_version"], 2)
+        self.assertEqual(result["schema_version"], 3)
         self.assertEqual(result["metrics"]["trajectories"], 80)
         self.assertEqual(result["metrics"]["mixed_groups"], 16)
         self.assertEqual(result["metrics"]["terminal_generation_count"], 80)
@@ -255,11 +255,11 @@ class QwenNativeSmokeAnalysisTest(unittest.TestCase):
         )
         self.assertTrue(all(check["passed"] for check in result["checks"].values()))
 
-    def test_no_go_when_terminal_search_request_rate_exceeds_limit(self) -> None:
+    def test_terminal_behavior_rates_are_diagnostic_only(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             args = self._fixture(Path(temporary))
             rows = [json.loads(line) for line in args.trace.read_text().splitlines()]
-            for row in rows[:5]:
+            for row in rows:
                 terminal = row["generation_events"][-1]
                 terminal.update({
                     "requested_action": "search",
@@ -272,9 +272,33 @@ class QwenNativeSmokeAnalysisTest(unittest.TestCase):
 
             result = SMOKE.analyze(args)
 
-        self.assertEqual(result["decision"], "NO-GO")
-        self.assertEqual(result["metrics"]["terminal_requested_search_count"], 5)
-        self.assertFalse(result["checks"]["terminal_requested_search_rate"]["passed"])
+        self.assertEqual(result["decision"], "GO")
+        self.assertEqual(result["metrics"]["terminal_answer_count"], 0)
+        self.assertEqual(result["metrics"]["terminal_requested_search_count"], 80)
+        self.assertEqual(result["metrics"]["terminal_answer_rate"], 0.0)
+        self.assertEqual(result["metrics"]["terminal_requested_search_rate"], 1.0)
+        self.assertNotIn("terminal_answer_rate", result["checks"])
+        self.assertNotIn("terminal_requested_search_rate", result["checks"])
+        self.assertTrue(all(check["passed"] for check in result["checks"].values()))
+
+    def test_rejects_inconsistent_terminal_search_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            args = self._fixture(Path(temporary))
+            rows = [json.loads(line) for line in args.trace.read_text().splitlines()]
+            terminal = rows[0]["generation_events"][-1]
+            terminal.update({
+                "requested_action": "search",
+                "action": None,
+                "parse_error": "search_disallowed_after_budget",
+                "terminal_rejection_reason": None,
+                "valid_action": False,
+            })
+            self._write_jsonl(args.trace, rows)
+
+            with self.assertRaisesRegex(
+                ValueError, "terminal search result is inconsistent"
+            ):
+                SMOKE.analyze(args)
 
     def test_no_go_when_terminal_instruction_or_policy_mask_is_wrong(self) -> None:
         cases = (

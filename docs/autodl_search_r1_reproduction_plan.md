@@ -15,6 +15,25 @@
 
 本项目仍是面向 Agent 算法岗位的缩小复现，不宣称复刻论文数值。固定两张 32 GiB 5090 级 GPU、单 seed、CPU BM25 和全参数微调；不做 PPO、dense retriever、模型/超参数 sweep、多 seed 或通用实验平台。
 
+### 1.1 检索器选择：为什么使用官方 BM25 后端
+
+论文主实验并非使用 BM25。[论文](2503.09516v5.pdf) 第 7 页 4.3 节明确采用 2018 Wikipedia、E5 dense retriever 和 top-3 passages；官方默认 [`retrieval_launch.sh`](../retrieval_launch.sh) 进一步给出 `intfloat/e5-base-v2 + e5_Flat.index + FAISS GPU`。本项目保留相同 Wiki-18 语料、top-3 返回数和 `/retrieve` 交互接口，但将排序后端固定为 CPU BM25。这是预算约束下的缩小复现选择，不应表述为与论文 E5 数值等价。
+
+BM25 不是本项目自行添加的非官方替代。Search-R1 官方 README 明确支持 local sparse retriever、local dense retriever 和 online search engine；官方 [`docs/retriever.md`](retriever.md) 提供 Wiki-18 BM25 索引下载及启动方法，[`example/retriever/retrieval_launch_bm25.sh`](../example/retriever/retrieval_launch_bm25.sh) 也提供 top-3 BM25 示例。Agent rollout 只通过统一 HTTP 接口提交 query、接收 passages，因此更换官方支持的检索后端不会改变 Search-R1 的多轮生成、retrieved-token loss masking、GRPO 或奖励计算主逻辑，但会改变环境返回的 top-3 文档集合及其排序。
+
+本轮不使用 E5 向量检索，原因如下：
+
+1. 论文级 E5 Flat 方案需要额外加载 E5 encoder 和大规模 dense index，官方为满足在线 RL 吞吐建议使用 FAISS GPU；当前两张 5090 已用于全参数训练，继续共享显存会增加 OOM 和吞吐风险，另开检索 GPU、扩盘或改用 CPU ANN 都会扩大预算与变量数。
+2. 当前 100 GB 数据盘、CPU/GPU 分阶段流程和数百元总预算优先保证一次完整的训练与对照闭环，而不是追求论文 benchmark 的绝对数值。BM25 可在无独立检索 GPU 的情况下持续提供确定性的本地 top-3 检索。
+3. 现有 train/val 已按固定 BM25 evidence、可见长度和 supporting facts 筛选。现在切换 E5 会改变每题 top-3，必须重建 evidence、selection ledger、Parquet、manifest、CPU handoff 和全部实验 lineage；这不是可以在训练前静默替换的单一参数。
+
+在本项目范围内使用 BM25 是合理的，但需要限定结论：
+
+- BM25 对人名、地名和专有名词等词面明确的开放域 QA 查询通常有效；本项目还用同一 BM25 对候选题做 evidence 可见性筛选，避免在已知无检索信号的数据上训练。
+- 所有阶段必须冻结同一份 BM25 index、corpus revision 和 top-k；其中 B/C 还共享相同 parent digest、样本顺序、seed、batch、group 和训练步数，因此 B/C 的内部成本对照只改变奖励函数。
+- E5 更擅长同义改写和低词面重合的语义检索，BM25 可能改变首跳召回、二跳查询、搜索次数、EM 和梯度分布；所以本项目可以复现 Agent/RL 核心机制并研究成本感知奖励，但不能把绝对 EM 或搜索次数宣称为论文 E5 benchmark 的复刻。
+- 若未来追求论文数值对齐，应把 E5 作为独立环境实验，重新构建数据与 handoff，并建立新的 lineage；不得与本轮 BM25 结果混合比较。
+
 ## 2. 固定搜索与长度配置
 
 论文最大 action budget 为 4，默认返回 top-3 passages。本项目保持：
@@ -30,7 +49,7 @@
 4 * (500 + 500) + 500 = 4500
 ```
 
-其中前四轮允许检索，最后 500 token 仅供仍 active 的轨迹收尾；该轮若再次生成 search，也不执行检索、不增加成本。`max_action_budget` 仍为 4，完整耗尽预算的轨迹在日志中记为 `action_count=5` 和 `terminal_generation=true`。当前固定参数为：
+其中前四轮允许检索，最后 500 token 仅供仍 active 的轨迹收尾。环境会在收尾生成前追加固定 user reminder；它是模型可见的软约束，其 token 的 policy mask 为 0，而模型随后生成的 terminal assistant token 仍参与 policy loss。该轮若再次生成 search，只记录请求，不接受、不执行检索也不增加成本。`max_action_budget` 仍为 4，完整耗尽预算的轨迹在日志中记为 `action_count=5` 和 `terminal_generation=true`。当前固定参数为：
 
 | 参数 | 值 |
 | --- | ---: |
@@ -190,7 +209,7 @@ bash /root/autodl-tmp/search-r1/checkout/scripts/autodl/07_gpu_group_probe.sh
 
 两卡单价按 5.76 元/小时记录。当前 probe 的硬上限为 10 元；response 500 只在输出实际变长时增加耗时。后续训练仍以 300 元为总硬上限，但只有 probe GO 后才启用训练预算。100 GB 数据盘足够：新增 Hotpot train 原文件约 0.57 GB，检索 ledger 和混合 Parquet 远小于 checkpoint。
 
-面试中应如实表述：256 是局部截断干扰，但不是缺少多搜的唯一原因；真正的改进是把“多跳数据集标签”转化为由相同检索器验证的可执行二搜证据链，并用 group-level 探针在训练前检查稀疏奖励是否存在可学习信号。
+面试中应如实表述：256 是局部截断干扰，但不是缺少多搜的唯一原因；真正的改进是把“多跳数据集标签”转化为由相同检索器验证的可执行二搜证据链，并用 group-level 探针在训练前检查稀疏奖励是否存在可学习信号。论文主实验使用 E5 dense retriever；本项目为控制显存、存储和云端费用，选择官方仓库支持的 Wiki-18 BM25 top-3 后端。它保持 Search-R1 的检索接口和 RL 主闭环，并保证 B/C 在冻结环境下公平比较，但属于明确披露的缩小复现差异，不能用于声称论文绝对指标复刻。
 
 ## 8. 2026-07-23 实际探针结果
 
@@ -201,3 +220,18 @@ Base grouped probe 已按预注册配置完成，结论为 **NO-GO**。64 题、
 ## 9. Qwen3.5 协议适配后的后续入口
 
 专项审计确认当前 NO-GO 混入了 Qwen3.5 原生工具协议未启用、提示词占位符复制和宽松 parser 误触发等因素。后续不直接启动 `R-mix60`，统一按 [`qwen35_native_tool_adaptation_plan.md`](qwen35_native_tool_adaptation_plan.md) 先完成原生协议适配和 G0-G3 分层门禁；只有新 grouped gate 通过，才恢复本文件第 5 节的能力训练与成本分叉。
+
+## 10. Terminal 门禁语义修正
+
+最新 G0/G1 已证明 terminal reminder 能覆盖全部待收尾轨迹，reminder token 未进入 policy loss，且 terminal search 的 accepted/executed 均为 0；prompt、token、mask、trace 与 retrieval lineage 检查也通过。模型仍可能不听从软提醒：它可以再次请求 search、输出 unknown tool 或非法格式。因此 terminal answer rate、requested-search rate 和 invalid count/rate 用于观察 parent 行为及后续 RL 改善幅度，不再作为训练前硬阈值。
+
+修正后的 GO/NO-GO 只保留可由工程实现保证的 terminal 硬门：
+
+- reminder applied count 必须与第 4 轮后仍 active 的轨迹数完全一致；
+- reminder 与模板 wrapper 的 policy-token count 必须为 0，随后模型采样 token 的 mask 必须保持正确；
+- terminal search accepted count 与 executed count 必须均为 0；
+- `final_answer` 只能来自严格 parser；既有 prompt/token/mask、retrieval、trace、digest、基数及数值有限性合同继续全部生效。
+
+旧严格合同下已经封存的 `NO-GO` 结果、原始轨迹和 marker 保持不可变，不能按新规则追溯改写成 `GO`。新合同实现并完成 CPU reseal 后，必须从同一 sealed parent 重新运行一次小型 G0/G1，生成绑定新 commit、配置及合同版本的独立证据；只有这次新证据通过才可进入 2-step smoke。该重跑用于建立有效 lineage，不是更换 seed 或重复采样直到得到有利结果。
+
+这次最小修正不改变初始 prompt、terminal reminder 文本、parser、Qwen 原生工具协议、reward、数据、BM25、采样设置或训练参数，也不引入 constrained decoding。BM25 仍是本方案冻结的官方 sparse 后端；它可能改变相对论文 E5 的 top-3 文档集合及排序，因而绝对 EM 和搜索次数不能与论文数值等价。只有冻结同一 BM25 环境、parent、数据顺序和训练配置后的 B/C 内部对照，才可以表述为只改变奖励函数。

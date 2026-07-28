@@ -224,7 +224,7 @@ verify_native_attempt_binding() {
     recorded_results="$(tr -d '\r\n' <"$outer/result-root")" || return 1
     recorded_marker="$(tr -d '\r\n' <"$outer/evidence-marker")" || return 1
     recorded_digest="$(tr -d '\r\n' <"$outer/evidence-digest")" || return 1
-    [[ "$contract" == qwen-native-gate-v4 &&
+    [[ "$contract" == qwen-native-gate-v5 &&
         "$recorded_results" == "$results" &&
         "$recorded_marker" == "$marker" &&
         "$recorded_digest" == "$evidence_digest" ]] || {
@@ -848,7 +848,7 @@ publish_native_gate_evidence() {
     }
     atomic_write "$marker" "$evidence_digest"$'\n'
     sync_path "$marker_dir"
-    atomic_write "$outer_attempt/result-contract" 'qwen-native-gate-v4'$'\n'
+    atomic_write "$outer_attempt/result-contract" 'qwen-native-gate-v5'$'\n'
     atomic_write "$outer_attempt/result-root" "$results_dir"$'\n'
     atomic_write "$outer_attempt/evidence-marker" "$marker"$'\n'
     atomic_write "$outer_attempt/evidence-digest" "$evidence_digest"$'\n'
