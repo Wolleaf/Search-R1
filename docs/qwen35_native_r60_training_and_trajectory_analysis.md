@@ -18,7 +18,7 @@
 2. EM 增益主要来自 NQ：NQ 增加 25 题，HotpotQA 只增加 2 题。成本实验真正关心的 held-out 多跳能力仍需单独验证。
 3. 第 52 步后出现明显的长输出漂移。末 10 步真实截断达到 `202/400 = 50.5%`，含非安全类协议异常的轨迹达到 `186/400 = 46.5%`；同时 KL 后段升高。训练没有数值爆炸，但最终 checkpoint 的格式与多搜能力不能只靠训练 rollout 判定。
 
-因此最小下一步不是运行旧的完整 `main`，也不是直接联跑 B/C，而是只对 sealed R60 checkpoint 跑一次预注册的 G3。当前仓库还没有可直接运行的 G3-only 入口；启动 GPU 前需先最小实现并验证“只消费本次 R60 marker/checkpoint、封存 G3 后停止”的入口。G3 完成后先人工分析，不自动进入 endpoint 或 B/C。
+因此最小下一步不是运行旧的完整 `main`，也不是直接联跑 B/C，而是只对 sealed R60 checkpoint 跑一次预注册的 G3。当前已增加最小 G3-only operator：它保留 R60 当时的 checkout/handoff/数据身份，只消费 exact R60 marker 和 `global_step_60`，封存 G3 后立即停止。G3 完成后先人工分析，不自动进入 endpoint 或 B/C。
 
 ## 2. 终态、血缘与证据完整性
 
@@ -356,7 +356,32 @@ G3 使用 sealed R60 `global_step_60`，固定 held-out HotpotQA 64 题，每题
 
 五项中任一失败，应记录 `G3 capability=NO-GO` 并作为完整科学结果停止。若五项全部通过，则记录 `G3 capability=GO`，再单独检查 branch authorization：clean cost-contrast group 必须 `>=8/64`。cost-contrast 不足时，结论是“capability GO、branches NO-GO”，不能反过来改写 G3 能力结论。
 
-即使 capability 和 cost-contrast 都通过，也只进入人工复核；现有完整 `09...main` 还包含 A/R endpoint 和潜在 B/C 自动续跑，不能直接复用为下一条命令。后续应按既定血缘决定是否执行 A/R endpoint，以及是否另行批准同 parent、同数据、同采样和同 20 步预算的 B20/C20；两个训练分支只允许改变预注册奖励项。
+即使 capability 和 cost-contrast 都通过，也只进入人工复核；现有完整 `09...main` 还包含 A/R endpoint 和潜在 B/C 自动续跑，不能直接复用为下一条命令。`10_gpu_qwen_native_r60_only.sh` 也会从 base 重训 R60，同样不能运行。后续应按既定血缘决定是否执行 A/R endpoint，以及是否另行批准同 parent、同数据、同采样和同 20 步预算的 B20/C20；两个训练分支只允许改变预注册奖励项。
+
+### 10.3 G3-only 实现边界与命令
+
+[`11_gpu_qwen_native_g3_only.sh`](../scripts/autodl/11_gpu_qwen_native_g3_only.sh) 不成为 R60 实验 checkout 的一部分。R60 绑定的 checkout 继续固定为 `f8c1cd7e87078d07385f74ca8710add5d5f79c06`；新 runner 通过受控 SFTP 放到 `/root/autodl-tmp/search-r1/operator/`，并把自身 SHA-256 写入 CPU receipt 和最终 evidence。这样既可以增加“只跑 G3”的操作边界，又不会用新代码身份伪装成 R60 当时的训练代码。
+
+CPU 无卡阶段只执行前驱校验：
+
+```bash
+QWEN_NATIVE_PROTOCOL_GATE_EVIDENCE=/root/autodl-tmp/search-r1/manifests/qwen-native-gate/20260728T044634Z-2051-4045.ok \
+QWEN_NATIVE_SMOKE_EVIDENCE=/root/autodl-tmp/search-r1/manifests/qwen-native-training-smoke/20260728T061246Z-1316-15067.ok \
+QWEN_NATIVE_R60_EVIDENCE=/root/autodl-tmp/search-r1/manifests/qwen-native-training-r60-only/20260728T092026Z-2906-16060.ok \
+bash /root/autodl-tmp/search-r1/operator/11_gpu_qwen_native_g3_only.sh --cpu-prepare
+```
+
+该步验证冻结 checkout、CPU handoff、native-v4 数据、G0/G1、smoke、R60 marker、R60 trace 和 checkpoint digest，不重封 handoff、不更新 checkout、不重建数据。因此不得运行 `AUTODL_RESEAL_ONLY=1` 或 `02_cpu_prepare.sh`。CPU verifier 通过后，挂载两卡只执行：
+
+```bash
+QWEN_NATIVE_PROTOCOL_GATE_EVIDENCE=/root/autodl-tmp/search-r1/manifests/qwen-native-gate/20260728T044634Z-2051-4045.ok \
+QWEN_NATIVE_SMOKE_EVIDENCE=/root/autodl-tmp/search-r1/manifests/qwen-native-training-smoke/20260728T061246Z-1316-15067.ok \
+QWEN_NATIVE_R60_EVIDENCE=/root/autodl-tmp/search-r1/manifests/qwen-native-training-r60-only/20260728T092026Z-2906-16060.ok \
+GPU_COUNT=2 AUTODL_PRICE_PER_HOUR=5.76 \
+bash /root/autodl-tmp/search-r1/operator/11_gpu_qwen_native_g3_only.sh
+```
+
+入口只在 held-out HotpotQA 64 题上每题采样 5 条，不更新权重、不产生 checkpoint、不运行 endpoint 或 B/C。无论科学结论为 GO 还是 NO-GO，都会封存 `qwen-native-training-g3-only-v1` marker 和 evidence。旧 watchdog 不识别该新成功合同，所以 runner 在封存完成后按设计返回受控外层状态 `201`，用于走旧 failure-path 关机。`201` 不是评测失败；必须用 G3-only marker、evidence manifest 和内层 eval `success/0` 判定完成。
 
 当前数据盘为 150 GB，已用约 113 GB、剩余约 38 GB。一次 G3 评测不产生新的 9 GB 全参数 checkpoint，空间足够；若继续保留两个约 9 GB 的 B/C checkpoint、轨迹和临时目录，38 GB 会偏紧，启动分支前应先重新做保留策略和空间预算，而不是现在付费扩容。
 
