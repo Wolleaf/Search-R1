@@ -342,7 +342,10 @@ manual_gpu_start_required=true
 verify_g3_foundation() {
     local commit="$1" handoff_digest="$2" base_digest="$3"
     local base_model="$4" recorded sidecar data_digest g3_data_digest config_digest
+    export PYTHONDONTWRITEBYTECODE=1
+    export PYTHONPYCACHEPREFIX="$G3_PROJECT_ROOT/cache/g3-only-pycache"
     export PYTHONPATH="$CHECKOUT_DIR${PYTHONPATH:+:$PYTHONPATH}"
+    mkdir -p "$PYTHONPYCACHEPREFIX"
     [[ ! -e "$MANIFEST_DIR/cpu-seal.pending.json" &&
        ! -L "$MANIFEST_DIR/cpu-seal.pending.json" ]] || {
         printf 'CPU seal transaction is unresolved.\n' >&2
