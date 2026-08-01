@@ -4,7 +4,7 @@ set -Eeuo pipefail
 MODE="${1:-}"
 VARIANT="${2:-}"
 PROJECT_ROOT="${AUTODL_ROOT:-/root/autodl-tmp/search-r1}"
-CHECKOUT_DIR="$PROJECT_ROOT/checkout"
+CHECKOUT_DIR="${AUTODL_CODE_CHECKOUT:-$PROJECT_ROOT/checkout}"
 TRAIN_PYTHON="$PROJECT_ROOT/envs/train/bin/python"
 MODEL_DIR="$PROJECT_ROOT/models/Qwen3.5-2B"
 DATA_DIR_WAS_SET="${DATA_DIR+x}"
@@ -21,6 +21,7 @@ TRACE_RUN_ID="${TRACE_RUN_ID:-}"
 TRACE_CHECKPOINT_DIGEST="${TRACE_CHECKPOINT_DIGEST:-}"
 TRACE_PARENT_CHECKPOINT_DIGEST="${TRACE_PARENT_CHECKPOINT_DIGEST:-}"
 TOOL_PROTOCOL="${TOOL_PROTOCOL:-legacy_xml}"
+QWEN_NATIVE_RECOVERY_C20="${AUTODL_QWEN_NATIVE_RECOVERY_C20:-0}"
 GRPO_GROUP_SIZE=5
 PPO_MINI_BATCH_SIZE=$((TRAIN_BATCH_SIZE * GRPO_GROUP_SIZE))
 readonly MAX_TURNS=4
@@ -39,6 +40,33 @@ readonly QWEN35_PROMPT_VERSION=qwen35-native-search-v4-terminal-answer-only
     printf 'TOOL_PROTOCOL must be legacy_xml or qwen35_native.\n' >&2
     exit 64
 }
+[[ "$QWEN_NATIVE_RECOVERY_C20" == 0 || "$QWEN_NATIVE_RECOVERY_C20" == 1 ]] || {
+    printf 'AUTODL_QWEN_NATIVE_RECOVERY_C20 must be 0 or 1.\n' >&2
+    exit 64
+}
+if [[ -n "${AUTODL_CODE_CHECKOUT+x}" ]]; then
+    [[ -d "$CHECKOUT_DIR" && ! -L "$CHECKOUT_DIR" ]] || {
+        printf 'Explicit code checkout is missing or symlinked: %s\n' "$CHECKOUT_DIR" >&2
+        exit 1
+    }
+    project_canonical="$(readlink -f -- "$PROJECT_ROOT")"
+    checkout_canonical="$(readlink -f -- "$CHECKOUT_DIR")"
+    canonical_checkout="$(readlink -f -- "$PROJECT_ROOT/checkout")"
+    if [[ "$QWEN_NATIVE_RECOVERY_C20" == 1 ]]; then
+        recovery_root="$project_canonical/recovery-checkouts"
+        [[ "$CHECKOUT_DIR" == "$checkout_canonical" &&
+            "$(dirname -- "$checkout_canonical")" == "$recovery_root" &&
+            "$(basename -- "$checkout_canonical")" =~ ^[0-9a-f]{40}$ ]] || {
+            printf 'Recovery C20 requires one exact commit checkout under %s.\n' \
+                "$recovery_root" >&2
+            exit 64
+        }
+    elif [[ "$checkout_canonical" != "$canonical_checkout" ]]; then
+        printf 'A non-recovery job may use only the canonical checkout.\n' >&2
+        exit 64
+    fi
+    CHECKOUT_DIR="$checkout_canonical"
+fi
 [[ "$TRAIN_BATCH_SIZE" == 8 || "$TRAIN_BATCH_SIZE" == 4 ]] || {
     printf 'TRAIN_BATCH_SIZE must be 8 (default) or the documented OOM fallback 4.\n' >&2
     exit 64
@@ -189,6 +217,17 @@ case "$MODE:$VARIANT" in
         fi
         SAVE_FREQ="$TOTAL_STEPS"
         TEST_FREQ="$TOTAL_STEPS"
+        if [[ "$QWEN_NATIVE_RECOVERY_C20" == 1 ]]; then
+            [[ "$TOOL_PROTOCOL" == qwen35_native &&
+                "$VARIANT" == cost_aware_gated && "$TOTAL_STEPS" == 20 ]] || {
+                printf 'Recovery mode is restricted to native C20.\n' >&2
+                exit 64
+            }
+            # The recovery workflow performs a separately sealed val-128 run.
+            # Save and finalize C20 without a second in-process validation so a
+            # slow endpoint cannot destroy an already completed checkpoint.
+            TEST_FREQ=-1
+        fi
         if [[ "$TOOL_PROTOCOL" == qwen35_native ]]; then
             VAL_FILE="$DATA_DIR/val_128.parquet"
         else
@@ -276,6 +315,12 @@ case "$MODE:$VARIANT" in
         exit 64
         ;;
 esac
+
+if [[ "$QWEN_NATIVE_RECOVERY_C20" == 1 &&
+      "$MODE:$VARIANT" != train:cost_aware_gated ]]; then
+    printf 'Recovery mode is valid only for train:cost_aware_gated.\n' >&2
+    exit 64
+fi
 
 if [[ "$MODE:$VARIANT" != eval:search_opportunity &&
       "$MODE:$VARIANT" != eval:group_probe &&
@@ -461,6 +506,13 @@ HYDRA_ARGS=(
     "${NATIVE_TRAIN_HYDRA_ARGS[@]}"
     "${TRACE_HYDRA_ARGS[@]}"
 )
+
+if [[ "$QWEN_NATIVE_RECOVERY_C20" == 1 ]]; then
+    HYDRA_ARGS+=(
+        ++trainer.val_after_train=false
+        ++trainer.recovery_c20=true
+    )
+fi
 
 cd "$CHECKOUT_DIR"
 if [[ "${AUTODL_CONFIG_ONLY:-0}" == 1 ]]; then

@@ -218,6 +218,28 @@ env "${COMMON[@]}" \
 grep -Fxq -- 'algorithm.cost_lambda=0.10' "$CAPTURE"
 grep -Fxq -- '++algorithm.cost_reward_mode=correct_only' "$CAPTURE"
 grep -Fxq -- '++trainer.native_training_variant=cost_aware_gated' "$CAPTURE"
+grep -Fxq -- 'trainer.save_freq=20' "$CAPTURE"
+grep -Fxq -- 'trainer.test_freq=20' "$CAPTURE"
+! grep -Fq -- 'trainer.val_after_train' "$CAPTURE"
+! grep -Fq -- 'trainer.recovery_c20' "$CAPTURE"
+
+RECOVERY_COMMIT="$(printf 'b%.0s' {1..40})"
+RECOVERY_CHECKOUT="$ROOT/recovery-checkouts/$RECOVERY_COMMIT"
+mkdir -p "$RECOVERY_CHECKOUT" "$ROOT/escape-checkout"
+env "${COMMON[@]}" \
+    AUTODL_CODE_CHECKOUT="$RECOVERY_CHECKOUT" \
+    AUTODL_QWEN_NATIVE_RECOVERY_C20=1 \
+    DATA_DIR="$ROOT/data/search_mix_qwen35_native_v4" \
+    TOOL_PROTOCOL=qwen35_native \
+    bash "$AUTODL_DIR/train_small_grpo.sh" \
+    train cost_aware_gated 20 "$ROOT/parent-checkpoint"
+grep -Fxq -- 'trainer.save_freq=20' "$CAPTURE"
+grep -Fxq -- 'trainer.test_freq=-1' "$CAPTURE"
+grep -Fxq -- '++trainer.val_after_train=false' "$CAPTURE"
+grep -Fxq -- '++trainer.recovery_c20=true' "$CAPTURE"
+grep -Fxq -- '++trainer.native_training_variant=cost_aware_gated' "$CAPTURE"
+grep -Fxq -- 'algorithm.cost_lambda=0.10' "$CAPTURE"
+grep -Fxq -- '++algorithm.cost_reward_mode=correct_only' "$CAPTURE"
 
 expect_exit_64() {
     set +e
@@ -262,6 +284,24 @@ expect_exit_64 env "${COMMON[@]}" TRAIN_BATCH_SIZE=4 \
 expect_exit_64 env "${COMMON[@]}" MAX_RESPONSE_LENGTH=384 \
     DATA_DIR="$ROOT/data/search_mix_qwen35_native_v4" TOOL_PROTOCOL=qwen35_native \
     bash "$AUTODL_DIR/train_small_grpo.sh" train smoke 2
+expect_exit_64 env "${COMMON[@]}" \
+    AUTODL_CODE_CHECKOUT="$RECOVERY_CHECKOUT" \
+    AUTODL_QWEN_NATIVE_RECOVERY_C20=1 \
+    DATA_DIR="$ROOT/data/search_mix_qwen35_native_v4" TOOL_PROTOCOL=qwen35_native \
+    bash "$AUTODL_DIR/train_small_grpo.sh" \
+    train control 20 "$ROOT/parent-checkpoint"
+expect_exit_64 env "${COMMON[@]}" \
+    AUTODL_CODE_CHECKOUT="$RECOVERY_CHECKOUT" \
+    AUTODL_QWEN_NATIVE_RECOVERY_C20=1 \
+    DATA_DIR="$ROOT/data/search_mix_qwen35_native_v4" TOOL_PROTOCOL=qwen35_native \
+    bash "$AUTODL_DIR/train_small_grpo.sh" \
+    train cost_aware_gated 19 "$ROOT/parent-checkpoint"
+expect_exit_64 env "${COMMON[@]}" \
+    AUTODL_CODE_CHECKOUT="$ROOT/recovery-checkouts/../escape-checkout" \
+    AUTODL_QWEN_NATIVE_RECOVERY_C20=1 \
+    DATA_DIR="$ROOT/data/search_mix_qwen35_native_v4" TOOL_PROTOCOL=qwen35_native \
+    bash "$AUTODL_DIR/train_small_grpo.sh" \
+    train cost_aware_gated 20 "$ROOT/parent-checkpoint"
 
 if env "${COMMON[@]}" \
     EVAL_DATA_FILE="$ROOT/data/group-probe.parquet" \

@@ -1703,7 +1703,9 @@ class RayPPOTrainer(object):
                 if next_step is None:
 
                     # perform validation after training
-                    if self.val_reward_fn is not None and not validated_this_step:
+                    if (self.val_reward_fn is not None
+                            and self.config.trainer.get('val_after_train', True)
+                            and not validated_this_step):
                         val_metrics = self._validate()
                         pprint(f'Final validation metrics: {val_metrics}')
                         logger.log(data=val_metrics, step=self.global_steps)

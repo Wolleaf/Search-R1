@@ -263,7 +263,12 @@ run_job() {
             elif [[ "$argument" == "$BASE_GATE_STEPS" ]]; then
                 budget_rmb=8
             elif [[ "$argument" == "$BRANCH_STEPS" ]]; then
-                budget_rmb=25
+                # A native C20 run includes a 128-row terminal validation.  The
+                # previous 25 RMB cap expired inside that validation after all
+                # 20 rollout batches had been written, before the checkpoint
+                # could be published.  Give C20 the same wall-clock envelope as
+                # the otherwise identical B20 branch.
+                budget_rmb=40
             else
                 printf 'C-gated is allowed only for the %s-step gate or step %s endpoint.\n' \
                     "$BASE_GATE_STEPS" "$BRANCH_STEPS" >&2
