@@ -58,7 +58,7 @@ inside <answer> and </answer>, without detailed illustrations. For
 example, <answer> Beijing </answer>. Question: {question}
 ```
 
-“as many times as you want”是保留的上游提示词语义；真实环境仍以四个常规 action turn 为硬预算。工具通过 Qwen3.5 原生 tool schema 传入，`enable_thinking=True`，检索结果以原生 `tool` role 回填。代码合同见 [tool_protocol.py](../search_r1/llm_agent/tool_protocol.py)。
+“as many times as you want”是保留的上游提示词语义；真实环境仍以四个常规 action turn 为硬预算。工具通过 Qwen3.5 原生 tool schema 传入，`enable_thinking=True`，检索结果以原生 `tool` role 回填。代码合同见 [tool_protocol.py](../../../../search_r1/llm_agent/tool_protocol.py)。
 
 采样固定为：
 
@@ -116,7 +116,7 @@ terminal_requested_search_rate <= 5%
 
 这两个比率正是计划交给 RL 验证的候选行为目标，不适合作为本阶段的工程准入条件。Gate-v5 保留比率和完整轨迹作为诊断，但只让工程能够保证的事实决定 GO/NO-GO：提醒必须完整注入、提醒 token 不得进入 policy loss、terminal search 不得被接受或执行，以及原有 prompt/token/mask/retrieval/lineage 合同必须通过。
 
-`f8c1cd7` 同时提升了 gate/smoke contract 版本，并加强 terminal prompt 文本、digest、follow-up token、run-index、原始 trace 和 analyzer replay 的可验证性；它没有修改 prompt 文案、parser、模型、数据、BM25、采样、reward 或生成参数。Gate-v5 是看到 Gate-v4 失败语义后进行的 post-hoc 工程合同修订，不是预注册的 confirmatory success；旧 Gate-v4 `NO-GO` 证据保持不变，也没有被追溯覆盖。具体语义见 [主复现方案第 10 节](autodl_search_r1_reproduction_plan.md#10-terminal-门禁语义修正)。
+`f8c1cd7` 同时提升了 gate/smoke contract 版本，并加强 terminal prompt 文本、digest、follow-up token、run-index、原始 trace 和 analyzer replay 的可验证性；它没有修改 prompt 文案、parser、模型、数据、BM25、采样、reward 或生成参数。Gate-v5 是看到 Gate-v4 失败语义后进行的 post-hoc 工程合同修订，不是预注册的 confirmatory success；旧 Gate-v4 `NO-GO` 证据保持不变，也没有被追溯覆盖。具体语义见 [主复现方案第 10 节](../plans/autodl_search_r1_reproduction_plan.md#10-terminal-门禁语义修正)。
 
 ## 5. G0/E0：协议与真实工具闭环
 
@@ -316,7 +316,7 @@ gold -> 12 february 1959
 pred -> february 12 1959
 ```
 
-两者不完全相等。该例是 metric 表达敏感性的透明记录，不应据此临时放宽 reward；正式实现见 [qa_em.py](../verl/utils/reward_score/qa_em.py)。
+两者不完全相等。该例是 metric 表达敏感性的透明记录，不应据此临时放宽 reward；正式实现见 [qa_em.py](../../../../verl/utils/reward_score/qa_em.py)。
 
 ## 10. 当前能证明什么、不能证明什么
 
@@ -373,4 +373,4 @@ smoke checkpoint 不作为 R60 parent。只有 smoke `GO` 且人工看过实际�
 /root/autodl-tmp/search-r1/manifests/qwen-native-gate/20260728T044634Z-2051-4045.ok
 ```
 
-本报告的汇总数字来自 `summary.json`，问题级结论来自 `per_question.jsonl`，逐轨迹结论来自 `per_trajectory.jsonl` 与原始 `eval_predictions.jsonl`；四者已独立交叉重算，未发现不一致。完整流程合同见 [AutoDL 操作说明](../scripts/autodl/README.md) 和 [terminal/gold/WandB 修复方案](qwen35_native_terminal_gold_wandb_remediation_plan.md)。
+本报告的汇总数字来自 `summary.json`，问题级结论来自 `per_question.jsonl`，逐轨迹结论来自 `per_trajectory.jsonl` 与原始 `eval_predictions.jsonl`；四者已独立交叉重算，未发现不一致。完整流程合同见 [AutoDL 操作说明](../../../../scripts/autodl/README.md) 和 [terminal/gold/WandB 修复方案](../plans/qwen35_native_terminal_gold_wandb_remediation_plan.md)。

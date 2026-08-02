@@ -4,7 +4,7 @@
 
 2026-07-23 grouped probe 的 NO-GO 继续作为真实失败证据保留，但不能据此认定 Qwen3.5-2B 不会搜索。审计已经直接证明，占位符复制、含标签的恢复文案和宽松正则制造了大量退化调用；同时，当前输入没有启用 Qwen3.5 训练时使用的 tool schema、`<tool_call>` 和 `<tool_response>` 角色结构。
 
-下一轮不再只修补旧提示词后直接长训，而是优先完成 **Qwen3.5 原生协议适配与分层验证**。只有协议和 Agent 循环通过低成本门禁，才恢复 `R-mix60 -> B-mix20/C-gated-mix20`。详细证据见 [`results/grouped-probe-20260723/qwen35_tool_protocol_audit_zh.md`](results/grouped-probe-20260723/qwen35_tool_protocol_audit_zh.md)。
+下一轮不再只修补旧提示词后直接长训，而是优先完成 **Qwen3.5 原生协议适配与分层验证**。只有协议和 Agent 循环通过低成本门禁，才恢复 `R-mix60 -> B-mix20/C-gated-mix20`。详细证据见 [`results/grouped-probe-20260723/qwen35_tool_protocol_audit_zh.md`](../../../results/grouped-probe-20260723/qwen35_tool_protocol_audit_zh.md)。
 
 ## 2. 不变项与允许改动
 

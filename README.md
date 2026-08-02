@@ -34,13 +34,13 @@ Built upon [veRL](https://github.com/volcengine/verl), Search-R1 extends the ide
 
 We support different RL methods (e.g., PPO, GRPO, reinforce), different LLMs (e.g., llama3, Qwen2.5, etc) and different search engines (e.g., local sparse/dense retrievers and online search engines).
 
-Paper: [link1](https://arxiv.org/pdf/2503.09516), [link2](https://arxiv.org/abs/2505.15117); Model and data: [link](https://huggingface.co/collections/PeterJinGo/search-r1-67d1a021202731cb065740f5); Twitter thread: [link](https://x.com/BowenJin13/status/1895544294473109889); Full experiment log: [prelim](https://wandb.ai/peterjin/Search-R1-open); [v0.1](https://wandb.ai/peterjin/Search-R1-nq_hotpotqa_train); [v0.2](https://wandb.ai/peterjin/Search-R1-v0.2); [v0.3](https://wandb.ai/peterjin/Search-R1-v0.3). Details about these logs and methods can be find [here](https://github.com/PeterGriffinJin/Search-R1/blob/main/docs/experiment_log.md).
+Paper: [link1](https://arxiv.org/pdf/2503.09516), [link2](https://arxiv.org/abs/2505.15117); Model and data: [link](https://huggingface.co/collections/PeterJinGo/search-r1-67d1a021202731cb065740f5); Twitter thread: [link](https://x.com/BowenJin13/status/1895544294473109889); Full experiment log: [prelim](https://wandb.ai/peterjin/Search-R1-open); [v0.1](https://wandb.ai/peterjin/Search-R1-nq_hotpotqa_train); [v0.2](https://wandb.ai/peterjin/Search-R1-v0.2); [v0.3](https://wandb.ai/peterjin/Search-R1-v0.3). Details about these logs and methods can be find [here](docs/reference/experiment_log.md).
 
 ## Qwen3.5 Small-Scale Reproduction (This Branch)
 
 This branch adds a minimal two-GPU AutoDL workflow for full-parameter GRPO training of Qwen3.5-2B and a controlled search-cost reward experiment. On NQ test-128, the reproduced model improved EM from 3.9% to 16.4%. The cost-aware branch reduced searches by 97.0% versus its matched control but also reduced EM, exposing a no-search policy collapse rather than a successful cost-quality trade-off.
 
-- [Experiment design and reproducible cloud workflow](docs/autodl_search_r1_reproduction_plan.md)
+- [Experiment design and reproducible cloud workflow](docs/history/qwen35-native-arbc-202607-202608/plans/autodl_search_r1_reproduction_plan.md)
 - [Final metrics, curves, lineage, and interpretation](docs/results/search-r1-small-20260720/README.md)
 - [AutoDL operator commands](scripts/autodl/README.md)
 
@@ -53,8 +53,8 @@ This branch adds a minimal two-GPU AutoDL workflow for full-parameter GRPO train
 - [2025.7] Search-R1 is supported by [SkyRL](https://github.com/NovaSky-AI/SkyRL)! Detailed instructions: [code](https://github.com/NovaSky-AI/SkyRL/tree/main/skyrl-train/examples/search), [Document](https://novasky-ai.notion.site/skyrl-searchr1).
 - [2025.6] Search-R1 is now integrated into the latest version of veRL and can take advantage of its most up-to-date features! Detailed instructions: [veRL](https://verl.readthedocs.io/en/latest/sglang_multiturn/search_tool_example.html), [English Document](https://github.com/zhaochenyang20/Awesome-ML-SYS-Tutorial/blob/main/rlhf/verl/multi-turn/tool_examples/verl-multiturn-searchR1-like.md), [Chinese Document](https://github.com/zhaochenyang20/Awesome-ML-SYS-Tutorial/blob/main/rlhf/verl/multi-turn/tool_examples/verl-multiturn-searchR1-like_ZH.md).
 - [2025.5] The second [paper](https://arxiv.org/abs/2505.15117) conducting detailed empirical studies is published with logs: [v0.3](https://wandb.ai/peterjin/Search-R1-v0.3). 
-- [2025.4] We support [multinode](https://github.com/PeterGriffinJin/Search-R1/blob/main/docs/multinode.md) training for 30B+ LLMs!
-- [2025.4] We support [different search engines](https://github.com/PeterGriffinJin/Search-R1/blob/main/docs/retriever.md) including sparse local retriever, dense local retriever with ANN indexing and online search engines!
+- [2025.4] We support [multinode](docs/reference/multinode.md) training for 30B+ LLMs!
+- [2025.4] We support [different search engines](docs/reference/retriever.md) including sparse local retriever, dense local retriever with ANN indexing and online search engines!
 - [2025.3] The first Search-R1 [paper](https://arxiv.org/pdf/2503.09516) is published with the logs: [v0.1](https://wandb.ai/peterjin/Search-R1-nq_hotpotqa_train); [v0.2](https://wandb.ai/peterjin/Search-R1-v0.2).
 - [2025.2] We opensource Search-R1 codebase with [preliminary results](https://wandb.ai/peterjin/Search-R1-open).
 
@@ -210,7 +210,7 @@ You can change ```retriever_name``` and ```retriever_model``` to your interested
 
 ## Use your own search engine
 
-Our codebase supports local sparse retriever (e.g., BM25), local dense retriever (both flat indexing with GPUs and ANN indexing with CPUs) and online search engine (e.g., Google, Bing, etc). More details can be found [here](https://github.com/PeterGriffinJin/Search-R1/tree/main/docs/retriever.md).
+Our codebase supports local sparse retriever (e.g., BM25), local dense retriever (both flat indexing with GPUs and ANN indexing with CPUs) and online search engine (e.g., Google, Bing, etc). More details can be found [here](docs/reference/retriever.md).
 
 The main philosophy is to launch a local or remote search engine server separately from the main RL training pipeline. 
 

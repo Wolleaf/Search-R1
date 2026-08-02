@@ -203,17 +203,17 @@ B 的训练内置 val-128（64 NQ + 64 HotpotQA）在 step 20 完成：
 当前结果应放进下面这条完整故事，而不是孤立成一次“C 挂了”：
 
 1. **早期工程阻塞与首轮成功运行（7 月 19–20 日）**：修复 Qwen3.5/FSDP/offload/GPU gate/关机状态机。首轮 A→R60→B/C 的进程最终成功，真正的科学失败是策略坍缩，不是单纯 OOM。
-2. **旧 NQ-only 线性成本奖励坍缩（7 月 20 日）**：C-old 把 no-search 推到 98.44%，EM 从 B 的 17.97% 降到 7.03%。全错 GRPO group 中，线性成本项错误地奖励了“不搜索但答错”。详见 [首轮结果](../search-r1-small-20260720/README.md) 和 [坍缩分析](../../成本感知坍缩分析与改进建议.md)。
+2. **旧 NQ-only 线性成本奖励坍缩（7 月 20 日）**：C-old 把 no-search 推到 98.44%，EM 从 B 的 17.97% 降到 7.03%。全错 GRPO group 中，线性成本项错误地奖励了“不搜索但答错”。详见 [首轮结果](../search-r1-small-20260720/README.md) 和 [坍缩分析](../../history/qwen35-native-arbc-202607-202608/plans/成本感知坍缩分析与改进建议.md)。
 3. **correct-only gated 修复（7 月 21 日）**：no-search 回到 0%，EM 恢复到 14.06%，但仍低于旧 B 的 17.97%，也没有节省搜索。详见 [二次实验分析](../../history/成本感知二次实验结果分析.md)。
 4. **搜索机会门（7 月 22 日）**：旧 B 的多跳集里几乎全是一搜；仅有的二搜样本又错误、重复且截断，所以继续压搜索没有可利用空间。详见 [search-opportunity gate](../search-opportunity-gate-20260722/analysis_zh.md)。
 5. **数据配比调整（7 月 22 日）**：训练数据从 NQ/Hotpot 1:1 改为 37.5%/62.5%，Hotpot comparison/bridge 从 200/120 改为 56/264，以增加可学习二跳链，同时保留 NQ 稳定梯度。
 6. **mixed-data grouped probe（7 月 23 日）**：320 条里只有 7 条正确，非法与截断严重；大量 query 是 `query`、`and` 或空串，问题被定位到私有 XML 协议和解析器，而不是只缺奖励。详见 [grouped probe](../grouped-probe-20260723/analysis_zh.md)。
-7. **Qwen3.5 native tool adaptation（7 月 23–28 日）**：迁移到 native tool schema，逐步修复 token/mask、答案边界、停止行为、W&B 与 evidence seal。详见 [实现报告](../../qwen35_native_tool_adaptation_implementation_report.md) 和 [两步 smoke](../../qwen35_native_v4_two_step_smoke_analysis.md)。
-8. **新 native mixed-data R60（7 月 28–29 日）**：60/60、2,400 条轨迹完成；固定 val EM 从 37.50% 升到 58.59%，平均搜索从 3.117 降到 1.992，且没有 no-search collapse；但后段 clipping/invalid/KL 同步上升。详见 [R60 分析](../../qwen35_native_r60_training_and_trajectory_analysis.md)。
-9. **G3 NO-GO（7 月 29 日）**：320 条推理完整，但 clipping 46.88%、invalid 43.75%、clean learnable group 仅 5/64；预注册门禁失败。cost contrast 13/64 只支持另立 post-hoc exploratory B/C，不能改写 G3。详见 [G3 分析](../../qwen35_native_r60_g3_evaluation_and_trajectory_analysis.md)。
-10. **本次 native B/C（7 月 31 日）**：B20 完整；C 在最终内置验证中超时，训练证据包未封存。它提供了候选趋势和一个清晰的工程故障点，但没有完成正式 B/C 问题。实验边界见 [执行 handoff](../../qwen35_native_bc_posthoc_execution_handoff.md)。
+7. **Qwen3.5 native tool adaptation（7 月 23–28 日）**：迁移到 native tool schema，逐步修复 token/mask、答案边界、停止行为、W&B 与 evidence seal。详见 [实现报告](../../history/qwen35-native-arbc-202607-202608/stages/qwen35_native_tool_adaptation_implementation_report.md) 和 [两步 smoke](../../history/qwen35-native-arbc-202607-202608/stages/qwen35_native_v4_two_step_smoke_analysis.md)。
+8. **新 native mixed-data R60（7 月 28–29 日）**：60/60、2,400 条轨迹完成；固定 val EM 从 37.50% 升到 58.59%，平均搜索从 3.117 降到 1.992，且没有 no-search collapse；但后段 clipping/invalid/KL 同步上升。详见 [R60 分析](../../history/qwen35-native-arbc-202607-202608/stages/qwen35_native_r60_training_and_trajectory_analysis.md)。
+9. **G3 NO-GO（7 月 29 日）**：320 条推理完整，但 clipping 46.88%、invalid 43.75%、clean learnable group 仅 5/64；预注册门禁失败。cost contrast 13/64 只支持另立 post-hoc exploratory B/C，不能改写 G3。详见 [G3 分析](../../history/qwen35-native-arbc-202607-202608/stages/qwen35_native_r60_g3_evaluation_and_trajectory_analysis.md)。
+10. **本次 native B/C（7 月 31 日）**：B20 完整；C 在最终内置验证中超时，训练证据包未封存。它提供了候选趋势和一个清晰的工程故障点，但没有完成正式 B/C 问题。实验边界见 [执行 handoff](../../history/qwen35-native-arbc-202607-202608/plans/qwen35_native_bc_posthoc_execution_handoff.md)。
 
-未来的 SFT40→RL20→B/C 必须继续作为独立路线，不替换、也不回写当前 direct-RL 结果，见 [SFT+RL 后续方案](../../qwen35_native_sft_rl_bc_followup_plan.md)。
+未来的 SFT40→RL20→B/C 必须继续作为独立路线，不替换、也不回写当前 direct-RL 结果，见 [SFT+RL 后续方案](../../history/qwen35-native-arbc-202607-202608/plans/qwen35_native_sft_rl_bc_followup_plan.md)。
 
 ## 9. 推荐恢复方案
 

@@ -49,8 +49,8 @@ prompt 不可能与上游 Qwen2.5 + legacy XML 输入逐字或逐 token 相同�
 prefix；这些是模型接口序列化，不是新增搜索策略。
 
 原版 user prompt 位于
-[`scripts/data_process/nq_search.py`](../scripts/data_process/nq_search.py)，当前合同位于
-[`search_r1/llm_agent/tool_protocol.py`](../search_r1/llm_agent/tool_protocol.py)。对当前
+[`scripts/data_process/nq_search.py`](../../../../scripts/data_process/nq_search.py)，当前合同位于
+[`search_r1/llm_agent/tool_protocol.py`](../../../../search_r1/llm_agent/tool_protocol.py)。对当前
 sealed 样本的实际 user 文本，相对原版只保留以下三项白名单差异：
 
 | 原版 | 当前 Qwen3.5 | 性质 |
@@ -188,8 +188,8 @@ answer，10/16 用完预算仍未合法终止。现在的主要模型问题已�
 
 Qwen 原生 template 已把 assistant 输出分成 reasoning 与后续 action：当前 sampled
 continuation 通常先生成 reasoning，再出现 `</think>`，之后才是 tool call 或
-`<answer>`。但 [`slice_first_complete_native_action()`](../search_r1/llm_agent/generation.py)
-和 [`_parse_qwen35_action()`](../search_r1/llm_agent/tool_protocol.py) 仍在整段 decoded
+`<answer>`。但 [`slice_first_complete_native_action()`](../../../../search_r1/llm_agent/generation.py)
+和 [`_parse_qwen35_action()`](../../../../search_r1/llm_agent/tool_protocol.py) 仍在整段 decoded
 文本中全局查找/计数 action marker。于是 reasoning 中只是谈论输出格式的文字，也会
 被当成真正 action。
 
@@ -225,7 +225,7 @@ action 集，但会改变 malformed 行为：若模型未关闭 thinking 就输�
 ```
 
 因此“包含首个完整 closing marker 的最短 token prefix”不一定在字符层面以 marker
-结尾。当前 [`_validate_raw_generation()`](../search_r1/trajectory_trace.py) 使用
+结尾。当前 [`_validate_raw_generation()`](../../../../search_r1/trajectory_trace.py) 使用
 `rstrip().endswith("</answer>")`，把字符末尾当成 token 边界的二次校验，最终让本应
 落盘的 generation event 摧毁整轮 G1。
 
@@ -280,9 +280,9 @@ generation slicer、strict parser 和 trace validator 对同一边界达成一�
    action 仍能以对应 boundary 落盘，语法有效性由 parser 单独给出。
 
 该最小修复会涉及
-[`search_r1/llm_agent/generation.py`](../search_r1/llm_agent/generation.py)、
-[`search_r1/llm_agent/tool_protocol.py`](../search_r1/llm_agent/tool_protocol.py) 和
-[`search_r1/trajectory_trace.py`](../search_r1/trajectory_trace.py)，并同步更新只读协议探针
+[`search_r1/llm_agent/generation.py`](../../../../search_r1/llm_agent/generation.py)、
+[`search_r1/llm_agent/tool_protocol.py`](../../../../search_r1/llm_agent/tool_protocol.py) 和
+[`search_r1/trajectory_trace.py`](../../../../search_r1/trajectory_trace.py)，并同步更新只读协议探针
 的同一解析调用。最小原则按责任和行为变量判断，不以“只能改一个文件”判断；若只把
 `endswith` 改成全局 `contains`，G1 虽可能落盘，三条已知误解析仍会污染后续训练。
 

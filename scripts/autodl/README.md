@@ -2,7 +2,7 @@
 
 本目录是 Search-R1-small 云端复现的唯一入口。固定镜像为 **PyTorch 2.8.0 / Python 3.12 / Ubuntu 22.04 / CUDA 12.8**，持久目录为 `/root/autodl-tmp/search-r1`。正常流程始终是 **Git -> CPU -> GPU**；脚本不扫描机器规格、不自动改配置、不自动重试。GPU phase 本身不关机；需要时显式绑定本次 attempt 启动独立 watchdog。
 
-`03/05/06/07` 保留此前 NQ、搜索机会门和 XML grouped probe 的可执行证据，不作为 Qwen3.5 原生协议入口。从零复现时，`08_gpu_qwen_native_gate.sh` 运行结构 G0/G1 门，`09_gpu_qwen_native_train.sh` 提供 smoke 和完整 main。本轮 R60、G3、B20/C20 recovery 与 A/R 三端点评测已经全部完成并封存，**当前没有待启动的 GPU 阶段**。总交接见 [`docs/qwen35_native_complete_experiment_handoff.md`](../../docs/qwen35_native_complete_experiment_handoff.md)，最终结果见 [`docs/qwen35_native_arbc_final_results_analysis.md`](../../docs/qwen35_native_arbc_final_results_analysis.md)。
+`03/05/06/07` 保留此前 NQ、搜索机会门和 XML grouped probe 的可执行证据，不作为 Qwen3.5 原生协议入口。从零复现时，`08_gpu_qwen_native_gate.sh` 运行结构 G0/G1 门，`09_gpu_qwen_native_train.sh` 提供 smoke 和完整 main。本轮 R60、G3、B20/C20 recovery 与 A/R 三端点评测已经全部完成并封存，**当前没有待启动的 GPU 阶段**。总交接见 [`qwen35_native_complete_experiment_handoff.md`](../../docs/history/qwen35-native-arbc-202607-202608/final/qwen35_native_complete_experiment_handoff.md)，最终结果见 [`qwen35_native_arbc_final_results_analysis.md`](../../docs/history/qwen35-native-arbc-202607-202608/final/qwen35_native_arbc_final_results_analysis.md)。
 
 ## 最终状态：实验已完成（不要重跑）
 

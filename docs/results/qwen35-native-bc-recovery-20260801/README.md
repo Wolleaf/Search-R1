@@ -2,7 +2,7 @@
 
 本目录是 2026-08-01 B20/C20 recovery 与配对评测的本地紧凑证据包。完整中文分析见：
 
-- [Qwen3.5 Native R60 后续 B20/C20 训练、恢复与完整结果分析](../../qwen35_native_bc_recovery_complete_analysis_report.md)
+- [Qwen3.5 Native R60 后续 B20/C20 训练、恢复与完整结果分析](../../history/qwen35-native-arbc-202607-202608/final/qwen35_native_bc_recovery_complete_analysis_report.md)
 
 ## 1. 证据来源
 

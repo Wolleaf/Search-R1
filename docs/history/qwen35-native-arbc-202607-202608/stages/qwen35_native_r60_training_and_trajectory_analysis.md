@@ -360,7 +360,7 @@ G3 使用 sealed R60 `global_step_60`，固定 held-out HotpotQA 64 题，每题
 
 ### 10.3 G3-only 实现边界与命令
 
-[`11_gpu_qwen_native_g3_only.sh`](../scripts/autodl/11_gpu_qwen_native_g3_only.sh) 不成为 R60 实验 checkout 的一部分。R60 绑定的 checkout 继续固定为 `f8c1cd7e87078d07385f74ca8710add5d5f79c06`；新 runner 通过受控 SFTP 放到 `/root/autodl-tmp/search-r1/operator/`，并把自身 SHA-256 写入 CPU receipt 和最终 evidence。这样既可以增加“只跑 G3”的操作边界，又不会用新代码身份伪装成 R60 当时的训练代码。
+[`11_gpu_qwen_native_g3_only.sh`](../../../../scripts/autodl/11_gpu_qwen_native_g3_only.sh) 不成为 R60 实验 checkout 的一部分。R60 绑定的 checkout 继续固定为 `f8c1cd7e87078d07385f74ca8710add5d5f79c06`；新 runner 通过受控 SFTP 放到 `/root/autodl-tmp/search-r1/operator/`，并把自身 SHA-256 写入 CPU receipt 和最终 evidence。这样既可以增加“只跑 G3”的操作边界，又不会用新代码身份伪装成 R60 当时的训练代码。
 
 CPU 无卡阶段只执行前驱校验：
 

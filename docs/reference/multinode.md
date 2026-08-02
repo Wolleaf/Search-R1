@@ -15,22 +15,22 @@ a. Start **head** node with ```ray start --head --dashboard-host=0.0.0.0```, the
 
 - Dashboard address: ```<address>:8265```, where you should submit job to the cluster.
 
-![head](../public/head.png)
+![head](../../public/head.png)
 
 b. Start **worker node** and register it to the ray cluster with ```ray start --address=<address>``` you get above.
 
-![worker](../public/worker.png)
+![worker](../../public/worker.png)
 
 c. Check the cluster status with ```ray status```.
 
 For example, if you have two nodes (each with 8 GPUs) in the cluster, you should see something like this:
 
-![status](../public/status.png)
+![status](../../public/status.png)
 
 
 ### Step 2: Launch the retrieval server on every node.
 
-We would recommend launch the **same** retrieval server on every nodes (including both head and worker nodes) for the stable RL training. Detailed information on how to launch different retrievers can be found as follows: [doc](https://github.com/PeterGriffinJin/Search-R1/blob/main/docs/retriever.md) and [scripts](https://github.com/PeterGriffinJin/Search-R1/tree/main/example/retriever).
+We would recommend launch the **same** retrieval server on every nodes (including both head and worker nodes) for the stable RL training. Detailed information on how to launch different retrievers can be found as follows: [doc](retriever.md) and [scripts](https://github.com/PeterGriffinJin/Search-R1/tree/main/example/retriever).
 
 For example, if you want to launch the local dense retriever with flat indexing, run the following command on **every** nodes:
 

@@ -8,7 +8,7 @@
 
 上一轮 grouped probe 的 NO-GO 是有效的失败证据，但不能直接推出“Qwen3.5-2B 不会搜索”。审计发现，旧实验仍用 Search-R1 的 XML 动作格式，并存在占位符复制、带动作标签的恢复提示和宽松解析等干扰；Qwen3.5 实际训练时使用的 tool schema、`<tool_call>` 与 `<tool_response>` 上下文没有被正确接入。因此，模型能力、提示协议、解析器和采样因素混在了一起。
 
-失败轨迹提供了直接证据：312 次检索中，字面量 `query` 有 139 次、`and` 有 70 次、空 query 有 1 次，合计 210/312（67.31%）属于退化调用。实际 checkpoint 是已后训练的 `Qwen3.5-2B`，不是未经后训练的 `Qwen3.5-2B-Base`；如此高的占位符比例更应先排查适配边界，而不是先归因于模型智力。原始审计保存在 [`results/grouped-probe-20260723/qwen35_tool_protocol_audit_zh.md`](results/grouped-probe-20260723/qwen35_tool_protocol_audit_zh.md)。
+失败轨迹提供了直接证据：312 次检索中，字面量 `query` 有 139 次、`and` 有 70 次、空 query 有 1 次，合计 210/312（67.31%）属于退化调用。实际 checkpoint 是已后训练的 `Qwen3.5-2B`，不是未经后训练的 `Qwen3.5-2B-Base`；如此高的占位符比例更应先排查适配边界，而不是先归因于模型智力。原始审计保存在 [`results/grouped-probe-20260723/qwen35_tool_protocol_audit_zh.md`](../../../results/grouped-probe-20260723/qwen35_tool_protocol_audit_zh.md)。
 
 本轮没有直接重训，而是先完成一个可切换、可验证、可回退的 Qwen3.5 原生协议边界，并把验证拆为低成本 G0-G3 门禁。核心结论是：
 
@@ -54,7 +54,7 @@ GPU G0+G1 -> exact evidence -> G2 -> exact evidence -> G3
 
 ### 4.1 Canonical prompt 与工具 schema
 
-新增 [`search_r1/llm_agent/tool_protocol.py`](../search_r1/llm_agent/tool_protocol.py)，集中管理：
+新增 [`search_r1/llm_agent/tool_protocol.py`](../../../../search_r1/llm_agent/tool_protocol.py)，集中管理：
 
 - `legacy_xml|qwen35_native` 协议枚举与规范化；
 - 固定 Qwen3.5 model revision、chat template digest 和 prompt version；
@@ -69,7 +69,7 @@ GPU G0+G1 -> exact evidence -> G2 -> exact evidence -> G3
 
 ### 4.2 多轮 token 保真与工具回填
 
-[`search_r1/llm_agent/generation.py`](../search_r1/llm_agent/generation.py) 增加 native conversation 路径。初始 batch 必须携带 canonical raw messages；搜索结果由官方模板作为 tool response 回填，再开始下一轮 assistant。
+[`search_r1/llm_agent/generation.py`](../../../../search_r1/llm_agent/generation.py) 增加 native conversation 路径。初始 batch 必须携带 canonical raw messages；搜索结果由官方模板作为 tool response 回填，再开始下一轮 assistant。
 
 多轮续接不能简单执行“decode 全文再 encode”，因为 chat template 会 trim assistant content，非规范 BPE 分段也不保证往返一致。实现使用唯一 ASCII sentinel 从真实模板中提取本轮 assistant 后缀，然后拼接：
 
@@ -92,15 +92,15 @@ GPU G0+G1 -> exact evidence -> G2 -> exact evidence -> G3
 
 ### 4.3 Dataset 与 reward 对齐
 
-[`verl/utils/dataset/rl_dataset.py`](../verl/utils/dataset/rl_dataset.py) 在 native 模式下验证 canonical messages、使用同一 renderer，并把 raw chat 原样交给 Agent loop。legacy 数据加载行为不变。
+[`verl/utils/dataset/rl_dataset.py`](../../../../verl/utils/dataset/rl_dataset.py) 在 native 模式下验证 canonical messages、使用同一 renderer，并把 raw chat 原样交给 Agent loop。legacy 数据加载行为不变。
 
-native 最终答案只保存在 batch-aligned `final_answer` 环境字段中，不伪造 `<answer>` token。[`verl/trainer/main_ppo.py`](../verl/trainer/main_ppo.py) 直接用该字段计算 EM，并继续使用真实 `executed_search_count` 计算成本奖励。缺失 final answer、搜索计数形状错误、负数或超过 4 次都会失败关闭。
+native 最终答案只保存在 batch-aligned `final_answer` 环境字段中，不伪造 `<answer>` token。[`verl/trainer/main_ppo.py`](../../../../verl/trainer/main_ppo.py) 直接用该字段计算 EM，并继续使用真实 `executed_search_count` 计算成本奖励。缺失 final answer、搜索计数形状错误、负数或超过 4 次都会失败关闭。
 
 ## 5. 数据物化与 CPU 增量阶段
 
 ### 5.1 不重新选题，只重新表达 prompt
 
-[`scripts/data_process/search_mix.py`](../scripts/data_process/search_mix.py) 新增 `materialize-native` 与离线校验。它从已封存的 source manifest、catalog、selection funnel 和 retrieval evidence 重新物化独立目录 `data/search_mix_qwen35_native/`，并逐项证明：
+[`scripts/data_process/search_mix.py`](../../../../scripts/data_process/search_mix.py) 新增 `materialize-native` 与离线校验。它从已封存的 source manifest、catalog、selection funnel 和 retrieval evidence 重新物化独立目录 `data/search_mix_qwen35_native/`，并逐项证明：
 
 - train/val/probe 的 sample ID、顺序、seed 和类别配额不变；
 - 除 `prompt` 外的字段逐行不变；
@@ -124,7 +124,7 @@ CPU 使用固定真实 tokenizer 对每一行执行四类检查：canonical mess
 
 增量模式不重新执行 BM25，但也不能盲信一个同名 JSON。`retrieval_replay.json` 会重新校验 manifest/catalog/evidence 哈希、corpus 与 BM25 revision、640 条入选样本、1024 次查询、选择顺序哈希、canonical JSON 和 `.sha256` sidecar。
 
-[`scripts/autodl/handoff.py`](../scripts/autodl/handoff.py) 的 `verify --require-artifact` 让 CPU 增量入口和 GPU admission 都必须证明 replay receipt 与 sidecar 属于旧 handoff。增量入口先要求 `cpu.ok` 等于旧 handoff digest，再删除旧 `cpu.ok` 并开始重封，关闭“handoff 已更新但 cpu.ok 尚未更新”的 crash window；只有新 handoff 完整成功才重新发布 `cpu.ok`。新 receipt 随后进入 GPU input digest 和最终 evidence。
+[`scripts/autodl/handoff.py`](../../../../scripts/autodl/handoff.py) 的 `verify --require-artifact` 让 CPU 增量入口和 GPU admission 都必须证明 replay receipt 与 sidecar 属于旧 handoff。增量入口先要求 `cpu.ok` 等于旧 handoff digest，再删除旧 `cpu.ok` 并开始重封，关闭“handoff 已更新但 cpu.ok 尚未更新”的 crash window；只有新 handoff 完整成功才重新发布 `cpu.ok`。新 receipt 随后进入 GPU input digest 和最终 evidence。
 
 无卡实例只需运行：
 
@@ -146,7 +146,7 @@ temperature=1.0, top_p=1.0, top_k=20, min_p=0.0,
 presence_penalty=2.0, repetition_penalty=1.0
 ```
 
-[`verl/workers/rollout/hf_rollout.py`](../verl/workers/rollout/hf_rollout.py) 把 `top_k` 传入 HF `GenerationConfig`。由于当前 Transformers generation config 没有同语义的 `presence_penalty`，新增一个很小的 logits processor：只对当前 assistant 回合已经生成过的 token 减一次固定 penalty，不按出现次数累加，不惩罚 prompt/tool response，并在新 assistant 回合重置。`presence_penalty=0` 是严格 no-op。
+[`verl/workers/rollout/hf_rollout.py`](../../../../verl/workers/rollout/hf_rollout.py) 把 `top_k` 传入 HF `GenerationConfig`。由于当前 Transformers generation config 没有同语义的 `presence_penalty`，新增一个很小的 logits processor：只对当前 assistant 回合已经生成过的 token 减一次固定 penalty，不按出现次数累加，不惩罚 prompt/tool response，并在新 assistant 回合重置。`presence_penalty=0` 是严格 no-op。
 
 legacy 默认仍是 `top_k=0/presence_penalty=0`。native 的有效值会同时从 resolved config 与 `run.env` 交叉核对，并写入 `sampling.json` 后进入 evidence seal，避免“代码默认值看起来正确、实际运行参数不同”。
 
@@ -154,7 +154,7 @@ legacy 默认仍是 `top_k=0/presence_penalty=0`。native 的有效值会同时�
 
 HF rollout 在生成时使用经过 top-k/presence 处理的 proposal 分布，但现有 actor 在 PPO old/current log-prob 重算时只使用 temperature 后的完整词表分布。两者比较口径一致不代表数学上是严格 on-policy PPO。
 
-因此 [`verl/trainer/ppo/ray_trainer.py`](../verl/trainer/ppo/ray_trainer.py) 在核心层拒绝 `qwen35_native && !trainer.val_only`，[`scripts/autodl/train_small_grpo.sh`](../scripts/autodl/train_small_grpo.sh) 也只注册 native 的 G1/G2/G3 eval 组合。G0-G3 不做 actor update，所以当前采样设置没有 PPO ratio 风险。
+因此 [`verl/trainer/ppo/ray_trainer.py`](../../../../verl/trainer/ppo/ray_trainer.py) 在核心层拒绝 `qwen35_native && !trainer.val_only`，[`scripts/autodl/train_small_grpo.sh`](../../../../scripts/autodl/train_small_grpo.sh) 也只注册 native 的 G1/G2/G3 eval 组合。G0-G3 不做 actor update，所以当前采样设置没有 PPO ratio 风险。
 
 G3 GO 后若开放训练，必须先二选一：
 
@@ -165,7 +165,7 @@ G3 GO 后若开放训练，必须先二选一：
 
 ## 7. 完整轨迹与面试证据
 
-[`verl/trainer/ppo/ray_trainer.py`](../verl/trainer/ppo/ray_trainer.py) 和 native Agent loop 会保存 batch 对齐的原始与规范化事件。单条轨迹可回答：
+[`verl/trainer/ppo/ray_trainer.py`](../../../../verl/trainer/ppo/ray_trainer.py) 和 native Agent loop 会保存 batch 对齐的原始与规范化事件。单条轨迹可回答：
 
 - 哪道题、哪个 `sample_id`、group/slot、checkpoint 和 stage 产生了结果；
 - 每轮模型原始文本、token 数、是否 clipped、规范化 action 和 parse error；
@@ -176,11 +176,11 @@ G3 GO 后若开放训练，必须先二选一：
 
 事件对齐会检查“执行的 search action 数 = retrieval event 数 = `executed_search_count`”，final answer 也必须与终局 generation event 一致。任何错位直接报错，避免生成日志看似完整但无法复算。
 
-[`scripts/autodl/qwen_native_gate_analysis.py`](../scripts/autodl/qwen_native_gate_analysis.py) 输出 `per_trajectory.jsonl`、`per_question.jsonl`、`summary.json`、`summary.md` 和 `go_no_go.json`。因此后续不仅能报告总体 EM，还能逐题比较“需要几次搜索、实际用了几次、哪一步 query 或证据链失败”。
+[`scripts/autodl/qwen_native_gate_analysis.py`](../../../../scripts/autodl/qwen_native_gate_analysis.py) 输出 `per_trajectory.jsonl`、`per_question.jsonl`、`summary.json`、`summary.md` 和 `go_no_go.json`。因此后续不仅能报告总体 EM，还能逐题比较“需要几次搜索、实际用了几次、哪一步 query 或证据链失败”。
 
 ## 8. GPU 分层门禁与成本控制
 
-新增入口 [`scripts/autodl/08_gpu_qwen_native_gate.sh`](../scripts/autodl/08_gpu_qwen_native_gate.sh)，每次只运行一个 exact stage：
+新增入口 [`scripts/autodl/08_gpu_qwen_native_gate.sh`](../../../../scripts/autodl/08_gpu_qwen_native_gate.sh)，每次只运行一个 exact stage：
 
 | 阶段 | 固定规模 | 主要排除因素 | GO 条件摘要 | 工作预算 |
 | --- | --- | --- | --- | ---: |

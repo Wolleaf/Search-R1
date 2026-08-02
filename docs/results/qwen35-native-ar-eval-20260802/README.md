@@ -2,7 +2,7 @@
 
 本目录保存 2026-08-01 至 2026-08-02 完成的 A/R 三端点最终评测紧凑证据。完整结果分析见：
 
-- [Qwen3.5 Native A/R/B/C 最终结果分析](../../qwen35_native_arbc_final_results_analysis.md)
+- [Qwen3.5 Native A/R/B/C 最终结果分析](../../history/qwen35-native-arbc-202607-202608/final/qwen35_native_arbc_final_results_analysis.md)
 
 ## 结果身份
 

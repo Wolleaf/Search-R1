@@ -6,7 +6,7 @@
 >
 > 当前状态：B20、C20 与六个外部评测均已完成；完整证据已在持久盘封存，小型结果包与关键训练证据已下载到本地
 >
-> 本地证据入口：[qwen35-native-bc-recovery-20260801](results/qwen35-native-bc-recovery-20260801/README.md)
+> 本地证据入口：[qwen35-native-bc-recovery-20260801](../../../results/qwen35-native-bc-recovery-20260801/README.md)
 
 ## 1. 执行摘要
 
@@ -507,7 +507,7 @@ docs/results/qwen35-native-bc-recovery-20260801/
 
 还有一个纯元数据缺口：六个 eval 的 `run.env` 将 `eval_data_file/hash` 记为 `unavailable`。不过各自 sealed resolved config 明确绑定 `val_128.parquet`、`nq_test_128_native_v4.parquet` 或 `multihop_eval_256_native_v4.parquet`，这三份 parquet 本身均在 166 项清单中通过哈希；六份 trace 的 checkpoint digest 也逐条与 B20/C20 复算 digest 相同，B/C 样本身份与顺序完全一致且无重复。因此这是 `run.env` 字段覆盖不足，不是评测数据来源不明或配对身份失效。
 
-完整文件说明见[证据包 README](results/qwen35-native-bc-recovery-20260801/README.md)，原始 paired summaries 分别见 [val](results/qwen35-native-bc-recovery-20260801/raw-result/paired-val/summary.md)、[NQ-test](results/qwen35-native-bc-recovery-20260801/raw-result/paired-nq_test/summary.md) 与 [multihop](results/qwen35-native-bc-recovery-20260801/raw-result/paired-multihop/summary.md)。
+完整文件说明见[证据包 README](../../../results/qwen35-native-bc-recovery-20260801/README.md)，原始 paired summaries 分别见 [val](../../../results/qwen35-native-bc-recovery-20260801/raw-result/paired-val/summary.md)、[NQ-test](../../../results/qwen35-native-bc-recovery-20260801/raw-result/paired-nq_test/summary.md) 与 [multihop](../../../results/qwen35-native-bc-recovery-20260801/raw-result/paired-multihop/summary.md)。
 
 ### 10.2 远端磁盘
 
@@ -560,7 +560,7 @@ docs/results/qwen35-native-bc-recovery-20260801/
 - 先做小规模格式 smoke，确认 clipping、terminal compliance、zero-search 与 multi-search 都在合理范围；
 - 再注册 `SFT40→RL20`，从这个新 parent 平行训练 B/C。
 
-现有[后续方案](qwen35_native_sft_rl_bc_followup_plan.md)应作为这一新实验的起点，但不能与本轮 direct-RL B/C 合并成同一个实验身份。
+现有[后续方案](../plans/qwen35_native_sft_rl_bc_followup_plan.md)应作为这一新实验的起点，但不能与本轮 direct-RL B/C 合并成同一个实验身份。
 
 ### 12.4 下一轮确认性设计
 

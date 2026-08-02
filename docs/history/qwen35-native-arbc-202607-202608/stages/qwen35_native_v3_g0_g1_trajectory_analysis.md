@@ -3,7 +3,7 @@
 > 分析日期：2026-07-26
 > checkout：`experiment/hotpot-search-gate@6b1623191e6d2929fb9975bfa68acb342d8cf6de`
 > 模型：`Qwen/Qwen3.5-2B@15852e8c16360a2fea060d615a32b45270f8a8fc`
-> 精确证据：[qwen35-native-v3-g0-g1-20260726](results/qwen35-native-v3-g0-g1-20260726/README.md)
+> 精确证据：[qwen35-native-v3-g0-g1-20260726](../../../results/qwen35-native-v3-g0-g1-20260726/README.md)
 > 当前结论：**协议与轨迹工程门为 GO；parent 在固定 16 题探针上已能稳定产生多次搜索动作，但主要科学问题已经从“不搜索”转为“证据充分后仍继续搜索、耗尽动作预算”。建议保持配置不变，下一步先跑 2-step 数值 smoke，成功后再启动 R60。**
 
 ## 1. 结论先行
@@ -91,7 +91,7 @@ G0 共 32 条 protocol record：direct 16、native manager 16，覆盖 8 题 × 
 
 G1 还实际出现了 1 次同 token overshoot：`69168/slot0` 最后一个 policy token 同时解码出 `</answer>**`。系统正确执行 logical answer `Bremen`，保留原 sampled token，没有 invalid/retry，trace 正常落盘。其 strict EM=0 是因为 gold 为 `Bremen, Germany`，与 parser 无关。
 
-所以，相对 [上一轮边界故障修复计划](qwen35_native_g1_boundary_failure_remediation_plan.md)，这次首先证明的是：**logical action、policy-token prefix 和 trace validator 已经一致；工程修复没有通过修改 prompt、reward 或采样参数来掩盖模型行为。**
+所以，相对 [上一轮边界故障修复计划](../plans/qwen35_native_g1_boundary_failure_remediation_plan.md)，这次首先证明的是：**logical action、policy-token prefix 和 trace validator 已经一致；工程修复没有通过修改 prompt、reward 或采样参数来掩盖模型行为。**
 
 ## 5. G1 全量统计
 
@@ -379,12 +379,12 @@ utility = EM - 0.10 * executed_search_count / 4
 
 本地归档保留完整原始数据，不在本文复制 2.5 MB trace：
 
-- G1 原始 32 条：[eval_predictions.jsonl](results/qwen35-native-v3-g0-g1-20260726/raw/runs/eval/qwen_native_g1/attempts/20260726T072849Z-1665-11820/traces/eval_predictions.jsonl)
-- 逐轨迹诊断：[per_trajectory.jsonl](results/qwen35-native-v3-g0-g1-20260726/raw/runs/qwen-native-gate/attempts/20260726T072318Z-1616-11480/per_trajectory.jsonl)
-- 逐题配对：[per_question.jsonl](results/qwen35-native-v3-g0-g1-20260726/raw/runs/qwen-native-gate/attempts/20260726T072318Z-1616-11480/per_question.jsonl)
-- G0 记录：[records.jsonl](results/qwen35-native-v3-g0-g1-20260726/raw/runs/eval/qwen_native_g0/attempts/20260726T072457Z-1665-26451/output/records.jsonl)
-- 结构决策：[go_no_go.json](results/qwen35-native-v3-g0-g1-20260726/raw/runs/qwen-native-gate/attempts/20260726T072318Z-1616-11480/go_no_go.json)
-- 运行配置：[resolved-config.yaml](results/qwen35-native-v3-g0-g1-20260726/raw/runs/eval/qwen_native_g1/attempts/20260726T072849Z-1665-11820/resolved-config.yaml)
-- 完整证据清单：[evidence.sha256](results/qwen35-native-v3-g0-g1-20260726/raw/runs/qwen-native-gate/attempts/20260726T072318Z-1616-11480/evidence.sha256)
+- G1 原始 32 条：[eval_predictions.jsonl](../../../results/qwen35-native-v3-g0-g1-20260726/raw/runs/eval/qwen_native_g1/attempts/20260726T072849Z-1665-11820/traces/eval_predictions.jsonl)
+- 逐轨迹诊断：[per_trajectory.jsonl](../../../results/qwen35-native-v3-g0-g1-20260726/raw/runs/qwen-native-gate/attempts/20260726T072318Z-1616-11480/per_trajectory.jsonl)
+- 逐题配对：[per_question.jsonl](../../../results/qwen35-native-v3-g0-g1-20260726/raw/runs/qwen-native-gate/attempts/20260726T072318Z-1616-11480/per_question.jsonl)
+- G0 记录：[records.jsonl](../../../results/qwen35-native-v3-g0-g1-20260726/raw/runs/eval/qwen_native_g0/attempts/20260726T072457Z-1665-26451/output/records.jsonl)
+- 结构决策：[go_no_go.json](../../../results/qwen35-native-v3-g0-g1-20260726/raw/runs/qwen-native-gate/attempts/20260726T072318Z-1616-11480/go_no_go.json)
+- 运行配置：[resolved-config.yaml](../../../results/qwen35-native-v3-g0-g1-20260726/raw/runs/eval/qwen_native_g1/attempts/20260726T072849Z-1665-11820/resolved-config.yaml)
+- 完整证据清单：[evidence.sha256](../../../results/qwen35-native-v3-g0-g1-20260726/raw/runs/qwen-native-gate/attempts/20260726T072318Z-1616-11480/evidence.sha256)
 
 本文的科学结论以原始 trace、模型实际可见的 observation 和正式 strict EM 为准；完整 retrieved document 只用于检索器审计，不能冒充模型上下文。

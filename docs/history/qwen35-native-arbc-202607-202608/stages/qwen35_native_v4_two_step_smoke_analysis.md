@@ -473,4 +473,4 @@ Result: searches=1, EM=0
 /root/autodl-tmp/search-r1/runs/smoke/attempts/20260728T061454Z-1352-31865/wandb
 ```
 
-本报告数字来自 `smoke-decision.json`、`train.log`、`wandb-receipt.json`、`resolved-config.yaml`、`native-training-contract.json` 和原始 80 条 trace，并完成三次独立交叉复算。实现语义可查阅 [tool protocol](../search_r1/llm_agent/tool_protocol.py)、[trajectory logging](../verl/trainer/ppo/ray_trainer.py)、[strict EM](../verl/utils/reward_score/qa_em.py)、[AutoDL 操作说明](../scripts/autodl/README.md)及[主复现方案](autodl_search_r1_reproduction_plan.md)。
+本报告数字来自 `smoke-decision.json`、`train.log`、`wandb-receipt.json`、`resolved-config.yaml`、`native-training-contract.json` 和原始 80 条 trace，并完成三次独立交叉复算。实现语义可查阅 [tool protocol](../../../../search_r1/llm_agent/tool_protocol.py)、[trajectory logging](../../../../verl/trainer/ppo/ray_trainer.py)、[strict EM](../../../../verl/utils/reward_score/qa_em.py)、[AutoDL 操作说明](../../../../scripts/autodl/README.md)及[主复现方案](../plans/autodl_search_r1_reproduction_plan.md)。

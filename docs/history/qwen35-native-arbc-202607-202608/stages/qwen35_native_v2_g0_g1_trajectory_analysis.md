@@ -2,9 +2,9 @@
 
 > 分析日期：2026-07-25
 >
-> 对照文档：[Qwen3.5 Native G2 问题清单与训练解阻计划](qwen35_native_g2_issues_and_training_unblock_plan.md)
+> 对照文档：[Qwen3.5 Native G2 问题清单与训练解阻计划](../plans/qwen35_native_g2_issues_and_training_unblock_plan.md)
 >
-> 精确证据：[qwen35-native-v2-g0-g1-20260725](results/qwen35-native-v2-g0-g1-20260725/README.md)
+> 精确证据：[qwen35-native-v2-g0-g1-20260725](../../../results/qwen35-native-v2-g0-g1-20260725/README.md)
 >
 > 当前结论：**工程执行成功，科学门禁 NO-GO；不得进入 G2 或训练。**
 

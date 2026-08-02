@@ -14,7 +14,7 @@ direct-RL B/C recovery 与 A/R 三端点评测已经完成并封存
 ```
 
 已完成的 B/C 从已封存的 exact R60 checkpoint 平行启动，最终状态见
-[`qwen35_native_complete_experiment_handoff.md`](qwen35_native_complete_experiment_handoff.md)。原执行前合同保留在
+[`qwen35_native_complete_experiment_handoff.md`](../final/qwen35_native_complete_experiment_handoff.md)。原执行前合同保留在
 [`qwen35_native_bc_posthoc_execution_handoff.md`](qwen35_native_bc_posthoc_execution_handoff.md)。
 本文不得用来：
 
@@ -1283,9 +1283,9 @@ required_bytes =
 ## 23. 关联资料
 
 - [`qwen35_native_bc_posthoc_execution_handoff.md`](qwen35_native_bc_posthoc_execution_handoff.md)
-- [`qwen35_native_r60_training_and_trajectory_analysis.md`](qwen35_native_r60_training_and_trajectory_analysis.md)
-- [`qwen35_native_r60_g3_evaluation_and_trajectory_analysis.md`](qwen35_native_r60_g3_evaluation_and_trajectory_analysis.md)
+- [`qwen35_native_r60_training_and_trajectory_analysis.md`](../stages/qwen35_native_r60_training_and_trajectory_analysis.md)
+- [`qwen35_native_r60_g3_evaluation_and_trajectory_analysis.md`](../stages/qwen35_native_r60_g3_evaluation_and_trajectory_analysis.md)
 - [`autodl_search_r1_reproduction_plan.md`](autodl_search_r1_reproduction_plan.md)
-- [`../scripts/autodl/README.md`](../scripts/autodl/README.md)
+- [`../scripts/autodl/README.md`](../../../../scripts/autodl/README.md)
 - [Search-R1 paper](https://arxiv.org/abs/2503.09516)
 - [Search-R1 empirical study](https://arxiv.org/abs/2505.15117)

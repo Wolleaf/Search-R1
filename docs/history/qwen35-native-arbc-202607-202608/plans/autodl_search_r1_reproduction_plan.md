@@ -17,9 +17,9 @@
 
 ### 1.1 检索器选择：为什么使用官方 BM25 后端
 
-论文主实验并非使用 BM25。[论文](2503.09516v5.pdf) 第 7 页 4.3 节明确采用 2018 Wikipedia、E5 dense retriever 和 top-3 passages；官方默认 [`retrieval_launch.sh`](../retrieval_launch.sh) 进一步给出 `intfloat/e5-base-v2 + e5_Flat.index + FAISS GPU`。本项目保留相同 Wiki-18 语料、top-3 返回数和 `/retrieve` 交互接口，但将排序后端固定为 CPU BM25。这是预算约束下的缩小复现选择，不应表述为与论文 E5 数值等价。
+论文主实验并非使用 BM25。[论文](../../../reference/2503.09516v5.pdf) 第 7 页 4.3 节明确采用 2018 Wikipedia、E5 dense retriever 和 top-3 passages；官方默认 [`retrieval_launch.sh`](../../../../retrieval_launch.sh) 进一步给出 `intfloat/e5-base-v2 + e5_Flat.index + FAISS GPU`。本项目保留相同 Wiki-18 语料、top-3 返回数和 `/retrieve` 交互接口，但将排序后端固定为 CPU BM25。这是预算约束下的缩小复现选择，不应表述为与论文 E5 数值等价。
 
-BM25 不是本项目自行添加的非官方替代。Search-R1 官方 README 明确支持 local sparse retriever、local dense retriever 和 online search engine；官方 [`docs/retriever.md`](retriever.md) 提供 Wiki-18 BM25 索引下载及启动方法，[`example/retriever/retrieval_launch_bm25.sh`](../example/retriever/retrieval_launch_bm25.sh) 也提供 top-3 BM25 示例。Agent rollout 只通过统一 HTTP 接口提交 query、接收 passages，因此更换官方支持的检索后端不会改变 Search-R1 的多轮生成、retrieved-token loss masking、GRPO 或奖励计算主逻辑，但会改变环境返回的 top-3 文档集合及其排序。
+BM25 不是本项目自行添加的非官方替代。Search-R1 官方 README 明确支持 local sparse retriever、local dense retriever 和 online search engine；官方 [`docs/reference/retriever.md`](../../../reference/retriever.md) 提供 Wiki-18 BM25 索引下载及启动方法，[`example/retriever/retrieval_launch_bm25.sh`](../../../../example/retriever/retrieval_launch_bm25.sh) 也提供 top-3 BM25 示例。Agent rollout 只通过统一 HTTP 接口提交 query、接收 passages，因此更换官方支持的检索后端不会改变 Search-R1 的多轮生成、retrieved-token loss masking、GRPO 或奖励计算主逻辑，但会改变环境返回的 top-3 文档集合及其排序。
 
 本轮不使用 E5 向量检索，原因如下：
 

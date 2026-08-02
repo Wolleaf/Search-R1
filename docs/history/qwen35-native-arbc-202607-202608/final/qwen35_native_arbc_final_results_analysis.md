@@ -216,14 +216,14 @@ A 大量撞满 4-search 预算；R 将饱和率接近减半，同时显著提高
 
 本报告使用以下本地紧凑证据包：
 
-- [A/R 结果包](results/qwen35-native-ar-eval-20260802/README.md)
-- [A/R val summary](results/qwen35-native-ar-eval-20260802/raw-result/paired-ar-val/summary.md)
-- [A/R NQ-test summary](results/qwen35-native-ar-eval-20260802/raw-result/paired-ar-nq_test/summary.md)
-- [A/R multihop summary](results/qwen35-native-ar-eval-20260802/raw-result/paired-ar-multihop/summary.md)
-- [B/C 结果包](results/qwen35-native-bc-recovery-20260801/README.md)
-- [B/C val summary](results/qwen35-native-bc-recovery-20260801/raw-result/paired-val/summary.md)
-- [B/C NQ-test summary](results/qwen35-native-bc-recovery-20260801/raw-result/paired-nq_test/summary.md)
-- [B/C multihop summary](results/qwen35-native-bc-recovery-20260801/raw-result/paired-multihop/summary.md)
+- [A/R 结果包](../../../results/qwen35-native-ar-eval-20260802/README.md)
+- [A/R val summary](../../../results/qwen35-native-ar-eval-20260802/raw-result/paired-ar-val/summary.md)
+- [A/R NQ-test summary](../../../results/qwen35-native-ar-eval-20260802/raw-result/paired-ar-nq_test/summary.md)
+- [A/R multihop summary](../../../results/qwen35-native-ar-eval-20260802/raw-result/paired-ar-multihop/summary.md)
+- [B/C 结果包](../../../results/qwen35-native-bc-recovery-20260801/README.md)
+- [B/C val summary](../../../results/qwen35-native-bc-recovery-20260801/raw-result/paired-val/summary.md)
+- [B/C NQ-test summary](../../../results/qwen35-native-bc-recovery-20260801/raw-result/paired-nq_test/summary.md)
+- [B/C multihop summary](../../../results/qwen35-native-bc-recovery-20260801/raw-result/paired-multihop/summary.md)
 
 2026-08-02 的远端只读复核确认：
 

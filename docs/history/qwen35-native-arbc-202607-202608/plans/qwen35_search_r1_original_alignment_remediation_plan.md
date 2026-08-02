@@ -11,7 +11,7 @@
 >
 > 当前审计基线：`experiment/hotpot-search-gate@eae57c3ade2a3cad3549f70db1c5dd4e601ec949`
 >
-> 最新证据：[`qwen35-native-v2-g0-g1-20260725`](results/qwen35-native-v2-g0-g1-20260725/README.md)
+> 最新证据：[`qwen35-native-v2-g0-g1-20260725`](../../../results/qwen35-native-v2-g0-g1-20260725/README.md)
 
 本文是后续 Qwen3.5 协议补正的统一依据。它取代此前文档中与“原版语义 + 必要 Qwen3.5 适配”冲突的建议，但不覆盖旧实验、旧轨迹或旧 NO-GO。旧结果继续作为失败证据原样保留。
 
@@ -42,7 +42,7 @@
 
 发生冲突时按以下顺序判断：
 
-1. 论文 [`2503.09516v5.pdf`](2503.09516v5.pdf) 第 5 页 Table 1、第 6 页 Algorithm 1/奖励、第 7 页实验设置和第 16 页 Appendix B.2 决定科学语义。
+1. 论文 [`2503.09516v5.pdf`](../../../reference/2503.09516v5.pdf) 第 5 页 Table 1、第 6 页 Algorithm 1/奖励、第 7 页实验设置和第 16 页 Appendix B.2 决定科学语义。
 2. `origin/main` 决定论文未展开的官方实现方式。
 3. Qwen3.5 固定 revision 的 chat template 决定不可避免的接口序列化。
 4. 用户明确要求的 Qwen3.5-2B、两张 5090、数百元预算和缩小数据规模作为已披露的复现边界。
@@ -66,7 +66,7 @@ needed, you can directly provide the answer inside <answer> and </answer> withou
 detailed illustrations. For example, <answer> xxx </answer>. Question: question.
 ```
 
-上游仓库在 [`nq_search.py`](../scripts/data_process/nq_search.py) 和 [`qa_search_train_merge.py`](../scripts/data_process/qa_search_train_merge.py) 中保存同一语义的单条 user message，只把答案示例换成 `<answer> Beijing </answer>`，并带有 `as your want` 的拼写错误。关键语义是：
+上游仓库在 [`nq_search.py`](../../../../scripts/data_process/nq_search.py) 和 [`qa_search_train_merge.py`](../../../../scripts/data_process/qa_search_train_merge.py) 中保存同一语义的单条 user message，只把答案示例换成 `<answer> Beijing </answer>`，并带有 `as your want` 的拼写错误。关键语义是：
 
 - 每次得到问题或新检索信息后先在 `<think>` 中推理；
 - 只有缺少知识时才可以搜索，允许零搜索直接回答；
@@ -74,7 +74,7 @@ detailed illustrations. For example, <answer> xxx </answer>. Question: question.
 - 最终答案位于 `<answer>` 中且应简短；
 - prompt 不要求至少一次搜索，也不暴露最大搜索次数。
 
-仓库真实案例 [`example/case.txt`](../example/case.txt) 在没有强制首搜的情况下自主搜索两次，再输出 `<answer>`。
+仓库真实案例 [`example/case.txt`](../../../../example/case.txt) 在没有强制首搜的情况下自主搜索两次，再输出 `<answer>`。
 
 论文和 Qwen2.5 原实现没有 Qwen3.5 的 `enable_thinking` 模板开关；它们通过 prompt 和生成文本中的 `<think>...</think>` 表达 thinking。当前适配设置 `enable_thinking=False` 后，固定 Qwen3.5 template 会预填空 thinking，而 parser 又拒绝非空 `<think>`，实际效果恰好是取消论文要求。因而在 Qwen3.5 上改为 `enable_thinking=True` 是协议映射，不是新增思维链技巧。
 
@@ -137,7 +137,7 @@ r(x, y) = EM(a_pred, a_gold)
 | 检索对齐 | 真实请求应有真实回填 | 把 terminal 未执行 search 计作丢回填 | requested/executed/response 分开统计 |
 | 最终评测 | 七个标准 test/dev split | 主要使用检索可见性筛选后的 `val_128` | 机制集与无筛选泛化集分开 |
 
-这些偏差集中在 [`tool_protocol.py`](../search_r1/llm_agent/tool_protocol.py)、[`generation.py`](../search_r1/llm_agent/generation.py)、[`search_mix.py`](../scripts/data_process/search_mix.py)、[`qwen_native_gate_analysis.py`](../scripts/autodl/qwen_native_gate_analysis.py) 和 [`08_gpu_qwen_native_gate.sh`](../scripts/autodl/08_gpu_qwen_native_gate.sh)。
+这些偏差集中在 [`tool_protocol.py`](../../../../search_r1/llm_agent/tool_protocol.py)、[`generation.py`](../../../../search_r1/llm_agent/generation.py)、[`search_mix.py`](../../../../scripts/data_process/search_mix.py)、[`qwen_native_gate_analysis.py`](../../../../scripts/autodl/qwen_native_gate_analysis.py) 和 [`08_gpu_qwen_native_gate.sh`](../../../../scripts/autodl/08_gpu_qwen_native_gate.sh)。
 
 范围必须说准确：`Call search at least once...` 只写入当前 `probe_forced_16`，正式 `train_512` 和 `val_128` 的 `force_search=False`，因此还没有“强制首搜训练污染”。但自写 system、关闭 thinking、EOS-only action 边界、parser 与 retry 是正式 native 训练候选路径共用的，若不修就会真实进入 RL。
 
@@ -255,7 +255,7 @@ example, <answer> Beijing </answer>. Question: {question}
 
 ### P0-2：修 prompt、thinking、schema 和 parser
 
-在 [`tool_protocol.py`](../search_r1/llm_agent/tool_protocol.py) 中：
+在 [`tool_protocol.py`](../../../../search_r1/llm_agent/tool_protocol.py) 中：
 
 1. 删除手写策略 system、`force_search` 和搜索倾向 retry。
 2. 复用上游问题清洗和补问号规则，物化一条完整 user prompt；只让 chat template 注入 native tools。
@@ -269,7 +269,7 @@ example, <answer> Beijing </answer>. Question: {question}
 
 ### P0-3：修 action 边界和多轮重建
 
-在 [`generation.py`](../search_r1/llm_agent/generation.py) 中恢复上游首 action 语义。为保持实现最小且不 decode/re-tokenize：
+在 [`generation.py`](../../../../search_r1/llm_agent/generation.py) 中恢复上游首 action 语义。为保持实现最小且不 decode/re-tokenize：
 
 1. 保留 HF 返回的完整 raw token/text 用于审计。
 2. 在原 sampled token IDs 上按最早的完整 `</tool_call>`、`</answer>` 或 EOS action 边界切片；没有完整 action 时保留到 EOS 作为 invalid。
@@ -282,7 +282,7 @@ example, <answer> Beijing </answer>. Question: {question}
 
 ### P0-4：定义 prompt-only 数据重物化合同
 
-在 [`search_mix.py`](../scripts/data_process/search_mix.py) 中提升 prompt/schema version。v3 不再生成或引用 `probe_forced_16.parquet`，而是用相同 16 个 sample ID 生成自主 `probe_autonomous_16.parquet`；历史 v2 forced 文件仍原样归档。P0 只实现和测试 builder，等 P1/P2 的最终运行合同确定后再从现有 sealed source **一次** materialize 和 seal 新目录：
+在 [`search_mix.py`](../../../../scripts/data_process/search_mix.py) 中提升 prompt/schema version。v3 不再生成或引用 `probe_forced_16.parquet`，而是用相同 16 个 sample ID 生成自主 `probe_autonomous_16.parquet`；历史 v2 forced 文件仍原样归档。P0 只实现和测试 builder，等 P1/P2 的最终运行合同确定后再从现有 sealed source **一次** materialize 和 seal 新目录：
 
 - catalog、问题、gold、split、顺序、配额和检索证据逐项相同；
 - Parquet 行只改变 prompt；manifest/handoff 还会因 prompt/schema version、chat-template digest、总 `B=4` 和 observation 500 合同而更新，所有派生 digest 重新封存；

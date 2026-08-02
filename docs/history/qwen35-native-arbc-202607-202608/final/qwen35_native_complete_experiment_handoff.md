@@ -347,17 +347,17 @@ C 没有再次坍缩为不搜索：B/C 都只有 1/512 零搜索轨迹。它更�
 
 - [四模型最终结果分析](qwen35_native_arbc_final_results_analysis.md)：当前 A/R/B/C 数值与模型选择的权威入口。
 - [B/C 训练、恢复与完整分析](qwen35_native_bc_recovery_complete_analysis_report.md)：从最初崩溃、数据重配到 recovery 的完整叙事。
-- [R60 训练与轨迹分析](qwen35_native_r60_training_and_trajectory_analysis.md)：R60 训练动态、checkpoint 和 late-stage drift。
-- [R60 G3 评测与轨迹分析](qwen35_native_r60_g3_evaluation_and_trajectory_analysis.md)：G3 科学 `NO-GO` 的权威报告。
-- [native-v3 G0/G1 轨迹分析](qwen35_native_v3_g0_g1_trajectory_analysis.md)与 [terminal rollout 分析](qwen35_native_v3_terminal_rollout_g0_g1_analysis.md)：native 协议修复前后的轨迹证据。
-- [SFT→RL→B/C 后续方案](qwen35_native_sft_rl_bc_followup_plan.md)：尚未执行的独立新实验提案。
+- [R60 训练与轨迹分析](../stages/qwen35_native_r60_training_and_trajectory_analysis.md)：R60 训练动态、checkpoint 和 late-stage drift。
+- [R60 G3 评测与轨迹分析](../stages/qwen35_native_r60_g3_evaluation_and_trajectory_analysis.md)：G3 科学 `NO-GO` 的权威报告。
+- [native-v3 G0/G1 轨迹分析](../stages/qwen35_native_v3_g0_g1_trajectory_analysis.md)与 [terminal rollout 分析](../stages/qwen35_native_v3_terminal_rollout_g0_g1_analysis.md)：native 协议修复前后的轨迹证据。
+- [SFT→RL→B/C 后续方案](../plans/qwen35_native_sft_rl_bc_followup_plan.md)：尚未执行的独立新实验提案。
 
 ### 11.2 本地紧凑证据包
 
-- [A/R final evidence](results/qwen35-native-ar-eval-20260802/README.md)：21 个本地 payload 复算匹配，远端 143/143 manifest 通过。
-- [B/C recovery evidence](results/qwen35-native-bc-recovery-20260801/README.md)：24/24 本地 payload、12/12 关键训练文件匹配，远端 166/166 manifest 通过。
-- [第一次 B/C partial audit](results/qwen35-native-bc-partial-audit-20260731/README.md)：解释 B 可采用、旧 C 不可采用和真实 timeout 根因。
-- [native-v3 G0/G1 evidence](results/qwen35-native-v3-g0-g1-20260726/README.md)：协议适配阶段的原始证据。
+- [A/R final evidence](../../../results/qwen35-native-ar-eval-20260802/README.md)：21 个本地 payload 复算匹配，远端 143/143 manifest 通过。
+- [B/C recovery evidence](../../../results/qwen35-native-bc-recovery-20260801/README.md)：24/24 本地 payload、12/12 关键训练文件匹配，远端 166/166 manifest 通过。
+- [第一次 B/C partial audit](../../../results/qwen35-native-bc-partial-audit-20260731/README.md)：解释 B 可采用、旧 C 不可采用和真实 timeout 根因。
+- [native-v3 G0/G1 evidence](../../../results/qwen35-native-v3-g0-g1-20260726/README.md)：协议适配阶段的原始证据。
 
 这些目录应长期保留。`docs/results/` 是 Git 内 canonical 紧凑归档；本地 `tmp/` 只是下载、解包、损坏或 partial 文件的工作区，不属于科学交付物，已从版本控制排除。
 
@@ -432,7 +432,7 @@ SFT warm start 是合理的新假设，因为本轮证明 direct RL 能增强能
 - SFT parent 上的 B/C 必须使用完全相同 checkout、独立 optimizer 和多个 seed；
 - 在运行前登记 primary endpoint、非劣界、成本指标和停止规则。
 
-完整方案见 [SFT → RL → B/C 后续实验方案](qwen35_native_sft_rl_bc_followup_plan.md)。
+完整方案见 [SFT → RL → B/C 后续实验方案](../plans/qwen35_native_sft_rl_bc_followup_plan.md)。
 
 ## 15. 对外表述边界
 

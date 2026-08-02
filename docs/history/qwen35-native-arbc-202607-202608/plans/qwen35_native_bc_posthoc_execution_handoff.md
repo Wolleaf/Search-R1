@@ -1,6 +1,6 @@
 # Qwen3.5 Native B/C 探索实验交接手册
 
-> **历史文档，执行任务已完成。** 本文保留 B/C 启动前的决策与操作边界，不再代表当前“下一步”。B/C recovery、A/R 补评和四模型封存均已完成；当前总交接见 [Qwen3.5 Native 完整实验交接文档](qwen35_native_complete_experiment_handoff.md)，最终结果见 [Qwen3.5 Native A/R/B/C 最终结果分析](qwen35_native_arbc_final_results_analysis.md)。除非注册全新的复现实验，不要照本文重新启动 GPU。
+> **历史文档，执行任务已完成。** 本文保留 B/C 启动前的决策与操作边界，不再代表当前“下一步”。B/C recovery、A/R 补评和四模型封存均已完成；当前总交接见 [Qwen3.5 Native 完整实验交接文档](../final/qwen35_native_complete_experiment_handoff.md)，最终结果见 [Qwen3.5 Native A/R/B/C 最终结果分析](../final/qwen35_native_arbc_final_results_analysis.md)。除非注册全新的复现实验，不要照本文重新启动 GPU。
 
 ## 1. 交接目标与结论边界
 
@@ -32,8 +32,8 @@ R60 只有 `global_step_60`，没有中间 checkpoint，也没有 optimizer/sche
 本地存在以下用户未跟踪内容，接手时不得删除、覆盖或顺手提交：
 
 ```text
-docs/qwen35_native_v3_g0_g1_trajectory_analysis.md
-docs/qwen35_native_v3_terminal_rollout_g0_g1_analysis.md
+docs/history/qwen35-native-arbc-202607-202608/stages/qwen35_native_v3_g0_g1_trajectory_analysis.md
+docs/history/qwen35-native-arbc-202607-202608/stages/qwen35_native_v3_terminal_rollout_g0_g1_analysis.md
 docs/results/qwen35-native-v3-g0-g1-20260726/
 tmp/
 ```
@@ -172,13 +172,13 @@ R60 的 60 步训练耗时 `9:22:07`，所以同配置下单个 20-step 分支�
 
 可以把下面内容直接交给下一会话：
 
-> 阅读 `docs/qwen35_native_bc_posthoc_execution_handoff.md`、`docs/qwen35_native_r60_g3_evaluation_and_trajectory_analysis.md`、`scripts/autodl/README.md` 和 `scripts/autodl/09_gpu_qwen_native_train.sh`。按最小改动新增 `12_gpu_qwen_native_bc_only.sh`：不重训 R/G3，B20 与 C-gated20 都从 exact R60 digest 独立启动，完成三套 endpoint 配对评测、证据封存和安全自动关机。先实现并跑完本地测试/CPU prepare；没有用户明确告知 GPU 已挂载前，不得启动付费训练。
+> 阅读 `docs/history/qwen35-native-arbc-202607-202608/plans/qwen35_native_bc_posthoc_execution_handoff.md`、`docs/history/qwen35-native-arbc-202607-202608/stages/qwen35_native_r60_g3_evaluation_and_trajectory_analysis.md`、`scripts/autodl/README.md` 和 `scripts/autodl/09_gpu_qwen_native_train.sh`。按最小改动新增 `12_gpu_qwen_native_bc_only.sh`：不重训 R/G3，B20 与 C-gated20 都从 exact R60 digest 独立启动，完成三套 endpoint 配对评测、证据封存和安全自动关机。先实现并跑完本地测试/CPU prepare；没有用户明确告知 GPU 已挂载前，不得启动付费训练。
 
 ## 10. 关联资料
 
-- `docs/qwen35_native_r60_training_and_trajectory_analysis.md`：R60 训练、loss、轨迹和成本。
-- `docs/qwen35_native_r60_g3_evaluation_and_trajectory_analysis.md`：G3 数值、NO-GO 根因和证据路径。
-- `docs/autodl_search_r1_reproduction_plan.md`：总体实验设计与 B/C 奖励定义。
+- `docs/history/qwen35-native-arbc-202607-202608/stages/qwen35_native_r60_training_and_trajectory_analysis.md`：R60 训练、loss、轨迹和成本。
+- `docs/history/qwen35-native-arbc-202607-202608/stages/qwen35_native_r60_g3_evaluation_and_trajectory_analysis.md`：G3 数值、NO-GO 根因和证据路径。
+- `docs/history/qwen35-native-arbc-202607-202608/plans/autodl_search_r1_reproduction_plan.md`：总体实验设计与 B/C 奖励定义。
 - `scripts/autodl/README.md`：现有三阶段入口、状态、watchdog 和存储合同。
 - `scripts/autodl/09_gpu_qwen_native_train.sh`：已经实现但被门禁包围的 B/C 核心代码。
 - `scripts/autodl/11_gpu_qwen_native_g3_only.sh`：checkout 外受控 runner、CPU receipt 和固定 R60 校验范例。
