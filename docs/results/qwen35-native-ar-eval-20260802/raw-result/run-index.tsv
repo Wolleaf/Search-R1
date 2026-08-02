@@ -1,0 +1,7 @@
+stage	role	run_dir
+A-VAL-EVAL	parent_val_eval	/root/autodl-tmp/search-r1/runs/eval/qwen_native_a_val/attempts/20260801T123428Z-1407-26752
+R-VAL-EVAL	reproduced_val_eval	/root/autodl-tmp/search-r1/runs/eval/qwen_native_r_val/attempts/20260801T125449Z-1407-12396
+A-NQ-TEST-EVAL	parent_nq_test_eval	/root/autodl-tmp/search-r1/runs/eval/qwen_native_a_nq_test/attempts/20260801T131719Z-1407-16992
+R-NQ-TEST-EVAL	reproduced_nq_test_eval	/root/autodl-tmp/search-r1/runs/eval/qwen_native_r_nq_test/attempts/20260801T134010Z-1407-9718
+A-MULTIHOP-EVAL	parent_multihop_eval	/root/autodl-tmp/search-r1/runs/eval/qwen_native_a_multihop/attempts/20260801T140541Z-1407-32252
+R-MULTIHOP-EVAL	reproduced_multihop_eval	/root/autodl-tmp/search-r1/runs/eval/qwen_native_r_multihop/attempts/20260801T145025Z-1407-17547

@@ -120,3 +120,6 @@ tests/e2e/toy_examples/deepspeed/synchronous/output.txt
 log/
 
 **logs
+
+# Local transfer/download scratch; canonical experiment evidence lives in docs/results/.
+/tmp/

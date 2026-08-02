@@ -1,0 +1,4 @@
+at=2026-08-01T15:49:57Z
+backend=/usr/bin/shutdown
+backend_exit_code=0
+provider_control_plane_confirmed=false

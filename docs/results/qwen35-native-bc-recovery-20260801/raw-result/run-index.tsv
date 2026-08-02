@@ -1,0 +1,9 @@
+stage	role	run_dir
+B20-REUSED	control	/root/autodl-tmp/search-r1/runs/control/attempts/20260731T061302Z-1592-7937
+C20-RECOVERY	cost_aware_gated	/root/autodl-tmp/search-r1/runs/cost_aware_gated/attempts/20260801T042516Z-7061-17197
+B-VAL-EVAL	control_val_eval	/root/autodl-tmp/search-r1/runs/eval/qwen_native_b_val/attempts/20260801T074616Z-7061-9546
+C-VAL-EVAL	cost_aware_gated_val_eval	/root/autodl-tmp/search-r1/runs/eval/qwen_native_c_val/attempts/20260801T081048Z-7061-3750
+B-NQ-TEST-EVAL	control_nq_test_eval	/root/autodl-tmp/search-r1/runs/eval/qwen_native_b_nq_test/attempts/20260801T083243Z-7061-15480
+C-NQ-TEST-EVAL	cost_aware_gated_nq_test_eval	/root/autodl-tmp/search-r1/runs/eval/qwen_native_c_nq_test/attempts/20260801T085622Z-7061-20584
+B-MULTIHOP-EVAL	control_multihop_eval	/root/autodl-tmp/search-r1/runs/eval/qwen_native_b_multihop/attempts/20260801T092107Z-7061-32369
+C-MULTIHOP-EVAL	cost_aware_gated_multihop_eval	/root/autodl-tmp/search-r1/runs/eval/qwen_native_c_multihop/attempts/20260801T101457Z-7061-32065

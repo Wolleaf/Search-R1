@@ -1,0 +1,1 @@
+{"artifact":{"bytes":66067569,"expected_rows":800,"path":"train_trajectories.jsonl","record_schema":"search-r1.trajectory","record_schema_version":3,"record_type":"train","rows":800,"sha256":"b1907e579ecece4fe4c102d229cc3103b8ee71348bbd8c162bfe320a04a51cf5"},"run_id":"20260731T061302Z-1592-7937","schema":"search-r1.trajectory-manifest","schema_version":1,"stage":"control"}
