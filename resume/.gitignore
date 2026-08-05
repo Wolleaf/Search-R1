@@ -1,0 +1,4 @@
+# Personal resume sources and exports stay local only.
+*.html
+*.pdf
+*.local.md
